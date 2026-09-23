@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# .gitignore
+.langgraph_api/
+.venv/
+*.pyc
+logs/
+data/uploads
+node_modules/
+
+# 环境变量文件(含 MYSQL_PASSWORD 等敏感信息)
+.env
+docker/.env
+.env.local
+docker/secrets/
+
+# Milvus Lite local vector database
+data/milvus_lite.db/

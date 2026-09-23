@@ -1,0 +1,164 @@
+x-build: &build
+  context: ..
+  dockerfile: docker/Dockerfile
+  args:
+    # 国内镜像源,可用环境变量覆盖: BASE_IMAGE=... docker compose build
+    BASE_IMAGE: ${BASE_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+
+# 运行时敏感信息以 secret 文件挂载到容器 /run/secrets/<name>,
+# 不进镜像、不进环境变量、不提交 git (docker/secrets/ 已被 .gitignore 排除)。
+secrets:
+  mysql_password:
+    file: ./secrets/mysql_password.txt
+  deepseek_api_key:
+    file: ./secrets/deepseek_api_key.txt
+  langsmith_api_key:
+    file: ./secrets/langsmith_api_key.txt
+
+services:
+  hr-mcp:
+    build: *build
+    command: python -m app.mcp_servers.hr_server
+    ports: ["8001:8001"]
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
+    secrets: [mysql_password]
+    networks: [mxi]
+
+  finance-mcp:
+    build: *build
+    command: python -m app.mcp_servers.finance_server
+    ports: ["8002:8002"]
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
+    secrets: [mysql_password]
+    networks: [mxi]
+
+  hr-agent:
+    build: *build
+    command: python -m app.agents.hr_agent.server
+    ports: ["9001:9001"]
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      HR_MCP_URL: http://hr-mcp:8001/mcp
+      HR_AGENT_URL: http://hr-agent:9001
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+    secrets: [deepseek_api_key]
+    volumes:
+      - ../logs:/data/logs
+    depends_on: [hr-mcp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  finance-agent:
+    build: *build
+    command: python -m app.agents.finance_agent.server
+    ports: ["9002:9002"]
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      FINANCE_MCP_URL: http://finance-mcp:8002/mcp
+      FINANCE_AGENT_URL: http://finance-agent:9002
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+    secrets: [deepseek_api_key]
+    volumes:
+      - ../logs:/data/logs
+    depends_on: [finance-mcp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  # Elasticsearch: RAG 稀疏检索通道 (BM25; jieba 预分词, 无需 IK 插件)。
+  # 单节点内网部署, 无认证; 数据落在 es_data 卷。
+  elasticsearch:
+    image: ${ES_IMAGE:-docker.m.daocloud.io/library/elasticsearch:8.15.3}
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks: [mxi]
+
+  # MinerU OCR 服务 (图片解析). 按需启动:
+  #   docker compose -f docker/docker-compose.yml --profile mineru up -d mineru
+  # assistant 通过 MINERU_BASE_URL=http://host.docker.internal:8888 访问宿主机端口。
+  # 模型缓存在 mineru_models 卷中, 首次启动自动从 ModelScope 下载。
+  mineru:
+    profiles: [mineru]
+    build:
+      context: ./mineru
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-docker.m.daocloud.io/library/python:3.11-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    command: mineru-api --host 0.0.0.0 --port 8888
+    ports: ["8888:8888"]
+    volumes:
+      - mineru_models:/root/.cache
+    networks: [mxi]
+
+  assistant:
+    build: *build
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    # MYSQL_PASSWORD / DEEPSEEK_API_KEY 经 secrets 挂载到 /run/secrets/*,
+    # 由 app/config.py 读取; 不进环境变量、不落镜像与代码库。
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      RERANK_MODEL: ${RERANK_MODEL:-dengcao/bge-reranker-v2-m3}
+      MILVUS_LITE_URI: /data/milvus_lite.db
+      # ES 跑在同一 compose 网络, 用服务名访问; 无需 host.docker.internal
+      ES_URL: ${ES_URL:-http://elasticsearch:9200}
+      ES_INDEX: ${ES_INDEX:-kb_chunks}
+      # 上传文件必须落在持久卷 /data (../data:/data), 否则默认 ./data/uploads
+      # 会解析到容器工作目录 /srv/data/uploads, 容器重启即丢失原始上传文件。
+      UPLOAD_DIR: /data/uploads
+      HR_MCP_URL: http://hr-mcp:8001/mcp
+      FINANCE_MCP_URL: http://finance-mcp:8002/mcp
+      HR_AGENT_URL: http://hr-agent:9001
+      FINANCE_AGENT_URL: http://finance-agent:9002
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
+      # MinerU OCR: 服务跑在容器内, localhost 指向容器自身, 必须经 host.docker.internal
+      MINERU_BASE_URL: ${MINERU_BASE_URL:-http://host.docker.internal:8888}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_TIMEOUT: ${MINERU_TIMEOUT:-300}
+    secrets:
+      - mysql_password
+      - deepseek_api_key
+      - langsmith_api_key
+    volumes:
+      - ../data:/data
+      - ../logs:/data/logs
+    depends_on: [hr-agent, finance-agent, elasticsearch]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+volumes:
+  mineru_models:
+  es_data:
+
+networks:
+  mxi:
+    driver: bridge
