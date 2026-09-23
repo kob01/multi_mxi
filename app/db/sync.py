@@ -1,9 +1,9 @@
-"""Synchronous MySQL access for MCP servers.
+"""Synchronous PostgreSQL access for MCP servers.
 
 FastMCP tools run as plain sync functions, so the MCP servers use a
-synchronous SQLAlchemy engine (pymysql) instead of the async engine in
+synchronous SQLAlchemy engine (psycopg3) instead of the async engine in
 app.db.session. Connection settings come from the same Settings source
-(.env / docker/.env / 环境变量 / /run/secrets/mysql_password).
+(.env / docker/.env / 环境变量 / /run/secrets/pg_password).
 """
 
 from __future__ import annotations
@@ -31,36 +31,45 @@ def _jsonify(value):
 
 
 def _ensure_password() -> str:
-    password = get_settings().mysql_password
+    password = get_settings().pg_password
     if not password:
         raise RuntimeError(
-            "缺少 MySQL 密码: 请设置环境变量 MYSQL_PASSWORD, "
-            "或在项目根目录 .env / docker/.env 中添加 MYSQL_PASSWORD=..., "
-            "Docker 部署则创建 docker/secrets/mysql_password.txt"
-            "(容器内挂载为 /run/secrets/mysql_password)"
+            "缺少 PostgreSQL 密码: 请设置环境变量 PG_PASSWORD, "
+            "或在项目根目录 .env / docker/.env 中添加 PG_PASSWORD=..., "
+            "Docker 部署则创建 docker/secrets/pg_password.txt"
+            "(容器内挂载为 /run/secrets/pg_password)"
         )
     return password
 
 
 def get_sync_engine() -> Engine:
-    """Lazily create the shared synchronous engine (pymysql driver)."""
+    """Lazily create the shared synchronous engine (psycopg3 driver)."""
     global _engine
     if _engine is None:
         s = get_settings()
-        url = URL.create(
-            "mysql+pymysql",
-            username=s.mysql_user,
-            password=_ensure_password(),
-            host=s.mysql_host,
-            port=s.mysql_port,
-            database=s.mysql_database,
-            query={"charset": "utf8mb4"},
-        )
+        url: str | URL
+        if s.database_url:
+            # 同一个 DATABASE_URL 在同步侧换成 psycopg 驱动 (异步引擎用 asyncpg)。
+            url = s.database_url.replace("postgresql+asyncpg", "postgresql+psycopg")
+        else:
+            url = URL.create(
+                "postgresql+psycopg",
+                username=s.pg_user,
+                password=_ensure_password(),
+                host=s.pg_host,
+                port=s.pg_port,
+                database=s.pg_database,
+            )
         _engine = create_engine(
             url,
             pool_pre_ping=True,
             pool_recycle=3600,
-            connect_args={"connect_timeout": s.mysql_connect_timeout},
+            # psycopg 走 libpq, 这些均为原生 libpq 参数 (无需像 asyncpg 那样转 SSLContext)。
+            connect_args={
+                "connect_timeout": s.pg_connect_timeout,
+                "sslmode": s.pg_sslmode,
+                "application_name": "mxi-mcp",
+            },
         )
     return _engine
 
@@ -70,15 +79,19 @@ def execute_readonly_sql(sql: str, allowed_tables: set[str]) -> list[dict]:
 
     统一 json 化处理 Decimal / datetime, 便于 MCP 工具直接返回。
     """
-    from app.db.sql_guard import inject_timeout_hint, validate_readonly_select
+    from app.db.sql_guard import validate_readonly_select
 
     safe_sql = validate_readonly_select(sql, allowed_tables)
-    safe_sql = inject_timeout_hint(safe_sql)
     engine = get_sync_engine()
     with engine.connect() as conn:
+        # PostgreSQL 没有 MySQL 的 MAX_EXECUTION_TIME hint, 改用事务级
+        # statement_timeout: SET LOCAL 只在当前(隐式)事务内生效, 不污染连接池。
+        timeout_ms = int(get_settings().pg_statement_timeout_ms)
+        conn.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
         result = conn.execute(text(safe_sql))
         cols = list(result.keys())
         rows = []
         for row in result.mappings():
             rows.append({k: _jsonify(v) for k, v in row.items()})
+        conn.rollback()  # 只读: 立即结束事务, 释放超时设置与快照
         return [{"columns": cols, "rows": rows, "rowcount": len(rows)}]

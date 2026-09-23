@@ -41,10 +41,10 @@ def _token_field(text: str) -> str:
 
 
 def _acl_filter(principal: Principal | None) -> list[dict]:
-    """ES bool-filter mirroring app.security.acl.build_milvus_filter.
+    """ES bool-filter mirroring app.rag.vectorstore.build_sql_filter.
 
     Pre-trims unauthorized documents before TopK — semantically identical to
-    the vector channel's Milvus metadata filter, so the two channels never
+    the vector channel's pgvector metadata filter, so the two channels never
     disagree on what a principal may read.
     """
     if principal is None or principal.is_admin:

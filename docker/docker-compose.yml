@@ -9,24 +9,49 @@ x-build: &build
 # 运行时敏感信息以 secret 文件挂载到容器 /run/secrets/<name>,
 # 不进镜像、不进环境变量、不提交 git (docker/secrets/ 已被 .gitignore 排除)。
 secrets:
-  mysql_password:
-    file: ./secrets/mysql_password.txt
+  pg_password:
+    file: ./secrets/pg_password.txt
   deepseek_api_key:
     file: ./secrets/deepseek_api_key.txt
   langsmith_api_key:
     file: ./secrets/langsmith_api_key.txt
 
 services:
+  # PostgreSQL: 统一存储层 —— 文档/业务元数据 (原 MySQL) + pgvector 知识块
+  # (原 Milvus Lite)。用 pgvector 官方镜像, init 脚本首启即装好扩展,
+  # 应用账号无需 CREATE EXTENSION 权限。
+  postgres:
+    image: ${PG_IMAGE:-docker.m.daocloud.io/pgvector/pgvector:pg16}
+    environment:
+      POSTGRES_USER: ${PG_USER:-mxi}
+      POSTGRES_DB: ${PG_DATABASE:-mxi}
+      # 官方镜像支持 *_FILE: 密码从 secret 读, 不进环境变量
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    ports: ["5432:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    secrets: [pg_password]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [mxi]
+
   hr-mcp:
     build: *build
     command: python -m app.mcp_servers.hr_server
     ports: ["8001:8001"]
     environment:
-      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
-    secrets: [mysql_password]
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+    secrets: [pg_password]
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks: [mxi]
 
   finance-mcp:
@@ -34,11 +59,14 @@ services:
     command: python -m app.mcp_servers.finance_server
     ports: ["8002:8002"]
     environment:
-      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
-    secrets: [mysql_password]
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+    secrets: [pg_password]
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks: [mxi]
 
   hr-agent:
@@ -114,7 +142,7 @@ services:
     build: *build
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports: ["8000:8000"]
-    # MYSQL_PASSWORD / DEEPSEEK_API_KEY 经 secrets 挂载到 /run/secrets/*,
+    # PG_PASSWORD / DEEPSEEK_API_KEY 经 secrets 挂载到 /run/secrets/*,
     # 由 app/config.py 读取; 不进环境变量、不落镜像与代码库。
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
@@ -123,7 +151,6 @@ services:
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       RERANK_MODEL: ${RERANK_MODEL:-dengcao/bge-reranker-v2-m3}
-      MILVUS_LITE_URI: /data/milvus_lite.db
       # ES 跑在同一 compose 网络, 用服务名访问; 无需 host.docker.internal
       ES_URL: ${ES_URL:-http://elasticsearch:9200}
       ES_INDEX: ${ES_INDEX:-kb_chunks}
@@ -135,22 +162,33 @@ services:
       HR_AGENT_URL: http://hr-agent:9001
       FINANCE_AGENT_URL: http://finance-agent:9002
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      MYSQL_HOST: ${MYSQL_HOST:-47.116.208.170}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_USER: ${MYSQL_USER:-sql47_116_208_1}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-sql47_116_208_1}
+      # 统一存储层: 元数据与 pgvector 知识块同一个库
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       # MinerU OCR: 服务跑在容器内, localhost 指向容器自身, 必须经 host.docker.internal
       MINERU_BASE_URL: ${MINERU_BASE_URL:-http://host.docker.internal:8888}
       MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
       MINERU_TIMEOUT: ${MINERU_TIMEOUT:-300}
     secrets:
-      - mysql_password
+      - pg_password
       - deepseek_api_key
       - langsmith_api_key
     volumes:
       - ../data:/data
       - ../logs:/data/logs
-    depends_on: [hr-agent, finance-agent, elasticsearch]
+    depends_on:
+      hr-agent:
+        condition: service_started
+      finance-agent:
+        condition: service_started
+      elasticsearch:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
@@ -158,6 +196,7 @@ services:
 volumes:
   mineru_models:
   es_data:
+  pg_data:
 
 networks:
   mxi:

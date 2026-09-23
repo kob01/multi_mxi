@@ -54,7 +54,7 @@ _BASE_PROMPT = """你是 HR_Agent,企业 HR 服务专业智能体。
 
 Text2SQL 规则 (仅当 execute_sql 工具在你本次可用工具列表中时适用):
 - 用户提出统计/明细类查询(如"研发部今年提了多少工单"、"谁的年假剩余最多")时,
-  依据上述表结构编写单条 MySQL SELECT 语句并调用 execute_sql。
+  依据上述表结构编写单条 PostgreSQL SELECT 语句并调用 execute_sql。
 - 只写 SELECT;只查白名单内的表;需要部门/姓名时 JOIN hr_employees。
 - 若工具返回 error (SQL 校验失败/执行失败), 依据错误信息修正后重试一次;
   仍失败则如实告知用户, 不要编造结果。

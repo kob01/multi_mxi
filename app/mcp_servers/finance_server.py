@@ -1,9 +1,9 @@
 """Finance reimbursement MCP Server (FastMCP, streamable-http transport).
 
-Exposes the enterprise finance system stored in MySQL (fin_reimbursements /
-fin_department_budgets) as MCP tools; hr_employees is readable for
-employee->department joins. Also exposes a read-only Text2SQL tool
-(execute_sql) with a hard table whitelist.
+Exposes the enterprise finance system stored in PostgreSQL
+(fin_reimbursements / fin_department_budgets) as MCP tools; hr_employees is
+readable for employee->department joins. Also exposes a read-only Text2SQL
+tool (execute_sql) with a hard table whitelist.
 
 Run:
     python -m app.mcp_servers.finance_server     # serves http://0.0.0.0:8002/mcp
@@ -11,7 +11,7 @@ Run:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -33,7 +33,7 @@ ALLOWED_TABLES = {"fin_reimbursements", "fin_department_budgets", "hr_employees"
 
 def _next_order_no(session: Session) -> str:
     max_no = session.execute(
-        text("SELECT COALESCE(MAX(CAST(SUBSTRING(order_no, 4) AS SIGNED)), 4999) FROM fin_reimbursements")
+        text("SELECT COALESCE(MAX(CAST(SUBSTRING(order_no, 4) AS INTEGER)), 4999) FROM fin_reimbursements")
     ).scalar_one()
     return f"FIN{int(max_no) + 1}"
 
@@ -83,7 +83,8 @@ def create_reimbursement(user_id: str, title: str, amount: float, category: str,
             reason=reason,
             status="SUBMITTED",
             current_node="部门主管审批",
-            created_at=datetime.now(),
+            # timestamptz 列: 必须传带时区的值
+            created_at=datetime.now(timezone.utc),
         )
         session.add(order)
         session.commit()
@@ -190,7 +191,7 @@ def execute_sql(sql: str) -> list[dict[str, Any]]:
     完成业务操作, 本工具用于统计/明细等灵活查询。
 
     Args:
-        sql: A single read-only MySQL SELECT statement against whitelisted tables.
+        sql: A single read-only PostgreSQL SELECT statement against whitelisted tables.
 
     Returns:
         One result object: {columns, rows, rowcount}, or an error payload list.

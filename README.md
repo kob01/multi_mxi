@@ -17,13 +17,18 @@ MCP 工具调用、A2A 专业智能体委派。
           ┌─────────▼────┐  ┌───────▼───────┐   ┌───────▼────────┐
           │  RAG 知识底座 │  │  MCP Servers  │   │ 专业 Agent      │
           │ bge-m3 向量  │  │ HR工单 :8001  │   │ HR_Agent :9001 │
-          │ Milvus Lite  │  │ 财务报销:8002 │   │ Finance  :9002 │
+          │ pgvector     │  │ 财务报销:8002 │   │ Finance  :9002 │
           │ BM25+Rerank  │  │               │   │ (LangGraph+MCP)│
           │ +Metadata ACL│  │               │   │                │
           └──────────────┘  └───────────────┘   └────────────────┘
                     ├──── LLM: DeepSeek API (deepseek-flash) ────┤
-                    └──── 底座: Ollama (bge-m3 / bge-reranker-v2-m3) + MinerU (图片OCR) ────┘
+   └──── 存储: PostgreSQL(元数据 + pgvector 知识块) + Elasticsearch(BM25 稀疏通道的倒排索引) ────┘
+   └──── 模型底座: Ollama (bge-m3 / bge-reranker-v2-m3) + MinerU (图片OCR) ────┘
 ```
+
+> 存储层统一为一个 PostgreSQL 实例: 文档/业务元数据与向量知识块同库同连接池
+> (原 MySQL + Milvus Lite 的组合已合并), Elasticsearch 仅作为可全量重建的 BM25
+> 派生索引保留。
 
 A2A 遵循 Agent2Agent 协议:Agent Card 发布于 `/.well-known/agent-card.json`,
 通信为 JSON-RPC 2.0 over HTTP(`message/send`)。MCP 遵循 Model Context
@@ -95,15 +100,16 @@ RAG:  Query → Embedding
    Context Builder → LLM
 ```
 
-- **权限存储**:每条向量记录冗余携带 `visibility / owner_id / dept_id /
-  allowed_roles` 四个标量字段(`app/security/acl.py`),MySQL `documents`
-  表为事实来源,入库(`ingest`)与权限变更(`PUT /api/docs/{doc}/acl`)时同步
-  刷新向量库与 BM25 通道。
+- **权限存储**:每条知识块记录(`knowledge_chunks` 表)冗余携带
+  `visibility / owner_id / dept_id / allowed_roles` 四个标量列,同库的
+  `documents` 表为事实来源(`app/security/acl.py`);入库(`ingest`)与权限变更
+  (`PUT /api/docs/{doc}/acl`)时同步刷新向量表与 BM25 通道。
 - **可见性策略**:`public`(全员) / `dept`(指定部门) / `role`(指定角色)
   / `private`(仅上传者);管理员角色全量可见。
-- **前置裁剪**:稠密通道用 Milvus 标量过滤表达式(`build_milvus_filter`),
-  在 ANN 检索阶段即排除无权文档,不占用 TopK;稀疏通道(BM25 进程内索引)
-  用同一谓词 `is_allowed` 在打分后、TopK 前过滤,两通道语义严格一致。
+- **前置裁剪**:稠密通道用 SQL 谓词(`app.rag.vectorstore.build_sql_filter`,
+  与 `is_parent = false` 一起作用在 `ORDER BY embedding <=> ? LIMIT k` 之前),
+  在 ANN 检索阶段即排除无权文档,不占用 TopK;稀疏通道(Elasticsearch BM25)
+  用等价的 bool filter(`app.rag.bm25._acl_filter`),两通道语义严格一致。
 - **最终授权**:`kb_answer` 在父块组装后、拼接 Context 前再逐条复核一次,
   拦截组装/脏数据可能引入的越权块,剔除项写审计(`acl_final_check_dropped`)。
 
@@ -124,7 +130,7 @@ mxi/
 │   │   └── router.py             #   /api/chat 统一入口
 │   ├── rag/                      # ★ RAG 知识底座
 │   │   ├── embeddings.py         #   bge-m3 (Ollama /api/embed)
-│   │   ├── vectorstore.py        #   Milvus Lite collection/索引/检索
+│   │   ├── vectorstore.py        #   pgvector 知识块表(ANN 检索 + ACL SQL 谓词)
 │   │   ├── bm25.py               #   BM25 稀疏检索(Elasticsearch + jieba 预分词)
 │   │   ├── reranker.py           #   bge-reranker-v2-m3 重排
 │   │   ├── retriever.py          #   混合检索(向量+BM25→RRF→Rerank)
@@ -137,11 +143,13 @@ mxi/
 │   │   └── hr_agent/             #   agent_card / executor / server(:9001)
 │   └── security/                 # ★ 安全治理
 │       ├── auth.py               #   角色→工具/Agent 白名单
-│       ├── acl.py                #   文档级 ACL(Principal→Milvus 过滤 + 谓词)
+│       ├── acl.py                #   文档级 ACL(Principal→谓词/SQL/ES filter)
 │       ├── audit.py              #   全链路审计 JSONL(trace_id 串联)
 │       └── masking.py            #   身份证/银行卡/手机号/金额脱敏
 ├── scripts/
 │   ├── ingest_knowledge.py       # 知识库构建脚本
+│   ├── init_db.py                # PostgreSQL + pgvector 建表/自检
+│   ├── migrate_mxi_storage.py    # 一次性迁移: MySQL + Milvus Lite -> PostgreSQL
 │   └── demo_reimburse.py         # 端到端 demo:我要报销
 ├── data/knowledge/               # 样例语料(制度 md + 培训视频字幕 srt)
 ├── web/index.html                # Web 聊天界面
@@ -178,15 +186,44 @@ mineru-api --host 0.0.0.0 --port 8888
 
 ### Docker Compose 启动(推荐)
 
+compose 里的 `postgres` 服务以 secret 文件读取数据库密码, 首次部署需先创建它
+(`docker/secrets/` 已被 .gitignore 排除, 不会进仓库):
+
 ```bash
-cp .env docker/.env
+mkdir -p docker/secrets && echo '<你的 PG 密码>' > docker/secrets/pg_password.txt
+cp .env docker/.env   # 然后按容器语义改: PG_HOST=postgres、OLLAMA_BASE_URL=host.docker.internal
 docker compose -f docker/docker-compose.yml up -d --build
+# 建表 + pgvector 扩展(网关启动时也会自动完成, 这里显跑一次便于看报错)
+docker compose -f docker/docker-compose.yml exec assistant python -m scripts.init_db
 # 构建知识库(可选; 现在也可通过 Web 上传)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.ingest_knowledge --dir /data/knowledge
 # 重刷业务数据(可选)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.seed_business_data --force
 # Web 聊天: http://localhost:8000   文档管理: http://localhost:8000/upload
 ```
+
+### 从 MySQL + Milvus Lite 迁移存量数据
+
+一次性脚本把旧元数据/业务表与旧 Milvus 向量块都灌进 PostgreSQL(可重跑):
+
+```bash
+# 1) 起 PG 并建好 schema
+uv run python -m scripts.init_db
+
+# 2) 搬数据 (脚本需要临时读 MySQL, 所以临时带上 pymysql/pymilvus)
+uv run --with pymysql --with pymilvus python -m scripts.migrate_mxi_storage \
+    --mysql-url "mysql+pymysql://user:pw@host:3306/dbname?charset=utf8mb4" \
+    --milvus-uri ./data/milvus_lite.db
+
+# 不想搬向量 (或旧 collection 已被清): 只搬元数据, 向量重新入库
+uv run --with pymysql python -m scripts.migrate_mxi_storage --mysql-url "..." --skip-vectors
+uv run python -m scripts.ingest_knowledge --dir ./data/knowledge
+
+# 3) 校验行数一致后重刷 ES 派生索引, 确认无误再删除 data/milvus_lite.db/
+```
+
+旧向量列含 `is_parent=1` 的父块也会一并搬迁(检索不命中它们, 仅用于父块组装)。
+若单文档块数超过 Milvus 单次 query 上限(16384), 脚本会打 WARNING, 该文档建议重新入库。
 
 ### 本地开发
 
@@ -195,10 +232,13 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 pip install uv
 uv sync
 
-# 配置敏感信息: 在项目根目录 .env 填写 MYSQL_PASSWORD=... 与 DEEPSEEK_API_KEY=...
+# 配置敏感信息: 在项目根目录 .env 填写 PG_PASSWORD=... 与 DEEPSEEK_API_KEY=...
 # (该文件已被 .gitignore 排除); 也可直接设置环境变量 (PowerShell: $env:DEEPSEEK_API_KEY="...")
 
-# 1. 建表自检
+# 本地需先有一个带 pgvector 扩展的 PostgreSQL (推荐容器):
+#   docker compose -f docker/docker-compose.yml up -d postgres
+
+# 1. 建表自检(含 CREATE EXTENSION vector)
 uv run python -m scripts.init_db
 
 # 2. 启动业务 MCP / A2A 服务(按需)

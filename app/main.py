@@ -1,8 +1,9 @@
 """FastAPI application entry: single Assistant gateway + Web UI.
 
-Startup initialises the MySQL metadata schema (prompting for the password
-once in the terminal); if MySQL is unavailable the gateway still serves chat
-with degraded metadata while the document-management APIs report errors.
+Startup initialises the PostgreSQL schema — document metadata tables plus the
+pgvector knowledge table (prompting for the password once in the terminal);
+if the database is unavailable the gateway still serves chat with degraded
+metadata while the document-management APIs report errors.
 
 Run:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -31,7 +32,7 @@ DIST_DIR = WEB_DIR / "dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Init MySQL metadata schema at startup (getpass password prompt happens here)."""
+    """Init PostgreSQL schema at startup (getpass password prompt happens here)."""
     from app.tracing import init_tracing
 
     if init_tracing():
@@ -40,10 +41,10 @@ async def lifespan(app: FastAPI):
         from app.db.session import init_schema
 
         await init_schema()
-        logger.info("MySQL metadata schema ready")
+        logger.info("PostgreSQL schema ready (metadata + pgvector)")
     except Exception as exc:
         logger.error(
-            "MySQL 初始化失败, 文档管理功能不可用, 聊天将降级为无标签模式: %s", exc
+            "PostgreSQL 初始化失败, 文档管理/知识库功能不可用, 聊天将降级为无标签模式: %s", exc
         )
     yield
 

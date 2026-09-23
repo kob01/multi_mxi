@@ -14,11 +14,14 @@ logs/
 data/uploads
 node_modules/
 
-# 环境变量文件(含 MYSQL_PASSWORD 等敏感信息)
+# 环境变量文件(含 PG_PASSWORD 等敏感信息)
 .env
 docker/.env
 .env.local
 docker/secrets/
 
-# Milvus Lite local vector database
+# 遗留: Milvus Lite 本地向量库 (已迁移到 PostgreSQL + pgvector, 确认完成后可删除整个目录)
 data/milvus_lite.db/
+
+# PostgreSQL 本地数据目录 (若不用容器跑 PG 时可能落在仓库内)
+data/pgdata/

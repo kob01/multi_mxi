@@ -4,10 +4,11 @@ Design (matches the platform's layered-authorization model):
 - 文档权限以元数据形式冗余存储在每条向量记录上 (visibility / owner_id /
   dept_id / allowed_roles), 由统一身份系统下发的用户主体 (Principal:
   user_id / department / role) 在检索时做前置裁剪。
-- 前置裁剪 (Metadata Filter): 在 Milvus ANN 检索阶段用标量过滤表达式,
-  让无权文档根本不进入候选集 (TopK 之前), 兼顾正确性与召回效率。
-- 稀疏通道 (BM25, 进程内索引) 无法用 Milvus 表达式, 检索后用同一谓词
-  `is_allowed` 做等价的内存过滤。
+- 前置裁剪 (Metadata Filter): 在向量检索(pgvector)阶段用 SQL 谓词
+  ``app.rag.vectorstore.build_sql_filter``, 让无权文档根本不进入候选集
+  (TopK 之前), 兼顾正确性与召回效率。
+- 稀疏通道 (Elasticsearch BM25) 无法用 SQL, 由 ``app.rag.bm25._acl_filter``
+  构造语义等价的 bool filter。
 - 最终授权 (Final Authorization): 重排/父块组装后、进入 Context Builder
   前, 再对最终资料集逐条复核一次, 作为纵深防御 (防止索引脏数据/父块
   组装引入越权块)。
@@ -39,11 +40,6 @@ class Principal:
         return self.role == Role.ADMIN
 
 
-def _escape(value: str) -> str:
-    """Escape a literal for a Milvus double-quoted string expression."""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def format_allowed_roles(roles: list[str] | tuple[str, ...] | str) -> str:
     """Normalise a role list into the comma-wrapped storage form `,hr,admin,`.
 
@@ -66,40 +62,13 @@ def parse_allowed_roles(stored: str) -> list[str]:
     return [r for r in stored.strip(",").split(",") if r]
 
 
-def build_milvus_filter(principal: Principal) -> str:
-    """Scalar metadata filter appended to the ANN search to pre-trim ACL.
-
-    Admin sees everything (subject to the is_parent child-chunk filter added by
-    the caller). Non-admins get the OR of the visibility predicates they
-    satisfy; a principal with no department simply never matches `dept` docs.
-    """
-    if principal.is_admin:
-        return 'chunk_id != ""'  # 恒真(主键非空): 管理员全量可见
-    clauses = [f'visibility == "{DocVisibility.PUBLIC.value}"']
-    if principal.user_id:
-        clauses.append(
-            f'(visibility == "{DocVisibility.PRIVATE.value}" '
-            f'and owner_id == "{_escape(principal.user_id)}")'
-        )
-    if principal.department:
-        clauses.append(
-            f'(visibility == "{DocVisibility.DEPT.value}" '
-            f'and dept_id == "{_escape(principal.department)}")'
-        )
-    # role visibility: allowed_roles is stored comma-wrapped, match with LIKE.
-    clauses.append(
-        f'(visibility == "{DocVisibility.ROLE.value}" '
-        f'and allowed_roles like "%,{_escape(principal.role.value)},%")'
-    )
-    return "(" + " or ".join(clauses) + ")"
-
-
 def is_allowed(chunk: KnowledgeChunk, principal: Principal) -> bool:
     """Per-chunk ACL predicate — the single source of truth reused by the
     BM25 in-memory filter and the final authorization pass.
 
-    Mirrors :func:`build_milvus_filter` exactly, so the two channels and the
-    post-rerank re-check never disagree on what a principal may read.
+    Mirrors :func:`app.rag.vectorstore.build_sql_filter` and the ES bool filter
+    exactly, so the two channels and the post-rerank re-check never disagree on
+    what a principal may read.
     """
     if principal.is_admin:
         return True

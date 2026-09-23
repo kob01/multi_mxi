@@ -69,7 +69,7 @@ async def upload_doc(file: UploadFile = File(...), uploader: str = Form("anonymo
 
 @router.post("/ingest")
 async def ingest_doc(req: IngestRequest) -> dict:
-    """Phase 2: chunk + embed + Milvus overwrite + MySQL metadata."""
+    """Phase 2: chunk + embed + pgvector overwrite + document metadata."""
     trace_id = new_trace_id()
     try:
         result = await service.ingest_confirmed(
@@ -91,7 +91,7 @@ async def ingest_doc(req: IngestRequest) -> dict:
 
 @router.put("/{doc_key}/acl")
 async def update_doc_acl(doc_key: str, req: AclRequest) -> dict:
-    """Change a document's visibility (metadata in MySQL + Milvus chunks)."""
+    """Change a document's visibility (metadata table + knowledge chunk rows)."""
     trace_id = new_trace_id()
     try:
         result = await service.update_document_acl(
@@ -99,7 +99,7 @@ async def update_doc_acl(doc_key: str, req: AclRequest) -> dict:
         )
     except service.UploadError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:  # e.g. Milvus unavailable
+    except RuntimeError as exc:  # e.g. database / pgvector unavailable
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     get_audit_logger().log(
         trace_id, "docs", "document_acl_updated",
@@ -112,13 +112,13 @@ async def update_doc_acl(doc_key: str, req: AclRequest) -> dict:
 
 @router.delete("/{doc_key}")
 async def delete_doc(doc_key: str, operator: str = "anonymous") -> dict:
-    """Remove a document: Milvus chunks + MySQL metadata + upload files."""
+    """Remove a document: knowledge chunk rows + metadata + upload files."""
     trace_id = new_trace_id()
     try:
         result = await service.delete_document(doc_key)
     except service.UploadError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:  # e.g. Milvus unavailable
+    except RuntimeError as exc:  # e.g. database / pgvector unavailable
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     get_audit_logger().log(
         trace_id, "docs", "document_deleted",

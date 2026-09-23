@@ -1,8 +1,8 @@
 """Knowledge ingestion pipeline.
 
 Stages: parse (txt/md/pdf/docx/pptx/xlsx + video transcripts + images) into
-section-level blocks -> parent-child chunking -> embed -> upsert into Milvus,
-then rebuild the BM25 channel.
+section-level blocks -> parent-child chunking -> embed -> upsert into the
+pgvector ``knowledge_chunks`` table, then rebuild the BM25 channel.
 
 Document identity: ``doc_id = sha1(file_name + ext)`` — path-independent, so
 re-uploading the same name+type overwrites the previous copy (single-version
@@ -24,7 +24,7 @@ from typing import Sequence
 from app.config import get_settings
 from app.docs.parsers import ParsedBlock, parse_blocks
 from app.rag.embeddings import OllamaEmbedder
-from app.rag.vectorstore import MilvusStore
+from app.rag.vectorstore import PgVectorStore
 from app.schemas import KnowledgeChunk
 
 CHUNK_SIZE = 512
@@ -122,7 +122,7 @@ def build_parent_child_chunks(
     return chunks
 
 
-async def ingest_file(path: Path, store: MilvusStore, embedder: OllamaEmbedder) -> int:
+async def ingest_file(path: Path, store: PgVectorStore, embedder: OllamaEmbedder) -> int:
     """Ingest a single file; returns number of chunks written (parents+children)."""
     doc_id = compute_doc_id(path.stem, path.suffix)
     modality, blocks = await parse_blocks(path)
@@ -136,20 +136,22 @@ async def ingest_blocks(
     source: str,
     modality: str,
     blocks: Sequence[ParsedBlock],
-    store: MilvusStore,
+    store: PgVectorStore,
     embedder: OllamaEmbedder,
     acl: dict[str, str] | None = None,
 ) -> int:
-    """Overwrite-ingest pre-parsed blocks of one document into Milvus."""
+    """Overwrite-ingest pre-parsed blocks of one document into pgvector."""
     chunks = build_parent_child_chunks(doc_id, title, source, modality, blocks, acl=acl)
     if not chunks:
         return 0
-    store.delete_by_doc(doc_id)  # single-version overwrite semantics
+    await store.delete_by_doc(doc_id)  # single-version overwrite semantics
     vectors = await embedder.embed([c.content for c in chunks])
-    return store.upsert(chunks, vectors)
+    return await store.upsert(chunks, vectors)
 
 
-async def ingest_directory(dir_path: Path, store: MilvusStore, embedder: OllamaEmbedder) -> dict[str, int]:
+async def ingest_directory(
+    dir_path: Path, store: PgVectorStore, embedder: OllamaEmbedder
+) -> dict[str, int]:
     """Ingest every supported file under a directory (recursive)."""
     report: dict[str, int] = {}
     for path in sorted(dir_path.rglob("*")):
@@ -164,6 +166,6 @@ async def ingest_directory(dir_path: Path, store: MilvusStore, embedder: OllamaE
     return report
 
 
-def collect_corpus(store: MilvusStore) -> Sequence[KnowledgeChunk]:
+async def collect_corpus(store: PgVectorStore, limit: int = 100000) -> list[KnowledgeChunk]:
     """Fetch the child-chunk corpus (for BM25 rebuild)."""
-    return store.iter_child_chunks()
+    return await store.iter_child_chunks(limit)

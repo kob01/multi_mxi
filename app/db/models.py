@@ -1,22 +1,32 @@
-"""SQLAlchemy ORM models (MySQL): 文档元数据 + HR/Finance 业务表."""
+"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块."""
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Date,
     DateTime,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    func,
 )
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.config import get_settings
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware timestamp (PG 侧列为 timestamptz, naive 值会被错读为本地时区)."""
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -34,17 +44,21 @@ class Document(Base):
     ext: Mapped[str] = mapped_column(String(16))
     modality: Mapped[str] = mapped_column(String(32), default="text")
     file_path: Mapped[str] = mapped_column(String(512), default="")
-    parsed_text: Mapped[str | None] = mapped_column(MEDIUMTEXT, nullable=True)
+    parsed_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # MySQL MEDIUMTEXT -> PG TEXT(无长度上限)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     created_by: Mapped[str] = mapped_column(String(64), default="")
-    # --- 文档级 ACL (权限存储在元数据中; 检索时经 Milvus Metadata Filter 前置裁剪) ---
+    # --- 文档级 ACL (权限存储在元数据中; 检索时经 pgvector Metadata Filter 前置裁剪) ---
     visibility: Mapped[str] = mapped_column(String(16), default="public")  # public/dept/role/private
     owner_id: Mapped[str] = mapped_column(String(64), default="")         # private: 所有者工号
     dept_id: Mapped[str] = mapped_column(String(64), default="")           # dept: 授权部门
     allowed_roles: Mapped[str] = mapped_column(String(128), default="")    # role: 逗号包裹 ",hr,admin,"
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
 
 
 class Tag(Base):
@@ -55,7 +69,9 @@ class Tag(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     source: Mapped[str] = mapped_column(String(16), default="llm")  # llm / custom
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
 
 
 class DocumentTag(Base):
@@ -85,7 +101,9 @@ class Employee(Base):
     annual_leave_total: Mapped[int] = mapped_column(Integer, default=10)
     annual_leave_used: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="在职")  # 在职/离职
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
 
 
 class HRTicket(Base):
@@ -99,8 +117,12 @@ class HRTicket(Base):
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="OPEN")  # OPEN/PROCESSING/DONE/CANCELLED
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
 
 
 class LeaveRecord(Base):
@@ -115,7 +137,9 @@ class LeaveRecord(Base):
     end_date: Mapped[date] = mapped_column(Date)
     days: Mapped[Decimal] = mapped_column(Numeric(5, 1))
     status: Mapped[str] = mapped_column(String(16), default="审批中")  # 审批中/已批准/已驳回
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +158,9 @@ class Reimbursement(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="SUBMITTED")  # SUBMITTED/APPROVED/REJECTED/PAID
     current_node: Mapped[str] = mapped_column(String(64), default="部门主管审批")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
+    )
 
 
 class DepartmentBudget(Base):
@@ -148,3 +174,48 @@ class DepartmentBudget(Base):
     year: Mapped[int] = mapped_column(Integer)
     annual_budget: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     used_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+
+
+# ---------------------------------------------------------------------------
+# RAG 知识块 (原 Milvus Lite collection -> pgvector 表)
+# ---------------------------------------------------------------------------
+class KnowledgeChunkRow(Base):
+    """One retrievable chunk (parent or child) with its dense vector.
+
+    与旧 Milvus schema 一一对应: ``chunk_id`` 主键, ``is_parent`` 区分父块/子块
+    (检索只命中子块), 四个 ACL 标量冗余在每行上供检索前置裁剪。父块也写向量
+    (与旧行为一致), 列可空以便后续只向量化子块。
+    """
+
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        # 稠密 TopK 检索: cosine HNSW (pgvector)。create_all 以非 CONCURRENT 方式
+        # 建索引(需独占事务), 语料上量后应先建表、再手工 CREATE INDEX CONCURRENTLY。
+        Index(
+            "ix_knowledge_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        # 单文档重入库 / ACL 刷新的主路径
+        Index("ix_knowledge_chunks_doc_parent", "doc_id", "is_parent"),
+    )
+
+    chunk_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    doc_id: Mapped[str] = mapped_column(String(64), index=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(512), default="")
+    modality: Mapped[str] = mapped_column(String(32), default="text")
+    parent_id: Mapped[str] = mapped_column(String(80), default="")
+    is_parent: Mapped[bool] = mapped_column(Boolean, default=False)  # 父块不参与检索
+    page_no: Mapped[int] = mapped_column(Integer, default=-1)  # -1 = unknown
+    section: Mapped[str] = mapped_column(String(256), default="")
+    visibility: Mapped[str] = mapped_column(String(16), default="public")
+    owner_id: Mapped[str] = mapped_column(String(64), default="")
+    dept_id: Mapped[str] = mapped_column(String(64), default="")
+    allowed_roles: Mapped[str] = mapped_column(String(128), default="")  # ",hr,admin,"
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )

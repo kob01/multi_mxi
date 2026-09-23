@@ -1,6 +1,6 @@
-"""Hybrid retrieval pipeline: dense (Milvus) + sparse (Elasticsearch BM25) -> RRF -> rerank.
+"""Hybrid retrieval pipeline: dense (pgvector) + sparse (Elasticsearch BM25) -> RRF -> rerank.
 
-Retrieval operates on child chunks only (`is_parent == 0` filter); hit
+Retrieval operates on child chunks only (`is_parent = false` filter); hit
 children are then assembled back into their parent section blocks so the LLM
 receives complete section context instead of truncated fragments.
 
@@ -22,9 +22,9 @@ from app.config import get_settings
 from app.rag.bm25 import ElasticBM25Retriever, get_es_bm25
 from app.rag.embeddings import OllamaEmbedder
 from app.rag.reranker import OllamaReranker
-from app.rag.vectorstore import MilvusStore
+from app.rag.vectorstore import PgVectorStore
 from app.schemas import KnowledgeChunk
-from app.security.acl import Principal, build_milvus_filter
+from app.security.acl import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -61,18 +61,18 @@ class HybridRetriever:
         settings = get_settings()
         self._settings = settings
         self.embedder = OllamaEmbedder()
-        self.store = MilvusStore()
+        self.store = PgVectorStore()
         self.bm25: ElasticBM25Retriever = get_es_bm25()
         self.reranker = OllamaReranker()
 
     async def rebuild_bm25(self) -> None:
-        """Rebuild the ES BM25 index from child chunks stored in Milvus.
+        """Rebuild the ES BM25 index from child chunks stored in PostgreSQL.
 
-        Milvus stays the source of truth for the corpus; the ES index is a
+        PostgreSQL stays the source of truth for the corpus; the ES index is a
         derived lexical view rebuilt wholesale (drop + bulk) so it can never
-        drift after collection resets / migrations.
+        drift after a table reset / migration.
         """
-        await self.bm25.rebuild(self.store.iter_child_chunks())
+        await self.bm25.rebuild(await self.store.iter_child_chunks())
 
     async def retrieve(
         self,
@@ -104,12 +104,10 @@ class HybridRetriever:
         top_k = top_k or self._settings.rag_top_k
         top_n = top_n or self._settings.rerank_top_n
 
-        # 权限前置裁剪: 向量通道用 Milvus Metadata Filter, ES 稀疏通道用
-        # 等价的 bool filter —— 两条通道在 TopK 之前语义严格一致。
-        acl_filter = build_milvus_filter(principal) if principal else ""
-
+        # 权限前置裁剪: 向量通道用 SQL Metadata Filter (build_sql_filter),
+        # ES 稀疏通道用等价的 bool filter —— 两条通道在 TopK 之前语义严格一致。
         query_vec = await self.embedder.embed_query(query)
-        dense_hits = self.store.search(query_vec, top_k, acl_filter=acl_filter)
+        dense_hits = await self.store.search(query_vec, top_k, principal=principal)
         sparse_hits = await self.bm25.search(query, top_k, principal=principal)
         fused = _rrf_fuse(dense_hits, sparse_hits, top_k)
 
@@ -134,7 +132,7 @@ class HybridRetriever:
             return kept, "rerank"
         return reranked, "rerank"
 
-    def assemble_parents(self, chunks: Sequence[KnowledgeChunk]) -> list[KnowledgeChunk]:
+    async def assemble_parents(self, chunks: Sequence[KnowledgeChunk]) -> list[KnowledgeChunk]:
         """Assemble hit child chunks into complete parent section blocks.
 
         Keeps the reranked order: each distinct parent appears once, at the
@@ -148,7 +146,7 @@ class HybridRetriever:
             if pid not in best_child:
                 best_child[pid] = c
                 order.append(pid)
-        parents = self.store.query_parents(order)
+        parents = await self.store.query_parents(order)
         assembled: list[KnowledgeChunk] = []
         for pid in order:
             parent = parents.get(pid)
@@ -163,7 +161,7 @@ class HybridRetriever:
     ) -> str:
         """Render chunks as grounded context for the LLM prompt.
 
-        Each block cites title / section / page and (when MySQL metadata is
+        Each block cites title / section / page and (when document metadata is
         available) the document tags.
         """
         blocks = []

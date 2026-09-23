@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,6 +32,12 @@ from app.db.models import (
 from app.db.session import get_session_factory, init_schema
 
 BUSINESS_TABLES = (Employee, HRTicket, LeaveRecord, Reimbursement, DepartmentBudget)
+
+
+def _ts(dt: datetime) -> datetime:
+    """业务时间列已是 timestamptz: 统一按 UTC 附上时区, 避免驱动对 naive 值的不一致解释。"""
+    return dt.replace(tzinfo=timezone.utc)
+
 
 EMPLOYEES = [
     # emp_id, name, department, position, hire_date, annual_total, annual_used
@@ -132,15 +138,16 @@ async def seed(force: bool) -> None:
                                  hire_date=row[4], annual_leave_total=row[5], annual_leave_used=row[6]))
         for row in TICKETS:
             session.add(HRTicket(ticket_no=row[0], emp_id=row[1], category=row[2], title=row[3],
-                                 description=row[4], status=row[5], created_at=row[6],
-                                 updated_at=row[6]))
+                                 description=row[4], status=row[5], created_at=_ts(row[6]),
+                                 updated_at=_ts(row[6])))
         for row in LEAVES:
             session.add(LeaveRecord(emp_id=row[0], leave_type=row[1], start_date=row[2],
-                                    end_date=row[3], days=row[4], status=row[5], created_at=row[6]))
+                                    end_date=row[3], days=row[4], status=row[5],
+                                    created_at=_ts(row[6])))
         for row in REIMBURSEMENTS:
             session.add(Reimbursement(order_no=row[0], emp_id=row[1], title=row[2], amount=row[3],
                                       category=row[4], reason=row[5], status=row[6],
-                                      current_node=row[7], created_at=row[8]))
+                                      current_node=row[7], created_at=_ts(row[8])))
         for row in BUDGETS:
             session.add(DepartmentBudget(department=row[0], year=row[1],
                                          annual_budget=row[2], used_amount=row[3]))

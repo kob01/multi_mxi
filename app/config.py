@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 敏感项对应的 Docker secret 文件(BuildKit/compose secrets 挂载路径)
 _SECRET_FILES = {
-    "mysql_password": "/run/secrets/mysql_password",
+    "pg_password": "/run/secrets/pg_password",
     "langsmith_api_key": "/run/secrets/langsmith_api_key",
     "deepseek_api_key": "/run/secrets/deepseek_api_key",
 }
@@ -41,9 +41,7 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-flash"
     intent_model: str = "deepseek-flash"
 
-    # RAG (env var named MILVUS_LITE_URI to avoid clashing with pymilvus's own MILVUS_URI)
-    milvus_lite_uri: str = "./data/milvus_lite.db"
-    milvus_collection: str = "enterprise_knowledge"
+    # RAG (向量块与业务元数据同库: PostgreSQL + pgvector, 见 knowledge_chunks 表)
     knowledge_dir: str = "./data/knowledge"
     rag_top_k: int = 8
     rerank_top_n: int = 4
@@ -62,13 +60,28 @@ class Settings(BaseSettings):
     es_url: str = "http://localhost:9200"
     es_index: str = "kb_chunks"
 
-    # Document upload & metadata (MySQL)
-    mysql_host: str = "47.116.208.170"
-    mysql_port: int = 3306
-    mysql_user: str = "sql47_116_208_1"
-    mysql_password: str = ""
-    mysql_database: str = "sql47_116_208_1"
-    mysql_connect_timeout: int = 10
+    # ---------- 统一存储层: PostgreSQL (业务/文档元数据 + pgvector 向量检索) ----------
+    # DATABASE_URL 优先(形如 postgresql+asyncpg://user:pw@host:5432/db); 为空时由
+    # 下面的分散字段拼出 DSN (见 app/db/session.py / app/db/sync.py)。
+    database_url: str = ""
+    pg_host: str = "localhost"
+    pg_port: int = 5432
+    pg_user: str = "mxi"
+    # 密码只来自环境变量 / .env / /run/secrets/pg_password, 绝不硬编码。
+    pg_password: str = ""
+    pg_database: str = "mxi"
+    # disable: 本机/compose 内网直连; require: 自签证书云实例(只加密不校验 CA)。
+    pg_sslmode: str = "disable"
+    pg_connect_timeout: int = 10
+    # Text2SQL 语句级超时, 替代 MySQL 的 MAX_EXECUTION_TIME hint
+    # (由 app/db/sync.py 在执行前 SET LOCAL statement_timeout 注入)。
+    pg_statement_timeout_ms: int = 5000
+    # bge-m3 稠密向量维度; 换 embedding 模型必须同步改这里并全量重建向量表。
+    embedding_dim: int = 1024
+    # 单次 ON CONFLICT upsert 的行数 (避免单语句参数过多)。
+    upsert_batch_size: int = 500
+
+    # Document upload & metadata
     upload_dir: str = "./data/uploads"
     upload_max_mb: int = 50
     # MinerU OCR 服务 (mineru-api, 用于图片解析; 需先启动 mineru-api 服务)
@@ -104,7 +117,7 @@ class Settings(BaseSettings):
     langsmith_project: str = "mxi-assistant"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
-    @field_validator("mysql_password", "deepseek_api_key", "langsmith_api_key", mode="after")
+    @field_validator("pg_password", "deepseek_api_key", "langsmith_api_key", mode="after")
     @classmethod
     def _read_from_secret_file(cls, value: str, info) -> str:
         """环境变量/.env 未提供时, 回退读取 compose secret 文件。"""

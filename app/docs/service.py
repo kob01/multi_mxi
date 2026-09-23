@@ -18,7 +18,7 @@ from app.db.session import get_session_factory
 from app.docs.parsers import modality_of, parse_blocks, supported_extensions
 from app.rag.embeddings import OllamaEmbedder
 from app.rag.ingest import compute_doc_id, ingest_blocks
-from app.rag.vectorstore import MilvusStore
+from app.rag.vectorstore import PgVectorStore
 from app.schemas import DocVisibility
 from app.security.acl import format_allowed_roles
 
@@ -118,8 +118,8 @@ def normalize_acl(
     """Validate + canonicalize the document ACL into its storage form.
 
     Only the fields relevant to the chosen visibility are kept (e.g. a
-    ``dept`` doc ignores allowed_roles), so MySQL and Milvus always store a
-    single consistent representation.
+    ``dept`` doc ignores allowed_roles), so the metadata table and the
+    knowledge_chunks rows always store a single consistent representation.
     """
     try:
         vis = DocVisibility(visibility or "public").value
@@ -150,11 +150,11 @@ async def ingest_confirmed(
     dept_id: str = "",
     allowed_roles: list[str] | str = "",
 ) -> dict[str, Any]:
-    """Phase-2 ingest: parse -> chunk -> embed -> Milvus overwrite -> MySQL.
+    """Phase-2 ingest: parse -> chunk -> embed -> pgvector overwrite -> metadata.
 
     The document ACL (visibility/owner/dept/roles) is validated here, stamped
-    onto every Milvus chunk for retrieval-time metadata filtering, and stored
-    on the MySQL ``documents`` row as the source of truth.
+    onto every knowledge chunk row for retrieval-time metadata filtering, and
+    stored on the ``documents`` row as the source of truth.
 
     Returns a summary dict for the API response.
     """
@@ -167,7 +167,7 @@ async def ingest_confirmed(
     _, blocks = await parse_blocks(path)
     parsed_text = "\n\n".join(b.text for b in blocks)
 
-    store = MilvusStore()
+    store = PgVectorStore()
     embedder = OllamaEmbedder()
     title = path.stem
     chunk_count = await ingest_blocks(
@@ -176,7 +176,7 @@ async def ingest_confirmed(
     if not chunk_count:
         raise UploadError("文档解析后无有效内容")
 
-    # --- MySQL metadata (transactional) ---
+    # --- document metadata (transactional) ---
     # Two pages uploading the same file race here: both SELECTs miss, both
     # INSERT, the loser hits the doc_key unique index. The explicit flush
     # surfaces the conflict before the tag work; one retry then sees the
@@ -200,7 +200,7 @@ async def ingest_confirmed(
                     doc.chunk_count = chunk_count
                     doc.size_bytes = path.stat().st_size
                     doc.modality = modality
-                    # ACL 以 MySQL 为事实来源, 同时冗余写入向量库供检索裁剪
+                    # ACL 以元数据表为事实来源, 同时冗余写入向量表供检索裁剪
                     doc.visibility = acl["visibility"]
                     doc.owner_id = acl["owner_id"]
                     doc.dept_id = acl["dept_id"]
@@ -240,7 +240,7 @@ async def update_document_acl(
     allowed_roles: list[str] | str = "",
     operator: str = "",
 ) -> dict[str, Any]:
-    """Change a document's visibility: MySQL (truth) + Milvus chunk metadata.
+    """Change a document's visibility: metadata table (truth) + chunk ACL columns.
 
     The vector rows carry the ACL used for retrieval-time filtering, so both
     stores are updated in one call; the assistant's ES BM25 index rebuilds
@@ -261,7 +261,7 @@ async def update_document_acl(
         doc.allowed_roles = acl["allowed_roles"]
         await session.commit()
 
-    updated = MilvusStore().update_acl_by_doc(
+    updated = await PgVectorStore().update_acl_by_doc(
         doc_key, acl["visibility"], acl["owner_id"], acl["dept_id"], acl["allowed_roles"]
     )
 
@@ -276,8 +276,8 @@ async def update_document_acl(
     logger.info("document acl updated: doc_key=%s visibility=%s operator=%s", doc_key, acl["visibility"], operator)
     result: dict[str, Any] = {"doc_key": doc_key, **acl, "chunks_updated": updated}
     if updated == 0:
-        # 向量库里没有该文档的任何块 (常见于 collection 被重建/迁移后未重新入库):
-        # 权限只写进了 MySQL, 检索侧不会生效, 必须显式提示而不是静默"成功"。
+        # 向量表里没有该文档的任何块 (常见于表被重建/迁移后未重新入库):
+        # 权限只写进了元数据表, 检索侧不会生效, 必须显式提示而不是静默"成功"。
         result["warning"] = (
             "向量库中未找到该文档的知识块, 权限变更不会生效; 请重新入库该文档。"
         )
@@ -289,7 +289,7 @@ async def update_document_acl(
 
 
 async def delete_document(doc_key: str) -> dict[str, Any]:
-    """Delete a document: Milvus chunks + MySQL metadata + upload files."""
+    """Delete a document: knowledge chunks + metadata + upload files."""
     factory = get_session_factory()
     async with factory() as session:
         doc = (
@@ -299,10 +299,10 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
             raise UploadError("文档不存在或已删除")
         name, file_path = doc.name, doc.file_path
 
-        # Milvus vectors first; MySQL row is the source of truth, so a vector
-        # failure aborts before metadata is lost (chunk leftovers can be
-        # purged by a re-ingest, but a lost metadata row orphans nothing).
-        MilvusStore().delete_by_doc(doc_key)
+        # Vector rows first; the metadata row is the source of truth, so a
+        # vector failure aborts before metadata is lost (chunk leftovers can
+        # be purged by a re-ingest, but a lost metadata row orphans nothing).
+        await PgVectorStore().delete_by_doc(doc_key)
         await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
         await session.execute(delete(Document).where(Document.doc_key == doc_key))
         await session.commit()

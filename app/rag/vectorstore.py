@@ -1,177 +1,108 @@
-"""Milvus Lite vector store wrapper.
+"""PostgreSQL + pgvector knowledge store (替代原 Milvus Lite 向量库).
 
-Milvus Lite runs embedded (single file), which keeps local/dev deployment
-trivial while the same client code works against Milvus Server in K8s by
-simply switching MILVUS_LITE_URI.
+一张 ``knowledge_chunks`` 表同时承担: 稠密向量 ANN 检索、父子块组装取回、
+文档级 ACL 标量前置裁剪 —— 三者在一个 SQL 里完成。因此原 Milvus 方案里两处
+补丁逻辑一并消失: 没有「标量无局部更新 -> 读回整行含向量再 upsert」, 也没有
+gRPC keepalive 被服务端判定 too_many_pings 后必须自愈的连接管理。
 
-Schema carries parent-child chunking fields (parent_id / is_parent /
-page_no / section). Retrieval always filters `is_parent == 0` so only child
-chunks compete; parents are fetched by id afterwards for context assembly.
+检索永远过滤 ``is_parent = false``(只有子块参与 TopK), 命中的父块随后按 id
+批量取回用于上下文组装 —— 与旧 Milvus 行为保持一致。
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
-from pymilvus import DataType, MilvusClient
-from pymilvus.exceptions import MilvusException
+from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import get_settings
-from app.schemas import KnowledgeChunk
+from app.db.models import KnowledgeChunkRow
+from app.db.session import get_session_factory
+from app.schemas import DocVisibility, KnowledgeChunk
+from app.security.acl import Principal
 
 logger = logging.getLogger(__name__)
 
-DENSE_DIM = 1024  # bge-m3 dense dimension
-
-# pymilvus 默认 grpc.keepalive_time_ms=10000 且 PermitWithoutCalls=True, 即空闲
-# 连接也每 10s 发一次 ping; 服务端(Milvus / Milvus Lite)的 keepalive 强制策略
-# 视其为 ping 过频, 累计 3 次后直接回 GOAWAY(ENHANCE_YOUR_CALM,
-# "too_many_pings") 掐断 channel, 并打出
-# "Current keepalive time (before throttling): 10000ms"。
-# 连接空闲约 30s 就会被掐断; pymilvus 2.6 的自动恢复(_recover)对同一坏连接反复
-# 重连失败, 于是进程内后续所有 MilvusClient 都报
-# "Fail connecting to server on 127.0.0.1:xxxxx, illegal connection params or
-# server unavailable", 只能重启进程 —— 大文件入库(上传 + LLM 打标签 +
-# embedding 期间长时间没有 Milvus RPC)必然踩到, 小文件则因间隔短而侥幸通过。
-# Milvus Lite 跑在本机回环上, keepalive 没有意义: 关闭空闲 ping 并拉长间隔。
-GRPC_OPTIONS = {
-    "grpc.keepalive_time_ms": 120000,
-    "grpc.keepalive_timeout_ms": 20000,
-    "grpc.keepalive_permit_without_calls": 0,
-}
-
-OUTPUT_FIELDS = [
-    "chunk_id", "doc_id", "title", "content", "source", "modality",
-    "parent_id", "is_parent", "page_no", "section",
-    "visibility", "owner_id", "dept_id", "allowed_roles",
-]
+# ACL 标量列: 权限变更只需 UPDATE 这些列(向量与 HNSW 索引不受影响)。
+ACL_COLUMNS = ("visibility", "owner_id", "dept_id", "allowed_roles")
+# 主键冲突时需要整体覆盖的列(embedding 也在内 -> 重新入库即刷新向量)。
+UPSERT_COLUMNS = (
+    "doc_id",
+    "title",
+    "content",
+    "source",
+    "modality",
+    "parent_id",
+    "is_parent",
+    "page_no",
+    "section",
+    "embedding",
+    *ACL_COLUMNS,
+)
 
 
-def _reset_connection_manager() -> None:
-    """Drop pymilvus's process-wide connection registry (best effort).
+def build_sql_filter(principal: Principal | None) -> ColumnElement[bool] | None:
+    """SQLAlchemy predicate mirroring the ES bool filter in app.rag.bm25.
 
-    Imported lazily: the manager only exists in newer pymilvus layouts, and an
-    older one simply has nothing to reset (it reconnects on its own).
+    两条检索通道的 ACL 语义必须逐条对应(前置裁剪: 无权文档根本不进候选集,
+    不占 TopK): public 全员 / private 看 owner_id / dept 看 dept_id /
+    role 看逗号包裹的角色串。返回 None 表示不过滤(admin 或受信内部调用)。
+
+    ``allowed_roles`` 以 ",hr,admin," 形式存储, 用 LIKE 匹配; 角色值里的
+    ``%`` / ``_`` / ``\\`` 必须转义, 否则一个含通配符的角色会放大匹配范围。
     """
-    try:
-        from pymilvus.client.connection_manager import ConnectionManager
-    except ImportError:  # pragma: no cover - legacy pymilvus
-        return
-    ConnectionManager.get_instance().close_all()
+    if principal is None or principal.is_admin:
+        return None
+    R = KnowledgeChunkRow
+    clauses: list[ColumnElement[bool]] = [R.visibility == DocVisibility.PUBLIC.value]
+    if principal.user_id:
+        clauses.append(
+            and_(R.visibility == DocVisibility.PRIVATE.value, R.owner_id == principal.user_id)
+        )
+    if principal.department:
+        clauses.append(
+            and_(R.visibility == DocVisibility.DEPT.value, R.dept_id == principal.department)
+        )
+    role = principal.role.value.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    clauses.append(
+        and_(
+            R.visibility == DocVisibility.ROLE.value,
+            R.allowed_roles.like(f"%,{role},%", escape="\\"),
+        )
+    )
+    return or_(*clauses)
 
 
-class MilvusStore:
+class PgVectorStore:
     """Vector persistence + ANN search over enterprise knowledge chunks."""
 
-    def __init__(self, uri: str | None = None, collection: str | None = None) -> None:
-        settings = get_settings()
-        self.uri = self._resolve_uri(uri or settings.milvus_lite_uri)
-        self.collection_name = collection or settings.milvus_collection
-        self._lock = threading.Lock()
-        self._client: MilvusClient | None = None
-        self.client = self._connect()
-        self._ensure_collection()
+    def __init__(self) -> None:
+        # 惰性取工厂: 本对象会在 engine 就绪之前被构造(密码可能还没读到),
+        # 因此构造必须零 I/O。
+        self._factory: async_sessionmaker[AsyncSession] | None = None
 
-    def _connect(self) -> MilvusClient:
-        """Open the Milvus client, self-healing a poisoned shared connection.
+    def _sessions(self) -> async_sessionmaker[AsyncSession]:
+        if self._factory is None:
+            self._factory = get_session_factory()
+        return self._factory
 
-        pymilvus 2.6 keeps connections in a process-wide ConnectionManager
-        singleton keyed by address. If that entry's channel dies (e.g. the
-        server-side keepalive GOAWAY above), ``_recover()`` keeps reconnecting
-        the same broken handler and every later ``MilvusClient`` in the process
-        fails with "Fail connecting to server ... server unavailable" until the
-        process restarts. Dropping the registry makes the next attempt build a
-        fresh channel instead.
-        """
-        if self._client is not None:
-            return self._client
-        with self._lock:
-            if self._client is not None:
-                return self._client
-            try:
-                self._client = MilvusClient(uri=self.uri, grpc_options=GRPC_OPTIONS)
-            except MilvusException:
-                logger.warning("milvus connect failed, rebuilding shared connection", exc_info=True)
-                _reset_connection_manager()
-                self._client = MilvusClient(uri=self.uri, grpc_options=GRPC_OPTIONS)
-        return self._client
-
-    @staticmethod
-    def _resolve_uri(uri: str) -> str:
-        """Anchor relative file URIs to the project root and mkdir parents.
-
-        Milvus Lite auto-creates the db file on first use, but the parent
-        directory must exist, and a relative path would otherwise resolve
-        against the process CWD instead of the project root.
-        """
-        if uri.startswith(("http://", "https://")):
-            return uri
-        path = Path(uri)
-        if not path.is_absolute():
-            path = get_settings().base_dir / path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return str(path)
-
-    def _ensure_collection(self) -> None:
-        """Create collection + index on first use; always load it into memory.
-
-        Milvus Lite collections stay 'released' across processes, so every
-        process opening the db file must explicitly load() before search.
-        A legacy collection without the parent-child fields is dropped and
-        recreated (documents must be re-ingested).
-        """
-        if self.client.has_collection(self.collection_name):
-            fields = {f["name"] for f in self.client.describe_collection(self.collection_name)["fields"]}
-            if "is_parent" not in fields or "visibility" not in fields:
-                logger.warning(
-                    "collection %s uses the legacy schema (missing %s), dropping and "
-                    "recreating; documents must be re-ingested",
-                    self.collection_name,
-                    "is_parent/visibility" if "is_parent" not in fields else "visibility",
-                )
-                self.client.drop_collection(self.collection_name)
-            else:
-                self.client.load_collection(self.collection_name)
-                return
-        schema = self.client.create_schema(auto_id=False, enable_dynamic_field=False)
-        schema.add_field("chunk_id", DataType.VARCHAR, is_primary=True, max_length=80)
-        schema.add_field("doc_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("title", DataType.VARCHAR, max_length=512)
-        schema.add_field("content", DataType.VARCHAR, max_length=8192)
-        schema.add_field("source", DataType.VARCHAR, max_length=512)
-        schema.add_field("modality", DataType.VARCHAR, max_length=32)
-        schema.add_field("parent_id", DataType.VARCHAR, max_length=80)
-        schema.add_field("is_parent", DataType.INT64)  # 1 = parent block, 0 = child chunk
-        schema.add_field("page_no", DataType.INT64)    # -1 = unknown
-        schema.add_field("section", DataType.VARCHAR, max_length=256)
-        # 文档级 ACL: 冗余在每个 chunk 上, 检索时由 Metadata Filter 前置裁剪
-        schema.add_field("visibility", DataType.VARCHAR, max_length=16)   # public/dept/role/private
-        schema.add_field("owner_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("dept_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("allowed_roles", DataType.VARCHAR, max_length=128)  # ",hr,admin,"
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=DENSE_DIM)
-        index_params = self.client.prepare_index_params()
-        index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
-        self.client.create_collection(
-            collection_name=self.collection_name, schema=schema, index_params=index_params
-        )
-        self.client.load_collection(self.collection_name)
-
+    # ------------------------------------------------------------------ 序列化
     @staticmethod
     def _row(c: KnowledgeChunk, v: Sequence[float]) -> dict[str, Any]:
         return {
-            "chunk_id": c.chunk_id,
-            "doc_id": c.doc_id,
+            "chunk_id": c.chunk_id[:80],
+            "doc_id": c.doc_id[:64],
             "title": c.title[:512],
-            "content": c.content[:8192],
+            "content": c.content,
             "source": c.source[:512],
             "modality": c.modality,
-            "parent_id": c.parent_id,
-            "is_parent": 1 if c.is_parent else 0,
+            "parent_id": c.parent_id[:80],
+            "is_parent": c.is_parent,
             "page_no": c.page_no,
             "section": c.section[:256],
             "visibility": c.visibility[:16],
@@ -182,104 +113,151 @@ class MilvusStore:
         }
 
     @staticmethod
-    def _to_chunk(entity: dict[str, Any], score: float = 0.0) -> KnowledgeChunk:
+    def _to_chunk(row: KnowledgeChunkRow, score: float = 0.0) -> KnowledgeChunk:
         return KnowledgeChunk(
-            chunk_id=entity["chunk_id"],
-            doc_id=entity["doc_id"],
-            title=entity["title"],
-            content=entity["content"],
-            source=entity["source"],
-            modality=entity.get("modality", "text"),
-            parent_id=entity.get("parent_id", ""),
-            is_parent=bool(entity.get("is_parent", 0)),
-            page_no=int(entity.get("page_no", -1)),
-            section=entity.get("section", ""),
-            visibility=entity.get("visibility") or "public",
-            owner_id=entity.get("owner_id", ""),
-            dept_id=entity.get("dept_id", ""),
-            allowed_roles=entity.get("allowed_roles", ""),
+            chunk_id=row.chunk_id,
+            doc_id=row.doc_id,
+            title=row.title,
+            content=row.content,
+            source=row.source,
+            modality=row.modality or "text",
+            parent_id=row.parent_id or "",
+            is_parent=bool(row.is_parent),
+            page_no=int(row.page_no),
+            section=row.section or "",
+            visibility=row.visibility or "public",
+            owner_id=row.owner_id or "",
+            dept_id=row.dept_id or "",
+            allowed_roles=row.allowed_roles or "",
             score=score,
         )
 
-    def upsert(self, chunks: Sequence[KnowledgeChunk], vectors: Sequence[Sequence[float]]) -> int:
-        """Insert or update chunks with their dense vectors."""
+    # -------------------------------------------------------------------- 写入
+    async def upsert(
+        self, chunks: Sequence[KnowledgeChunk], vectors: Sequence[Sequence[float]]
+    ) -> int:
+        """Insert or update chunks with their dense vectors (batched ON CONFLICT)."""
         assert len(chunks) == len(vectors), "chunks/vectors length mismatch"
         rows = [self._row(c, v) for c, v in zip(chunks, vectors)]
-        self.client.upsert(collection_name=self.collection_name, data=rows)
+        if not rows:
+            return 0
+        batch = max(1, get_settings().upsert_batch_size)
+        async with self._sessions()() as session:
+            async with session.begin():
+                for start in range(0, len(rows), batch):
+                    stmt = pg_insert(KnowledgeChunkRow).values(rows[start : start + batch])
+                    await session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=[KnowledgeChunkRow.chunk_id],
+                            set_={col: stmt.excluded[col] for col in UPSERT_COLUMNS},
+                        )
+                    )
         return len(rows)
 
-    def search(self, query_vector: Sequence[float], top_k: int, acl_filter: str = "") -> list[KnowledgeChunk]:
-        """ANN cosine search over child chunks; returns chunks with score.
-
-        ``acl_filter`` is a Milvus scalar-expression built from the caller's
-        Principal (see app.security.acl); it pre-trims unauthorized documents
-        *before* TopK so they never compete for retrieval slots.
-        """
-        expr = "is_parent == 0"
-        if acl_filter:
-            expr = f"({expr}) and ({acl_filter})"
-        results = self.client.search(
-            collection_name=self.collection_name,
-            data=[list(query_vector)],
-            limit=top_k,
-            filter=expr,
-            output_fields=OUTPUT_FIELDS,
-        )
-        return [self._to_chunk(hit["entity"], float(hit["distance"])) for hit in results[0]]
-
-    def query_parents(self, parent_ids: Sequence[str]) -> dict[str, KnowledgeChunk]:
-        """Fetch parent blocks by chunk_id (for context assembly)."""
-        if not parent_ids:
-            return {}
-        quoted = ", ".join(f'"{pid}"' for pid in parent_ids)
-        rows = self.client.query(
-            collection_name=self.collection_name,
-            filter=f"chunk_id in [{quoted}]",
-            output_fields=OUTPUT_FIELDS,
-            limit=len(parent_ids),
-        )
-        return {r["chunk_id"]: self._to_chunk(r) for r in rows}
-
-    def iter_child_chunks(self, limit: int = 16384) -> list[KnowledgeChunk]:
-        """Return all child chunks (BM25 corpus rebuild)."""
-        rows = self.client.query(
-            collection_name=self.collection_name,
-            filter="is_parent == 0",
-            output_fields=OUTPUT_FIELDS,
-            limit=limit,
-        )
-        return [self._to_chunk(r) for r in rows]
-
-    def delete_by_doc(self, doc_id: str) -> None:
+    async def delete_by_doc(self, doc_id: str) -> int:
         """Remove all chunks of a document (used for overwrite re-ingest)."""
-        self.client.delete(collection_name=self.collection_name, filter=f'doc_id == "{doc_id}"')
+        async with self._sessions()() as session:
+            res = await session.execute(
+                delete(KnowledgeChunkRow).where(KnowledgeChunkRow.doc_id == doc_id)
+            )
+            await session.commit()
+        return int(res.rowcount or 0)
 
-    def update_acl_by_doc(
+    async def update_acl_by_doc(
         self, doc_id: str, visibility: str, owner_id: str, dept_id: str, allowed_roles: str
     ) -> int:
         """Rewrite the ACL metadata on every chunk row of a document.
 
-        Milvus has no partial scalar update: we read the rows back (with their
-        vectors), patch the four ACL fields, and upsert. Vectors are unchanged,
-        so the ANN index stays consistent with MySQL as the source of truth.
+        pgvector 支持标量列原地 UPDATE: 向量不变、HNSW 索引不受影响, 这正是旧
+        Milvus 方案必须「读回整行含 embedding 再 upsert」的地方。
         """
-        rows = self.client.query(
-            collection_name=self.collection_name,
-            filter=f'doc_id == "{doc_id}"',
-            output_fields=OUTPUT_FIELDS + ["embedding"],
-            limit=16384,
-        )
-        if not rows:
-            return 0
-        for r in rows:
-            r["visibility"] = visibility[:16]
-            r["owner_id"] = owner_id[:64]
-            r["dept_id"] = dept_id[:64]
-            r["allowed_roles"] = allowed_roles[:128]
-        self.client.upsert(collection_name=self.collection_name, data=rows)
-        return len(rows)
+        async with self._sessions()() as session:
+            res = await session.execute(
+                update(KnowledgeChunkRow)
+                .where(KnowledgeChunkRow.doc_id == doc_id)
+                .values(
+                    visibility=visibility[:16],
+                    owner_id=owner_id[:64],
+                    dept_id=dept_id[:64],
+                    allowed_roles=allowed_roles[:128],
+                )
+            )
+            await session.commit()
+        return int(res.rowcount or 0)
 
-    def count(self) -> int:
+    # -------------------------------------------------------------------- 检索
+    async def search(
+        self,
+        query_vector: Sequence[float],
+        top_k: int,
+        principal: Principal | None = None,
+    ) -> list[KnowledgeChunk]:
+        """ANN cosine TopK over child chunks; score = cosine distance (越小越相关).
+
+        ``is_parent = false`` 与 ACL 谓词都作用在 ORDER BY ... LIMIT 之前, 与 ES
+        通道的 bool filter 语义一致。score 是「距离」而非旧 Milvus 的「相似度」,
+        只用于排序与 RRF 融合(下游会被 RRF/rerank 分数覆盖)—— 全链路唯一相关性
+        阈值本来就只作用在 rerank 阶段, 故无需在此设阈值。
+        """
+        dist = KnowledgeChunkRow.embedding.cosine_distance(list(query_vector))
+        stmt = (
+            select(KnowledgeChunkRow, dist.label("score"))
+            .where(KnowledgeChunkRow.is_parent.is_(False))
+            .order_by(dist)
+            .limit(top_k)
+        )
+        if (acl := build_sql_filter(principal)) is not None:
+            stmt = stmt.where(acl)
+        async with self._sessions()() as session:
+            # HNSW 默认 ef_search=100: TopK 很小(默认 8)时够用, 但带标量过滤时
+            # 候选会被筛掉一部分, 抬高 ef 以保证召回与旧 Milvus 持平。
+            await session.execute(text(f"SET LOCAL hnsw.ef_search = {max(100, top_k * 8)}"))
+            hits = (await session.execute(stmt)).all()
+            # 实体 -> DTO 必须在会话内完成: 下面的 rollback 会 expire 所有实体,
+            # 出块后再取属性就是 DetachedInstanceError。
+            chunks = [self._to_chunk(row, float(score)) for row, score in hits]
+            await session.rollback()  # 结束 SET LOCAL 所在的隐式事务, 不污染连接池
+        return chunks
+
+    async def query_parents(self, parent_ids: Sequence[str]) -> dict[str, KnowledgeChunk]:
+        """Fetch parent blocks by chunk_id (for context assembly)."""
+        if not parent_ids:
+            return {}
+        async with self._sessions()() as session:
+            rows = (
+                await session.execute(
+                    select(KnowledgeChunkRow).where(
+                        KnowledgeChunkRow.chunk_id.in_(list(parent_ids))
+                    )
+                )
+            ).scalars().all()
+            return {r.chunk_id: self._to_chunk(r) for r in rows}
+
+    async def iter_child_chunks(self, limit: int = 100000) -> list[KnowledgeChunk]:
+        """Return all child chunks (BM25 corpus rebuild)."""
+        async with self._sessions()() as session:
+            rows = (
+                await session.execute(
+                    select(KnowledgeChunkRow)
+                    .where(KnowledgeChunkRow.is_parent.is_(False))
+                    .order_by(KnowledgeChunkRow.chunk_id)
+                    .limit(limit)
+                )
+            ).scalars().all()
+            chunks = [self._to_chunk(r) for r in rows]
+        if len(chunks) >= limit:
+            logger.warning(
+                "BM25 corpus hit the row limit (%d); sparse channel is partial, raise the limit", limit
+            )
+        return chunks
+
+    async def count(self) -> int:
         """Return number of stored chunks (parents + children)."""
-        stats = self.client.get_collection_stats(self.collection_name)
-        return int(stats.get("row_count", 0))
+        async with self._sessions()() as session:
+            return int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(KnowledgeChunkRow)
+                    )
+                ).scalar_one()
+            )

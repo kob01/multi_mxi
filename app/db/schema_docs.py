@@ -9,6 +9,18 @@ HR/Finance Agent 的 System Prompt 会注入对应 DDL 说明, LLM 据此生成 
 
 from __future__ import annotations
 
+# 方言语义: LLM 习惯写 MySQL, 这里显式约束到 PostgreSQL, 避免
+# DATE_FORMAT / IFNULL / GROUP_CONCAT 这类在上游必然报错的写法。
+SQL_DIALECT_NOTES = """\
+
+SQL 方言 (PostgreSQL) 硬性要求:
+- 只写单条 SELECT (或 WITH ... SELECT), 不要分号、不要注释、不要 SET/COPY/INTO。
+- 日期格式化用 to_char(col, 'YYYY-MM-DD'); 取年份用 EXTRACT(YEAR FROM col)
+  或 date_part('year', col); 没有 DATE_FORMAT / CURDATE / IFNULL。
+- 空值兜底用 COALESCE; 字符串聚合用 string_agg(x, ',') (没有 GROUP_CONCAT)。
+- 取当年数据: created_at >= date_trunc('year', now())。
+- 表/列名小写不加反引号, 字符串用单引号; 无 LIMIT 时系统会自动补 LIMIT 50。"""
+
 HR_SCHEMA_DDL = """\
 -- HR 业务表 (只读, Text2SQL 可查)
 hr_employees 员工主数据:
@@ -28,7 +40,7 @@ hr_tickets HR 工单:
   title VARCHAR(255)         -- 标题
   description TEXT           -- 详细描述
   status VARCHAR(16)         -- OPEN/PROCESSING/DONE/CANCELLED
-  created_at DATETIME        -- 创建时间
+  created_at TIMESTAMPTZ     -- 创建时间
 
 hr_leave_records 请假记录:
   id BIGINT PK 自增
@@ -37,7 +49,7 @@ hr_leave_records 请假记录:
   start_date DATE, end_date DATE
   days DECIMAL(5,1)          -- 请假天数
   status VARCHAR(16)         -- 审批中/已批准/已驳回
-  created_at DATETIME"""
+  created_at TIMESTAMPTZ""" + SQL_DIALECT_NOTES
 
 FINANCE_SCHEMA_DDL = """\
 -- Finance 业务表 (只读, Text2SQL 可查; hr_employees 用于员工->部门关联)
@@ -50,7 +62,7 @@ fin_reimbursements 报销单:
   reason TEXT                -- 事由
   status VARCHAR(16)         -- SUBMITTED(已提交)/APPROVED(已批准)/REJECTED(已驳回)/PAID(已打款)
   current_node VARCHAR(64)   -- 当前审批节点
-  created_at DATETIME        -- 提交时间
+  created_at TIMESTAMPTZ     -- 提交时间
 
 fin_department_budgets 部门年度预算:
   department VARCHAR(64)     -- 部门
@@ -60,4 +72,4 @@ fin_department_budgets 部门年度预算:
 
 hr_employees 员工主数据:
   emp_id VARCHAR(32) PK, name VARCHAR(64), department VARCHAR(64),
-  position VARCHAR(64), hire_date DATE, status VARCHAR(16)"""
+  position VARCHAR(64), hire_date DATE, status VARCHAR(16)""" + SQL_DIALECT_NOTES

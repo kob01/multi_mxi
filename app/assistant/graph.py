@@ -11,7 +11,7 @@ Routing policy (single-entry multi-agent):
         agent_delegate  -> agent_delegate (Assistant -> A2A specialist)
     -> [persist_memory] -> END
 
-kb_retrieve runs hybrid search (Milvus dense + Elasticsearch BM25 -> RRF ->
+kb_retrieve runs hybrid search (pgvector dense + Elasticsearch BM25 -> RRF ->
 rerank). The ONLY relevance cutoff is the rerank confidence threshold: hits
 scoring below it are treated as noise, so an empty result means "no relevant
 document". On the first miss the query is re-rewritten with a different
@@ -263,7 +263,7 @@ class AssistantOrchestrator:
         children, score_mode = await retriever.retrieve(query, principal=principal)
         # Assemble hit child chunks into complete parent section blocks so
         # the LLM answers from full sections (with page/section citations).
-        chunks = retriever.assemble_parents(children) if children else []
+        chunks = await retriever.assemble_parents(children) if children else []
         # 最终授权校验 (纵深防御): 进入 Context Builder 前逐条复核, 拦截
         # 父块组装/索引脏数据可能引入的越权块; 无权块在拼接前剔除并审计。
         authorized: list[KnowledgeChunk] = []
@@ -286,7 +286,7 @@ class AssistantOrchestrator:
                 from app.docs.service import get_meta_map
 
                 meta_map = await get_meta_map(list({c.doc_id for c in authorized}))
-            except Exception as exc:  # MySQL down must not break chat
+            except Exception as exc:  # database down must not break chat
                 logger.warning("doc metadata lookup failed, degrade to plain context: %s", exc)
         attempt = int(state.get("kb_attempt") or 0) + 1
         top_score = max((c.score for c in authorized), default=None)

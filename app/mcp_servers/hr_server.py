@@ -1,9 +1,9 @@
 """HR ticket-system MCP Server (FastMCP, streamable-http transport).
 
-Wraps the enterprise HR backend stored in MySQL (hr_employees / hr_tickets /
-hr_leave_records) as standard MCP tools so any MCP-compatible client can call
-them. Also exposes a read-only Text2SQL tool (execute_sql) with a hard
-table whitelist.
+Wraps the enterprise HR backend stored in PostgreSQL (hr_employees /
+hr_tickets / hr_leave_records) as standard MCP tools so any MCP-compatible
+client can call them. Also exposes a read-only Text2SQL tool (execute_sql)
+with a hard table whitelist.
 
 Run:
     python -m app.mcp_servers.hr_server          # serves http://0.0.0.0:8001/mcp
@@ -11,7 +11,7 @@ Run:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -32,7 +32,7 @@ ALLOWED_TABLES = {"hr_employees", "hr_tickets", "hr_leave_records"}
 
 def _next_ticket_no(session: Session) -> str:
     max_no = session.execute(
-        text("SELECT COALESCE(MAX(CAST(SUBSTRING(ticket_no, 3) AS SIGNED)), 999) FROM hr_tickets")
+        text("SELECT COALESCE(MAX(CAST(SUBSTRING(ticket_no, 3) AS INTEGER)), 999) FROM hr_tickets")
     ).scalar_one()
     return f"HR{int(max_no) + 1}"
 
@@ -72,7 +72,8 @@ def create_hr_ticket(user_id: str, category: str, title: str, description: str) 
             title=title,
             description=description,
             status="OPEN",
-            created_at=datetime.now(),
+            # timestamptz 列: 必须传带时区的值
+            created_at=datetime.now(timezone.utc),
         )
         session.add(ticket)
         session.commit()
@@ -167,7 +168,7 @@ def execute_sql(sql: str) -> list[dict[str, Any]]:
     本工具用于统计/明细等灵活查询。
 
     Args:
-        sql: A single read-only MySQL SELECT statement against whitelisted tables.
+        sql: A single read-only PostgreSQL SELECT statement against whitelisted tables.
 
     Returns:
         One result object: {columns, rows, rowcount}, or an error payload list.

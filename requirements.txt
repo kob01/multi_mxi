@@ -21,7 +21,7 @@ langchain-mcp-adapters>=0.1.0
 a2a-sdk[http-server]>=0.3.0,<0.4.0
 
 # RAG stack
-pymilvus[milvus_lite]>=2.4.8,<3  # milvus-lite is an optional extra since pymilvus 2.5
+pgvector>=0.2.9           # knowledge_chunks.embedding (HNSW / cosine ANN)
 elasticsearch>=8.0,<9  # BM25 稀疏检索通道 (jieba 预分词, 无需分词插件)
 jieba>=0.42.1
 pypdf>=5.0.0
@@ -29,8 +29,10 @@ python-docx>=1.1.2
 openpyxl>=3.1.5
 python-multipart>=0.0.9
 
-# Document management (upload / metadata / multi-modal parsing)
+# Document management + unified storage (PostgreSQL: metadata / business tables / vectors)
+# 异步侧用 asyncpg (网关与 RAG), 同步侧用 psycopg3 (FastMCP 工具是普通函数)
 sqlalchemy[asyncio]>=2.0.30
-aiomysql>=0.2.0
+asyncpg>=0.29.0
+psycopg[binary]>=3.1.21
 python-pptx>=1.0.0
 pillow>=10.0.0
