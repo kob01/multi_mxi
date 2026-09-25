@@ -1,12 +1,10 @@
-"""PostgreSQL + pgvector knowledge store (替代原 Milvus Lite 向量库).
+"""PostgreSQL + pgvector knowledge store.
 
 一张 ``knowledge_chunks`` 表同时承担: 稠密向量 ANN 检索、父子块组装取回、
-文档级 ACL 标量前置裁剪 —— 三者在一个 SQL 里完成。因此原 Milvus 方案里两处
-补丁逻辑一并消失: 没有「标量无局部更新 -> 读回整行含向量再 upsert」, 也没有
-gRPC keepalive 被服务端判定 too_many_pings 后必须自愈的连接管理。
+文档级 ACL 标量前置裁剪 —— 三者在一个 SQL 里完成。
 
 检索永远过滤 ``is_parent = false``(只有子块参与 TopK), 命中的父块随后按 id
-批量取回用于上下文组装 —— 与旧 Milvus 行为保持一致。
+批量取回用于上下文组装。
 """
 
 from __future__ import annotations
@@ -168,8 +166,7 @@ class PgVectorStore:
     ) -> int:
         """Rewrite the ACL metadata on every chunk row of a document.
 
-        pgvector 支持标量列原地 UPDATE: 向量不变、HNSW 索引不受影响, 这正是旧
-        Milvus 方案必须「读回整行含 embedding 再 upsert」的地方。
+        pgvector 支持标量列原地 UPDATE: 向量不变、HNSW 索引不受影响。
         """
         async with self._sessions()() as session:
             res = await session.execute(
@@ -195,7 +192,7 @@ class PgVectorStore:
         """ANN cosine TopK over child chunks; score = cosine distance (越小越相关).
 
         ``is_parent = false`` 与 ACL 谓词都作用在 ORDER BY ... LIMIT 之前, 与 ES
-        通道的 bool filter 语义一致。score 是「距离」而非旧 Milvus 的「相似度」,
+        通道的 bool filter 语义一致。score 是「距离」,
         只用于排序与 RRF 融合(下游会被 RRF/rerank 分数覆盖)—— 全链路唯一相关性
         阈值本来就只作用在 rerank 阶段, 故无需在此设阈值。
         """
@@ -210,7 +207,6 @@ class PgVectorStore:
             stmt = stmt.where(acl)
         async with self._sessions()() as session:
             # HNSW 默认 ef_search=100: TopK 很小(默认 8)时够用, 但带标量过滤时
-            # 候选会被筛掉一部分, 抬高 ef 以保证召回与旧 Milvus 持平。
             await session.execute(text(f"SET LOCAL hnsw.ef_search = {max(100, top_k * 8)}"))
             hits = (await session.execute(stmt)).all()
             # 实体 -> DTO 必须在会话内完成: 下面的 rollback 会 expire 所有实体,

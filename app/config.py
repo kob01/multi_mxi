@@ -67,7 +67,6 @@ class Settings(BaseSettings):
     pg_host: str = "localhost"
     pg_port: int = 5432
     pg_user: str = "mxi"
-    # 密码只来自环境变量 / .env / /run/secrets/pg_password, 绝不硬编码。
     pg_password: str = ""
     pg_database: str = "mxi"
     # disable: 本机/compose 内网直连; require: 自签证书云实例(只加密不校验 CA)。

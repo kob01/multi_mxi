@@ -26,10 +26,7 @@ def _password() -> str:
     password = get_settings().pg_password
     if not password:
         raise RuntimeError(
-            "缺少 PostgreSQL 密码: 请设置环境变量 PG_PASSWORD, "
-            "或在项目根目录 .env / docker/.env 中添加 PG_PASSWORD=..., "
-            "Docker 部署则创建 docker/secrets/pg_password.txt"
-            "(容器内挂载为 /run/secrets/pg_password)"
+            "缺少 PostgreSQL 密码，请设置环境变量 PG_PASSWORD"
         )
     return password
 
@@ -47,22 +44,20 @@ def async_database_url() -> str:
 
 
 def _connect_args() -> dict:
-    """asyncpg does not understand libpq's ``sslmode``; pass an SSLContext."""
+    """Connect args for asyncpg, mapping ``PG_SSLMODE`` straight through.
+
+    asyncpg 的 ``ssl`` 参数接受 libpq 风格的模式名(disable/allow/prefer/require/
+    verify-ca/verify-full): disable 会归一为明文, require 及以上由 asyncpg 自己
+    建 SSLContext(verify-full 才做主机名校验)。
+    必须显式传: 不传时 asyncpg 默认 ``prefer``, 那会让 PG_SSLMODE=disable 形同失效
+    (先试 SSL 再回退明文, 报出来的是 SSL 协商栈而不是真正的连接问题)。
+    """
     settings = get_settings()
-    args: dict = {
+    return {
         "timeout": settings.pg_connect_timeout,
         "server_settings": {"application_name": "mxi-assistant"},
+        "ssl": settings.pg_sslmode,
     }
-    if settings.pg_sslmode != "disable":
-        import ssl
-
-        ctx = ssl.create_default_context()
-        if settings.pg_sslmode == "require":
-            # 自签证书云实例: 只要求链路加密, 不校验 CA / 主机名。
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        args["ssl"] = ctx
-    return args
 
 
 def get_engine() -> AsyncEngine:
@@ -96,8 +91,16 @@ _DOC_ACL_COLUMNS = {
 
 
 def _documents_columns(sync_conn) -> set[str]:
-    """Existing column names of ``documents`` via the dialect inspector (no raw SQL)."""
-    return {c["name"] for c in inspect(sync_conn).get_columns("documents")}
+    """Existing column names of ``documents`` via the dialect inspector (no raw SQL).
+
+    表不存在时必须返空集而不是让 inspector 去查: 首次建库时 documents 还不存在,
+    直接 get_columns 会让 SQLAlchemy 吐一条 "... does not exist" 的 WARNING,
+    紧接着 create_all 就把表建出来了 —— 那条告警纯误导。
+    """
+    insp = inspect(sync_conn)
+    if not insp.has_table("documents"):
+        return set()
+    return {c["name"] for c in insp.get_columns("documents")}
 
 
 async def init_schema() -> None:

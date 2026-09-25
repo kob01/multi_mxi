@@ -1,4 +1,3 @@
-data/milvus_lite.db
 logs/
 .venv/
 __pycache__/

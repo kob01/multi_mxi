@@ -177,12 +177,12 @@ class DepartmentBudget(Base):
 
 
 # ---------------------------------------------------------------------------
-# RAG 知识块 (原 Milvus Lite collection -> pgvector 表)
+# RAG 知识块
 # ---------------------------------------------------------------------------
 class KnowledgeChunkRow(Base):
     """One retrievable chunk (parent or child) with its dense vector.
 
-    与旧 Milvus schema 一一对应: ``chunk_id`` 主键, ``is_parent`` 区分父块/子块
+    ``chunk_id`` 主键, ``is_parent`` 区分父块/子块
     (检索只命中子块), 四个 ACL 标量冗余在每行上供检索前置裁剪。父块也写向量
     (与旧行为一致), 列可空以便后续只向量化子块。
     """

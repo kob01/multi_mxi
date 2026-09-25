@@ -27,7 +27,7 @@ MCP 工具调用、A2A 专业智能体委派。
 ```
 
 > 存储层统一为一个 PostgreSQL 实例: 文档/业务元数据与向量知识块同库同连接池
-> (原 MySQL + Milvus Lite 的组合已合并), Elasticsearch 仅作为可全量重建的 BM25
+> Elasticsearch 仅作为可全量重建的 BM25
 > 派生索引保留。
 
 A2A 遵循 Agent2Agent 协议:Agent Card 发布于 `/.well-known/agent-card.json`,
@@ -149,7 +149,6 @@ mxi/
 ├── scripts/
 │   ├── ingest_knowledge.py       # 知识库构建脚本
 │   ├── init_db.py                # PostgreSQL + pgvector 建表/自检
-│   ├── migrate_mxi_storage.py    # 一次性迁移: MySQL + Milvus Lite -> PostgreSQL
 │   └── demo_reimburse.py         # 端到端 demo:我要报销
 ├── data/knowledge/               # 样例语料(制度 md + 培训视频字幕 srt)
 ├── web/index.html                # Web 聊天界面
@@ -170,29 +169,14 @@ ollama pull bge-m3
 ollama pull dengcao/bge-reranker-v2-m3
 ```
 
-MinerU 图片解析(上传 jpg/png 等图片时需要),任选其一:
-
-```bash
-# 方式 A: Docker Compose 内置服务(推荐, 本地构建 docker/mineru/Dockerfile,
-# 已补齐 slim 镜像缺失的 cv2 系统库 libxcb/libGL 等; 首次启动自动从 ModelScope 下载模型)
-docker compose -f docker/docker-compose.yml --profile mineru up -d mineru
-# 方式 B: pip 安装 (Python 3.10+, GPU 可选 vlm 后端)
-pip install "mineru[core]"
-mineru-api --host 0.0.0.0 --port 8888
-```
-
-(默认 `.env` 的 `MINERU_BASE_URL=http://host.docker.internal:8888` 指向宿主机端口,
-三种方式均可被容器内 assistant 访问)
-
 ### Docker Compose 启动(推荐)
 
 compose 里的 `postgres` 服务以 secret 文件读取数据库密码, 首次部署需先创建它
 (`docker/secrets/` 已被 .gitignore 排除, 不会进仓库):
 
 ```bash
-mkdir -p docker/secrets && echo '<你的 PG 密码>' > docker/secrets/pg_password.txt
-cp .env docker/.env   # 然后按容器语义改: PG_HOST=postgres、OLLAMA_BASE_URL=host.docker.internal
-docker compose -f docker/docker-compose.yml up -d --build
+# mineru 带 profiles: [mineru], 不显式加 --profile 会被 up 静默跳过(图片解析不可用)
+docker compose -f docker/docker-compose.yml --profile mineru up -d --build
 # 建表 + pgvector 扩展(网关启动时也会自动完成, 这里显跑一次便于看报错)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.init_db
 # 构建知识库(可选; 现在也可通过 Web 上传)
@@ -202,29 +186,6 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 # Web 聊天: http://localhost:8000   文档管理: http://localhost:8000/upload
 ```
 
-### 从 MySQL + Milvus Lite 迁移存量数据
-
-一次性脚本把旧元数据/业务表与旧 Milvus 向量块都灌进 PostgreSQL(可重跑):
-
-```bash
-# 1) 起 PG 并建好 schema
-uv run python -m scripts.init_db
-
-# 2) 搬数据 (脚本需要临时读 MySQL, 所以临时带上 pymysql/pymilvus)
-uv run --with pymysql --with pymilvus python -m scripts.migrate_mxi_storage \
-    --mysql-url "mysql+pymysql://user:pw@host:3306/dbname?charset=utf8mb4" \
-    --milvus-uri ./data/milvus_lite.db
-
-# 不想搬向量 (或旧 collection 已被清): 只搬元数据, 向量重新入库
-uv run --with pymysql python -m scripts.migrate_mxi_storage --mysql-url "..." --skip-vectors
-uv run python -m scripts.ingest_knowledge --dir ./data/knowledge
-
-# 3) 校验行数一致后重刷 ES 派生索引, 确认无误再删除 data/milvus_lite.db/
-```
-
-旧向量列含 `is_parent=1` 的父块也会一并搬迁(检索不命中它们, 仅用于父块组装)。
-若单文档块数超过 Milvus 单次 query 上限(16384), 脚本会打 WARNING, 该文档建议重新入库。
-
 ### 本地开发
 
 ```bash
@@ -232,11 +193,8 @@ uv run python -m scripts.ingest_knowledge --dir ./data/knowledge
 pip install uv
 uv sync
 
-# 配置敏感信息: 在项目根目录 .env 填写 PG_PASSWORD=... 与 DEEPSEEK_API_KEY=...
-# (该文件已被 .gitignore 排除); 也可直接设置环境变量 (PowerShell: $env:DEEPSEEK_API_KEY="...")
-
 # 本地需先有一个带 pgvector 扩展的 PostgreSQL (推荐容器):
-#   docker compose -f docker/docker-compose.yml up -d postgres
+docker compose -f docker/docker-compose.yml up -d postgres
 
 # 1. 建表自检(含 CREATE EXTENSION vector)
 uv run python -m scripts.init_db
@@ -252,24 +210,17 @@ uv run uvicorn app.main:app --port 8000
 
 # Web 聊天: http://localhost:8000
 # 文档上传/管理: http://localhost:8000/upload
-# 命令行方式构建知识库(首次或批量):
-uv run python -m scripts.ingest_knowledge --dir ./data/knowledge
 ```
+
+知识文件放宿主机 `data/knowledge/`,经 assistant 服务的 `../data:/data` 挂载映射为容器内
+`/data/knowledge`。镜像 WORKDIR 是 `/srv`,写成 `--dir ./data/knowledge` 会解析到
+`/srv/data/knowledge` —— 那是构建时 `COPY data/knowledge` 进去的快照,新增文件不重建镜像就读不到。
+`docker/data/knowledge/` 未被 compose 任何服务挂载(已作为遗留目录清理), 不要往那里放文件。
 
 ### LangGraph Studio + LangSmith 可视化调试(仅本地开发)
 
 生产容器默认关闭 tracing(`LANGSMITH_TRACING=false`), 对话数据不会上传; 以下能力仅在开发机启用。
 
-```bash
-# 1. 在 .env 中开启并填入你在 https://smith.langchain.com 申请的密钥
-#    LANGSMITH_TRACING=true
-#    LANGSMITH_API_KEY=ls_...
-
-# 2. 启动 Studio 本地 dev server (图定义见 langgraph.json -> assistant)
-uv run langgraph dev
-# 自动打开浏览器进入 LangGraph Studio, 可可视化编辑/运行编排图、
-# 单节点调试、断点回放; 每次运行同时作为 trace 上报 LangSmith 项目 mxi-assistant
-```
 
 - `uv sync` 已自动安装 dev 组依赖(`langgraph-cli[inmem]`), 不会进入生产镜像(Dockerfile 用 `--no-dev`)。
 - LangSmith trace 与现有 `audit.jsonl` 全链路审计互补: 前者面向开发调试/评估, 后者面向合规留痕。

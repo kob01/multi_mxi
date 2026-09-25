@@ -35,9 +35,7 @@ def get_chat_model(
 
         if not settings.deepseek_api_key:
             raise RuntimeError(
-                "缺少 DeepSeek API 密钥: 本地开发请在 .env 设置 DEEPSEEK_API_KEY, "
-                "Docker 部署请创建 docker/secrets/deepseek_api_key.txt "
-                "(容器内挂载为 /run/secrets/deepseek_api_key)"
+                "缺少 DeepSeek API 密钥"
             )
         kwargs: dict = {
             "model": name,

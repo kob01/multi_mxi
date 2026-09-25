@@ -34,10 +34,7 @@ def _ensure_password() -> str:
     password = get_settings().pg_password
     if not password:
         raise RuntimeError(
-            "缺少 PostgreSQL 密码: 请设置环境变量 PG_PASSWORD, "
-            "或在项目根目录 .env / docker/.env 中添加 PG_PASSWORD=..., "
-            "Docker 部署则创建 docker/secrets/pg_password.txt"
-            "(容器内挂载为 /run/secrets/pg_password)"
+            "缺少 PostgreSQL 密码，请设置环境变量 PG_PASSWORD"
         )
     return password
 

@@ -18,14 +18,11 @@ secrets:
 
 services:
   # PostgreSQL: 统一存储层 —— 文档/业务元数据 (原 MySQL) + pgvector 知识块
-  # (原 Milvus Lite)。用 pgvector 官方镜像, init 脚本首启即装好扩展,
-  # 应用账号无需 CREATE EXTENSION 权限。
   postgres:
     image: ${PG_IMAGE:-docker.m.daocloud.io/pgvector/pgvector:pg16}
     environment:
       POSTGRES_USER: ${PG_USER:-mxi}
       POSTGRES_DB: ${PG_DATABASE:-mxi}
-      # 官方镜像支持 *_FILE: 密码从 secret 读, 不进环境变量
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
     ports: ["5432:5432"]
     volumes:
@@ -142,8 +139,6 @@ services:
     build: *build
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports: ["8000:8000"]
-    # PG_PASSWORD / DEEPSEEK_API_KEY 经 secrets 挂载到 /run/secrets/*,
-    # 由 app/config.py 读取; 不进环境变量、不落镜像与代码库。
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
