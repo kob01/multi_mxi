@@ -41,12 +41,28 @@ async def lifespan(app: FastAPI):
         from app.db.session import init_schema
 
         await init_schema()
-        logger.info("PostgreSQL schema ready (metadata + pgvector)")
+        logger.info("PostgreSQL schema ready (metadata + pgvector + long_term_memories)")
     except Exception as exc:
         logger.error(
             "PostgreSQL 初始化失败, 文档管理/知识库功能不可用, 聊天将降级为无标签模式: %s", exc
         )
+    # 记忆层/缓存层初始化: Redis Checkpointer + Neo4j schema。内部已经逐层降级
+    # (AsyncRedisSaver 连不上自动退回 InMemorySaver / Neo4j 连不上自动图记忆不可用),
+    # 这里再兜底一层, 避免 setup() 本身抛出未预期异常时阻断启动。
+    from app.assistant.graph import get_orchestrator
+    from app.cache.redis_client import close_redis
+    from app.memory.graph_store import close_driver
+
+    orchestrator = get_orchestrator()
+    try:
+        await orchestrator.setup()
+        logger.info("Memory/cache layers ready (checkpoint + graph schema)")
+    except Exception as exc:
+        logger.error("记忆层/缓存层初始化失败, 将退回无持久化行为: %s", exc)
     yield
+    await orchestrator.shutdown()
+    await close_redis()
+    await close_driver()
 
 
 def create_app() -> FastAPI:

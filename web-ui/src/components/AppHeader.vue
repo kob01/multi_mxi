@@ -70,11 +70,14 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   background: #1f3a93;
   color: #fff;
   flex-shrink: 0;
+  overflow: hidden; /* 窄窗口下裁掉导航而非撑破两侧 */
 }
 .brand {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .logo {
   font-size: 18px;
@@ -88,6 +91,22 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
+}
+/* 窄屏下收窄员工选择器, 优先保证品牌与导航可见 */
+@media (max-width: 1100px) {
+  .emp-switch :deep(.el-select) {
+    width: 160px !important;
+  }
+}
+@media (max-width: 900px) {
+  .sub,
+  .dept {
+    display: none;
+  }
+  .app-header {
+    gap: 12px;
+  }
 }
 .dept {
   font-size: 12px;

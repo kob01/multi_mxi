@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块."""
+"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块 + 会话记录."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Date,
@@ -218,4 +219,94 @@ class KnowledgeChunkRow(Base):
     allowed_roles: Mapped[str] = mapped_column(String(128), default="")  # ",hr,admin,"
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(get_settings().embedding_dim), nullable=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# 长期记忆 (Vector 通道)
+# ---------------------------------------------------------------------------
+class LongTermMemoryRow(Base):
+    """一条跨会话长期记忆(事实/偏好) + 稠密向量, 按 ``user_id`` 隔离。
+
+    与 ``knowledge_chunks`` 是两张不同的表: 知识库是全企业共享的文档, 长期记忆
+    是"这个用户"自己的对话沉淀, 权限语义完全不同(必须按 user_id 严格隔离,
+    不能像文档那样走 public/dept/role 可见性模型), 因此不复用同一张表。
+    """
+
+    __tablename__ = "long_term_memories"
+    __table_args__ = (
+        # 与 knowledge_chunks 同样的 cosine HNSW 检索方式。
+        Index(
+            "ix_long_term_memories_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        # 语义查重 / 召回都是"限定 user_id + 按向量排序", 复合索引前置 user_id。
+        Index("ix_long_term_memories_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(16), default="fact")  # fact/preference
+    content: Mapped[str] = mapped_column(Text, default="")
+    source_session_id: Mapped[str] = mapped_column(String(64), default="")
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    last_accessed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 页面会话记录 (聊天历史持久化: 刷新/重进页面后可回看)
+# ---------------------------------------------------------------------------
+class ChatSession(Base):
+    """一个前端会话窗口 (identity = 客户端生成的 session_id)。
+
+    与 Session Memory(Redis, 有 TTL) 是两回事: 这里只负责"页面历史记录"
+    的永久回看, 不参与 prompt 上下文拼装。
+    """
+
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # client session_id
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(16), default="employee")
+    department: Mapped[str] = mapped_column(String(64), default="")
+    title: Mapped[str] = mapped_column(String(120), default="新会话")  # 首条用户消息前缀
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+class ChatMessage(Base):
+    """一条会话消息 (user / assistant); 助手消息附带思考内容与路由元信息。"""
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        # 历史回看主路径: 限定会话按时间序取全部消息
+        Index("ix_chat_messages_session_created", "session_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    trace_id: Mapped[str] = mapped_column(String(64), default="")
+    role: Mapped[str] = mapped_column(String(16))  # user/assistant
+    content: Mapped[str] = mapped_column(Text, default="")
+    thinking: Mapped[str | None] = mapped_column(Text, nullable=True)  # 思考过程(仅助手)
+    route: Mapped[str] = mapped_column(String(32), default="")  # 仅助手: 路由标签
+    target: Mapped[str] = mapped_column(String(64), default="")
+    intent: Mapped[str] = mapped_column(String(32), default="")
+    docs_meta: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 参考来源
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )

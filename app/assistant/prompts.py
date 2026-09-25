@@ -86,3 +86,18 @@ SUMMARY_PROMPT = """请将以下对话压缩为不超过 200 字的会话摘要,
 
 摘要:"""
 
+MEMORY_EXTRACTION_PROMPT = """你是长期记忆提取器。阅读下面这轮对话, 提取值得跨会话记住的信息。若本轮只是寒暄/无关紧要的闲聊/重复已知的内容, 或没有任何新增信息, 各字段均返回空列表, 不要强行编造。
+
+要求:
+- facts: 独立的、脱离本轮对话也能看懂的事实陈述(如"用户负责研发部""用户倾向于用 Markdown 格式回复"), 不要包含"用户说""AI回答"等元描述;
+- entities: 事实中涉及的具体实体(人名/部门/系统/单号/职位等), 每项含 name(实体名)与 type(person/department/system/document/other);
+- relations: 实体之间的关系三元组, src/dst 必须是 entities 中已出现的 name, relation 为简短关系词(如"负责","属于","审批");
+- 只提取用户陈述或确认的事实, 不要把助手自己的推测/建议当成用户长期记忆。
+
+本轮对话:
+用户: {message}
+助手: {answer}
+
+严格输出 JSON, 不要输出其它内容:
+{{"facts": ["..."], "entities": [{{"name": "...", "type": "..."}}], "relations": [{{"src": "...", "relation": "...", "dst": "..."}}]}}"""
+

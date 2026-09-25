@@ -117,6 +117,29 @@ services:
       - es_data:/usr/share/elasticsearch/data
     networks: [mxi]
 
+  # Redis: Session Memory + Working State Checkpointer + 三类 Cache 统一落在这一
+  # 个实例。必须是 redis-stack-server (非裸 redis:*-alpine): langgraph-checkpoint-redis
+  # 要求 RedisJSON + RediSearch 两个模块, 裸 redis 没有, checkpointer setup() 会直接报
+  # "unknown command JSON.SET/FT.INFO"。单节点内网, 无认证, 对齐 ES 的部署取舍。
+  redis:
+    image: ${REDIS_IMAGE:-docker.m.daocloud.io/redis/redis-stack-server:7.4.0-v3}
+    command: ["redis-stack-server", "--dir", "/data", "--save", "60 1"]
+    ports: ["6379:6379"]
+    volumes:
+      - redis_data:/data
+    networks: [mxi]
+
+  # Neo4j: 长期记忆的 Graph 通道 (实体/关系/多跳)。单节点内网部署,
+  # NEO4J_AUTH=none 对齐 ES 的"无认证"先例; 数据落在 neo4j_data 卷。
+  neo4j:
+    image: ${NEO4J_IMAGE:-docker.m.daocloud.io/library/neo4j:5-community}
+    environment:
+      NEO4J_AUTH: none
+    ports: ["7474:7474", "7687:7687"]
+    volumes:
+      - neo4j_data:/data
+    networks: [mxi]
+
   # MinerU OCR 服务 (图片解析). 按需启动:
   #   docker compose -f docker/docker-compose.yml --profile mineru up -d mineru
   # assistant 通过 MINERU_BASE_URL=http://host.docker.internal:8888 访问宿主机端口。
@@ -164,6 +187,10 @@ services:
       PG_DATABASE: ${PG_DATABASE:-mxi}
       PG_SSLMODE: ${PG_SSLMODE:-disable}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      # 记忆层/缓存层: Session Memory + Checkpoint + 三类 Cache 共用同一个 redis
+      # 服务; Graph 长期记忆走 neo4j 服务 (同一 compose 网络, 用服务名访问)。
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       # MinerU OCR: 服务跑在容器内, localhost 指向容器自身, 必须经 host.docker.internal
       MINERU_BASE_URL: ${MINERU_BASE_URL:-http://host.docker.internal:8888}
       MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
@@ -182,6 +209,10 @@ services:
         condition: service_started
       elasticsearch:
         condition: service_started
+      redis:
+        condition: service_started
+      neo4j:
+        condition: service_started
       postgres:
         condition: service_healthy
     extra_hosts:
@@ -192,6 +223,8 @@ volumes:
   mineru_models:
   es_data:
   pg_data:
+  redis_data:
+  neo4j_data:
 
 networks:
   mxi:

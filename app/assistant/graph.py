@@ -1,7 +1,7 @@
 """Assistant orchestration graph (LangGraph).
 
 Routing policy (single-entry multi-agent):
-    user -> [load_context] -> [resolve_time] -> [rewrite_query]
+    user -> [build_context] -> [resolve_time] -> [rewrite_query]
          -> [classify_intent] -> one of:
         knowledge_qa    -> kb_retrieve -> judge -> kb_generate   (confident hits)
                                             |-> kb_requery -> kb_retrieve (no-result retry)
@@ -11,31 +11,44 @@ Routing policy (single-entry multi-agent):
         agent_delegate  -> agent_delegate (Assistant -> A2A specialist)
     -> [persist_memory] -> END
 
+build_context 是架构图里 "Business Context" 的汇聚点: 并行拉
+Session Memory(Redis) + 长期记忆 Vector 通道(pgvector) + 长期记忆 Graph
+通道(Neo4j), 拼成下游共享的 history/memory_ctx; 三路各自单独降级, 任一通道
+不可用只影响拼接内容, 不阻断对话。
+
+Working State 通过 LangGraph checkpointer 持久化(Redis 可用时 AsyncRedisSaver,
+否则降级 InMemorySaver), 详见 ``AssistantOrchestrator.setup()``。
+
 kb_retrieve runs hybrid search (pgvector dense + Elasticsearch BM25 -> RRF ->
-rerank). The ONLY relevance cutoff is the rerank confidence threshold: hits
-scoring below it are treated as noise, so an empty result means "no relevant
-document". On the first miss the query is re-rewritten with a different
-strategy (RETRY_REWRITE_PROMPT) and retrieved once more; if the second pass
-is still empty the Assistant answers "未找到相关文档" directly (and returns
-NO reference sources) instead of letting the LLM hallucinate over noise.
+rerank), 结果缓存于 Retrieval Cache(key 含 ACL 签名)。The ONLY relevance cutoff
+is the rerank confidence threshold: hits scoring below it are treated as noise,
+so an empty result means "no relevant document". On the first miss the query is
+re-rewritten with a different strategy (RETRY_REWRITE_PROMPT) and retrieved
+once more; if the second pass is still empty the Assistant answers
+"未找到相关文档" directly (and returns NO reference sources) instead of
+letting the LLM hallucinate over noise.
 
 rewrite_query resolves pronouns/ellipsis ("那它的劣势呢" -> "XX 的劣势")
 BEFORE intent classification, so the classifier routes on the resolved
 standalone question and all four downstream routes share one
-disambiguated query.
+disambiguated query. rewrite_query/chitchat/意图 LLM 兜底层共享 Prompt Cache。
 
 Every node writes an audit record under the same trace_id.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.common_tools import lookup_employee_by_name
@@ -49,8 +62,16 @@ from app.assistant.prompts import (
     QUERY_REWRITE_PROMPT,
     RETRY_REWRITE_PROMPT,
 )
+from app.assistant.stream import get_stream_hub, new_run_id
+from app.cache.prompt_cache import cached_llm_call
+from app.cache.retrieval_cache import cached_retrieve, invalidate_all
+from app.cache.tool_cache import wrap_tools_for_cache
+from app.chat_store import get_chat_store
 from app.config import get_settings
-from app.llm import get_chat_model
+from app.llm import extract_reasoning, get_chat_model, get_streaming_chat_model
+from app.memory import graph_store
+from app.memory.extraction import extract_memories
+from app.memory.vector_store import get_long_term_store
 from app.rag.retriever import HybridRetriever
 from app.schemas import (
     ChatRequest,
@@ -105,7 +126,12 @@ class AssistantState(TypedDict):
     role: Role
     department: str
     trace_id: str
+    run_id: str  # SSE 流式运行的缓冲区 id; 空串 = 非流式调用(/api/chat/Studio)
+    thinking: bool  # 本轮是否开启深度思考(生成节点逐 token 流式 + 透出思考)
+    message_id: int | None  # 会话记录落库后的助手消息 id(persist_memory 回填)
+    thinking_text: str  # 本轮生成的完整思考内容(供历史记录落库)
     history: str
+    memory_ctx: str  # 长期记忆(Vector + Graph 通道)拼接结果, 与 history 分开审计
     current_time: str
     intent: IntentResult | None
     rewritten_query: str
@@ -124,21 +150,174 @@ class AssistantState(TypedDict):
 class AssistantOrchestrator:
     """Single-entry Assistant that routes across KB / MCP / A2A layers."""
 
+    # rewrite_query / chitchat 共用同一个 self._llm, 显式记录温度/模型名
+    # 以便与 Prompt Cache 的 key 保持一致 (与 __init__ 里构造参数同源)。
+    _LLM_TEMPERATURE = 0.3
+
     def __init__(self) -> None:
         settings = get_settings()
         self._settings = settings
-        self._llm = get_chat_model(settings.llm_model, temperature=0.3)
+        self._llm = get_chat_model(settings.llm_model, temperature=self._LLM_TEMPERATURE)
         self._intent = IntentRecognizer()
         self._memory = get_memory_store()
         self._audit = get_audit_logger()
         self._retriever: HybridRetriever | None = None
-        self._graph = self._build_graph()
+        # 图不再在 __init__ 里直接编译: Checkpointer 需要 await setup() 建索引,
+        # 而 __init__ 是同步的(FastAPI/orchestrator 单例构造时机决定)。
+        self._graph = None
+        self._checkpointer: BaseCheckpointSaver | None = None
+        # AsyncRedisSaver 自带 async context manager 协议(__aenter__ 内部就会
+        # 调 asetup() 建索引), 用 ExitStack 持有它, 才能把它的生命周期从
+        # setup() 局部作用域延长到进程整个存活期, 并在 shutdown() 里干净关闭。
+        self._exit_stack: AsyncExitStack | None = None
+        self._setup_lock: asyncio.Lock | None = None
+        self._setup_done = False
+        # 后台流式 run 任务强引用: asyncio 只弱引用 task, 不持引用会被 GC 掉
+        self._stream_tasks: set[asyncio.Task] = set()
+
+    # ---------------- lifecycle ----------------
+
+    async def setup(self) -> None:
+        """幂等的异步初始化: 建 Checkpointer + Neo4j schema, 然后编译图。
+
+        由 ``app.main`` 的 lifespan 在启动时主动调一次; ``handle()`` 也会
+        兜底调一次(幂等, 已初始化就直接返回), 这样 LangGraph Studio 直接
+        拿 ``get_graph()`` 时不会因为跳过 lifespan 而拿到未编译的图。
+        """
+        if self._setup_done:
+            return
+        if self._setup_lock is None:
+            self._setup_lock = asyncio.Lock()
+        async with self._setup_lock:
+            if self._setup_done:
+                return
+            self._checkpointer = await self._build_checkpointer()
+            await graph_store.ensure_schema()  # 内部已吞异常, 不会抛出
+            self._graph = self._build_graph(self._checkpointer)
+            self._setup_done = True
+
+    async def shutdown(self) -> None:
+        """释放 Checkpointer 持有的 Redis 连接(供 FastAPI lifespan 关闭时调用)。"""
+        if self._exit_stack is not None:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+        self._setup_done = False
+        self._checkpointer = None
+        self._graph = None
+
+    async def _build_checkpointer(self) -> BaseCheckpointSaver:
+        """Working State 存储: 优先 Redis, 降级 InMemorySaver(等价于未持久化)。"""
+        settings = self._settings
+        if not settings.checkpoint_enabled or not settings.redis_enabled:
+            logger.info("checkpoint 未启用或 Redis 未启用, Working State 降级为 InMemorySaver")
+            return InMemorySaver()
+        try:
+            from langgraph.checkpoint.redis import AsyncRedisSaver
+
+            # AsyncRedisSaver(url) 直接构造即可(from_conn_string 是同义包装且返回
+            # 的是上下文管理器对象本身, 不能对其调 .setup()); __aenter__ 内部已经
+            # 调了 asetup() 建索引, 不需要再手动调一次 .setup()。
+            self._exit_stack = AsyncExitStack()
+            saver = await self._exit_stack.enter_async_context(AsyncRedisSaver(settings.redis_url))
+            logger.info("Working State checkpointer: AsyncRedisSaver (%s)", settings.redis_url)
+            return saver
+        except Exception as exc:  # noqa: BLE001 - checkpointer 不可用绝不能阻断启动
+            logger.warning(
+                "AsyncRedisSaver 初始化失败(Redis 需带 RedisJSON+RediSearch 模块, "
+                "即 redis-stack-server 镜像), Working State 降级为 InMemorySaver: %s", exc
+            )
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
+            return InMemorySaver()
 
     # ---------------- graph nodes ----------------
 
-    async def load_context(self, state: AssistantState) -> dict[str, Any]:
-        history = self._memory.history_text(state.get("session_id") or "")
-        return {"history": history}
+    async def build_context(self, state: AssistantState) -> dict[str, Any]:
+        """架构图里 "Business Context" 的汇聚点(见模块 docstring)。
+
+        三路并行拉取, 各自单独 try/except: Session Memory(Redis) -> history;
+        长期记忆 Vector + Graph 通道 -> memory_ctx。任一路失败只影响自己那一
+        路的拼接内容, 不会让另一路或整条对话链路失败。
+        """
+        session_id = state.get("session_id") or ""
+        user_id = state.get("user_id") or ""
+        message = state["message"]
+        await self._emit_status(state, "understanding", "正在理解问题…")
+
+        history = await self._safe_history_text(session_id)
+        memory_ctx = ""
+        if self._settings.long_term_memory_enabled and user_id:
+            vector_part, graph_part = await asyncio.gather(
+                self._safe_vector_memories(user_id, message),
+                self._safe_graph_facts(user_id, message),
+            )
+            memory_ctx = "\n".join(p for p in (vector_part, graph_part) if p)
+        # 长期记忆拼进 history 一起往下传: 下游各节点(rewrite/classify/generate/
+        # chitchat/tool/agent)统一只读 history 一个字段, 不需要各自感知
+        # memory_ctx; memory_ctx 单独留在 state 里只用于审计可观测性。
+        full_history = f"{history}\n{memory_ctx}".strip() if memory_ctx else history
+        return {"history": full_history, "memory_ctx": memory_ctx}
+
+    async def _safe_history_text(self, session_id: str) -> str:
+        try:
+            return await self._memory.history_text(session_id)
+        except Exception as exc:  # noqa: BLE001 - 记忆层故障不能阻断对话
+            logger.warning("session memory 读取失败, 本轮无历史上下文: %s", exc)
+            return ""
+
+    async def _safe_vector_memories(self, user_id: str, query: str) -> str:
+        try:
+            hits = await get_long_term_store().search_memories(user_id, query)
+        except Exception as exc:  # noqa: BLE001 - PG/Embedding 不可用只是少了长期记忆
+            logger.warning("长期记忆 Vector 通道检索失败, 本轮跳过: %s", exc)
+            return ""
+        if not hits:
+            return ""
+        lines = [f"[{kind}] {content}" for content, kind, _score in hits]
+        return "[长期记忆]\n" + "\n".join(lines)
+
+    async def _safe_graph_facts(self, user_id: str, query: str) -> str:
+        """Graph 通道没有"查询->实体"的反向索引能力, 这里用查询里出现的实体名
+        做起点邻居展开(简单按中文分词后的候选实体匹配), 不做完整的 NER
+        —— 那是提取侧(写路径)的职责, 读路径只做一次轻量匹配即可。
+        """
+        if not self._settings.graph_memory_enabled:
+            return ""
+        try:
+            candidates = await self._extract_query_entities(user_id, query)
+            if not candidates:
+                return ""
+            facts = await graph_store.related_facts(user_id, candidates)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("长期记忆 Graph 通道检索失败, 本轮跳过: %s", exc)
+            return ""
+        if not facts:
+            return ""
+        return "[关联记忆]\n" + "\n".join(facts)
+
+    async def _extract_query_entities(self, user_id: str, query: str) -> list[str]:
+        """查该用户图里已存在, 且出现在本次查询文本中的实体名。
+
+        直接复用 Vector 通道已经算好的 embedding 是不行的(图里没有向量),
+        这里退而求其次做子串匹配: 拿用户已有的实体名单, 看哪些字面出现在
+        query 里 —— 避免为读路径再引入一次 NER 模型调用。
+        """
+        driver = graph_store.get_driver()
+        if driver is None:
+            return []
+        try:
+            async with driver.session() as session:
+                result = await session.run(
+                    "MATCH (e:MemoryEntity {user_id: $user_id}) RETURN e.name AS name LIMIT 200",
+                    user_id=user_id,
+                )
+                rows = await result.data()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Neo4j 实体名查询失败, 本轮 Graph 通道跳过: %s", exc)
+            return []
+        names = [r["name"] for r in rows if r.get("name")]
+        return [name for name in names if name in query]
 
     async def resolve_time(self, state: AssistantState) -> dict[str, Any]:
         """Pre-fetch the platform clock for time-sensitive questions.
@@ -162,6 +341,7 @@ class AssistantOrchestrator:
         # "查一下 XX 的余额" 后才能正确判出 tool_call 而非 knowledge_qa。
         query = state.get("rewritten_query") or state["message"]
         intent = await self._intent.classify(query, state.get("history", ""))
+        await self._emit_status(state, "routed", f"意图识别: {intent.intent.value}")
         self._audit.log(
             state.get("trace_id") or new_trace_id(), "assistant", "intent_classified",
             intent.model_dump(), state.get("session_id"),
@@ -192,14 +372,24 @@ class AssistantOrchestrator:
             # certainly self-contained; skip the LLM call to save latency.
             skipped = "self_contained"
         else:
-            try:
+            prompt = QUERY_REWRITE_PROMPT.format(history=history, message=message)
+
+            async def _invoke() -> str:
+                # Name the LLM run so the rewrite prompt/response is easy
+                # to locate in the LangSmith trace tree.
                 resp = await self._llm.ainvoke(
-                    QUERY_REWRITE_PROMPT.format(history=history, message=message),
-                    # Name the LLM run so the rewrite prompt/response is easy
-                    # to locate in the LangSmith trace tree.
+                    prompt,
                     config={"run_name": "rewrite_query", "tags": ["rewrite_query"]},
                 )
-                rewritten = self._clean_rewrite(str(resp.content), message)
+                return str(resp.content)
+
+            try:
+                # Prompt Cache: 改写是纯函数式调用(同 prompt -> 同结果), 不含
+                # 权限/实时数据, 可以安全缓存。
+                raw = await cached_llm_call(
+                    self._settings.llm_model, self._LLM_TEMPERATURE, prompt, _invoke
+                )
+                rewritten = self._clean_rewrite(raw, message)
             except Exception as exc:
                 logger.warning("query rewrite failed, fallback to raw message: %s", exc)
                 rewritten = message
@@ -254,13 +444,27 @@ class AssistantOrchestrator:
         """
         retriever = await self._get_retriever()
         query = state.get("kb_query") or state.get("rewritten_query") or state["message"]
+        await self._emit_status(
+            state, "searching",
+            "重新检索知识库…" if int(state.get("kb_attempt") or 0) else "检索知识库…",
+        )
         # 统一身份主体: 检索阶段据此做 Metadata Filter 前置权限裁剪。
         principal = Principal(
             user_id=state.get("user_id") or "",
             department=state.get("department") or "",
             role=self._role_of(state),
         )
-        children, score_mode = await retriever.retrieve(query, principal=principal)
+
+        async def _invoke_retrieve() -> tuple[list[KnowledgeChunk], str]:
+            return await retriever.retrieve(query, principal=principal)
+
+        # Retrieval Cache: key 含 ACL 签名, 命中即跳过一次混合检索(Embedding +
+        # ES + rerank), 但下方的 assemble_parents / is_allowed 仍然照常执行
+        # —— 缓存在权限裁剪之前, 不影响最终授权校验这道纵深防御。
+        children, score_mode, cache_hit = await cached_retrieve(
+            query, self._settings.rag_top_k, self._settings.rerank_top_n,
+            principal, _invoke_retrieve,
+        )
         # Assemble hit child chunks into complete parent section blocks so
         # the LLM answers from full sections (with page/section citations).
         chunks = await retriever.assemble_parents(children) if children else []
@@ -295,7 +499,7 @@ class AssistantOrchestrator:
             {"attempt": attempt, "query": query, "chunks": [c.chunk_id for c in authorized],
              "scores": [c.score for c in authorized],
              "top_score": top_score, "dropped_by_acl": sorted(dropped_docs),
-             "score_mode": score_mode,
+             "score_mode": score_mode, "cache_hit": cache_hit,
              "threshold": (
                  self._settings.retrieval_score_threshold if score_mode == "rerank"
                  else None
@@ -400,7 +604,14 @@ class AssistantOrchestrator:
             message=message,
             current_time=self._now_text(state),
         )
-        resp = await self._llm.ainvoke(prompt)
+        # 流式链路(SSE run): 逐 token 推送, 思考开启时额外透出 think; 否则保持
+        # 一次性 ainvoke(非流式 /api/chat 调用方行为完全不变)。
+        if self._stream_enabled(state):
+            await self._emit_status(state, "generating", "基于知识库生成回答…")
+            answer, think_text = await self._stream_answer(state, prompt)
+        else:
+            resp = await self._llm.ainvoke(prompt)
+            answer, think_text = str(resp.content), ""
         self._audit.log(
             state.get("trace_id") or "", "assistant", "kb_answered",
             {"chunks": [c.chunk_id for c in chunks], "attempts": state.get("kb_attempt")},
@@ -416,7 +627,10 @@ class AssistantOrchestrator:
             }
             for c in chunks
         ]
-        return {"answer": str(resp.content), "route": "assistant_kb", "docs_meta": docs_meta}
+        return {
+            "answer": answer, "route": "assistant_kb", "docs_meta": docs_meta,
+            "thinking_text": think_text,
+        }
 
     async def tool_execute(self, state: AssistantState) -> dict[str, Any]:
         """Run a small ReAct loop over the target domain's MCP tools."""
@@ -433,6 +647,10 @@ class AssistantOrchestrator:
         tools = filter_tools_for_role(role, target, all_tools)
         # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号再调业务工具。
         tools = [*tools, lookup_employee_by_name]
+        # Tool Cache: ReAct 循环里工具由 LLM 自主决定何时以何参数调用, 缓存逻辑
+        # 只能下推到工具本身; 只读前缀白名单命中的工具会被包一层, 写操作工具
+        # (create_*/cancel_* 等)原样传递, 不会被缓存。
+        tools = wrap_tools_for_cache(tools, target, role.value)
         visible_names = [t.name for t in tools]
         self._audit.log(
             state.get("trace_id") or "", "assistant", "tools_filtered",
@@ -458,6 +676,7 @@ class AssistantOrchestrator:
             "才默认使用操作者 employee_id。"
         )
         self._audit.log(state.get("trace_id") or "", "assistant", "mcp_dispatch", {"server": target}, state.get("session_id"))
+        await self._emit_status(state, "tool", f"正在调用 {target} 域业务工具…")
         # 用消解后的独立问题驱动 ReAct: "审批到哪一步了" 已改写为
         # "FIN5000 审批到哪一步了", 工具才能拿到正确的查询对象。
         query = state.get("rewritten_query") or state["message"]
@@ -472,7 +691,15 @@ class AssistantOrchestrator:
         return {"answer": answer, "route": "mcp_tool", "target": target}
 
     async def agent_delegate(self, state: AssistantState) -> dict[str, Any]:
-        """Delegate to a specialist agent over the A2A protocol."""
+        """Delegate to a specialist agent over the A2A protocol.
+
+        故意不接入 Tool Cache(对原方案的一处修正): AGENT_DELEGATE 按
+        INTENT_PROMPT 的定义就是"需要专业系统多步办理的复杂业务"(如"我要报销"
+        "帮我开在职证明"), 属于写/办理类操作, 缓存会把一次"提交成功"的响应
+        复用给下一次本应真实发生的提交, 造成业务数据不一致; 而且下方构造的
+        task 文本里含 `[当前时间=...]`, 天然每一轮都不同, 即使去接入缓存几乎
+        也不会命中。
+        """
         intent = state["intent"]
         target = intent.target if intent and intent.target else "hr"
         agent_name = f"{target}_agent"
@@ -491,6 +718,7 @@ class AssistantOrchestrator:
         if state.get("history"):
             task = f"对话背景:\n{state['history']}\n\n当前请求: {task}"
         self._audit.log(state.get("trace_id") or "", "assistant", "a2a_delegate", {"agent": agent_name}, state.get("session_id"))
+        await self._emit_status(state, "delegate", f"正在委派 {agent_name} 专业智能体办理…")
         # 可信身份经协议级 metadata 结构化下发 (而非文本标签), 供专业智能体做权限分级。
         answer = await get_a2a_pool().send(
             target,
@@ -514,17 +742,146 @@ class AssistantOrchestrator:
             )
         else:
             parts.append(f"用户: {state['message']}")
-        resp = await self._llm.ainvoke("\n\n".join(parts))
-        return {"answer": str(resp.content), "route": "direct"}
+        full_prompt = "\n\n".join(parts)
+
+        # 流式链路(SSE run): 逐 token 推送; 此时不走 Prompt Cache(缓存命中的
+        # 重放没有思考过程, 且命中时几乎零延迟, 缓存收益小于体验损失)。
+        if self._stream_enabled(state):
+            await self._emit_status(state, "generating", "正在思考回答…")
+            answer, think_text = await self._stream_answer(state, full_prompt)
+            return {"answer": answer, "route": "direct", "thinking_text": think_text}
+
+        async def _invoke() -> str:
+            resp = await self._llm.ainvoke(full_prompt)
+            return str(resp.content)
+
+        # Prompt Cache: key 是完整 prompt 的 hash, 历史/改写结果不同会得到不同
+        # key, 不会把某一轮的闲聊回复错误命中给另一轮。
+        answer = await cached_llm_call(
+            self._settings.llm_model, self._LLM_TEMPERATURE, full_prompt, _invoke
+        )
+        return {"answer": answer, "route": "direct", "thinking_text": ""}
 
     async def persist_memory(self, state: AssistantState) -> dict[str, Any]:
         masked_answer = mask_text(state["answer"])
-        await self._memory.append(state.get("session_id") or "", mask_text(state["message"]), masked_answer)
+        masked_message = mask_text(state["message"])
+        session_id = state.get("session_id") or ""
+        await self._memory.append(session_id, masked_message, masked_answer)
+        await self._write_long_term_memory(state, masked_message, masked_answer)
+        # 页面会话记录落库(app/chat_store.py): 失败静默降级, 不阻断对话。
+        intent = state.get("intent")
+        message_id = await get_chat_store().save_turn(
+            session_id=session_id,
+            user_id=state.get("user_id") or "",
+            role=self._role_of(state).value,
+            department=state.get("department") or "",
+            trace_id=state.get("trace_id") or "",
+            user_message=masked_message,
+            answer=masked_answer,
+            thinking=state.get("thinking_text") or "",
+            route=state.get("route") or "",
+            target=state.get("target") or "",
+            intent=intent.intent.value if intent else "",
+            docs_meta=state.get("docs_meta") or [],
+        )
         self._audit.log(
             state.get("trace_id") or "", "assistant", "turn_completed",
-            {"route": state.get("route"), "answer_len": len(state["answer"])}, state.get("session_id"),
+            {"route": state.get("route"), "answer_len": len(state["answer"]),
+             "chat_message_id": message_id}, session_id,
         )
-        return {}
+        return {"message_id": message_id}
+
+    async def _write_long_term_memory(
+        self, state: AssistantState, message: str, answer: str
+    ) -> None:
+        """提取并落盘长期记忆 (Vector + Graph 双通道), 失败只记审计不抛出。
+
+        跳过闲聊轮次(``route == "direct"``): 这类轮次几乎不产生值得跨会话记住
+        的事实, 白白多一次 LLM 提取调用。
+        """
+        if not self._settings.long_term_memory_enabled or state.get("route") == "direct":
+            return
+        user_id = state.get("user_id") or ""
+        if not user_id:
+            return
+        session_id = state.get("session_id") or ""
+        try:
+            extraction = await extract_memories(message, answer)
+            if extraction.is_empty:
+                return
+            store = get_long_term_store()
+            for fact in extraction.facts:
+                await store.upsert_memory(user_id, fact, source_session_id=session_id)
+            await graph_store.upsert_entities(user_id, extraction.entities, extraction.relations)
+            self._audit.log(
+                state.get("trace_id") or "", "assistant", "long_term_memory_written",
+                {
+                    "facts": len(extraction.facts),
+                    "entities": len(extraction.entities),
+                    "relations": len(extraction.relations),
+                },
+                session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 长期记忆写失败只是少一条记忆
+            logger.warning("长期记忆写入失败, 本轮跳过: %s", exc)
+
+    # ---------------- SSE 流式推送 ----------------
+
+    @staticmethod
+    def _stream_enabled(state: AssistantState) -> bool:
+        """只要本次调用挂在流式 run 上, 生成节点就逐 token 推送。
+
+        thinking 只决定推送里有没有 think 事件(以及模型的思考开关),
+        不影响正文是否流式 —— 关闭思考时前端依然能看到打字机效果。
+        """
+        return bool(state.get("run_id"))
+
+    async def _emit(self, state: AssistantState, event: dict[str, Any]) -> None:
+        """向当前 run 的事件缓冲区写一条事件(非流式调用时无缓冲区, 静默丢弃)。"""
+        run_id = state.get("run_id") or ""
+        if run_id:
+            await get_stream_hub().append(run_id, event)
+
+    async def _emit_status(self, state: AssistantState, stage: str, text: str) -> None:
+        await self._emit(state, {"type": "status", "stage": stage, "text": text})
+
+    async def _stream_answer(self, state: AssistantState, prompt: str) -> tuple[str, str]:
+        """逐 token 流式生成: think/token 事件经 StreamHub 实时下发(可断点续传)。
+
+        返回 ``(回答全文, 思考全文)``; 流中途异常但已有部分内容时直接返回
+        已生成部分(前端体验优先), 无任何内容时回退一次性 ainvoke。
+        """
+        thinking_on = bool(state.get("thinking"))
+        # 必须按本轮 thinking 取对应变体: self._llm 是按全局默认(开思考)构造的,
+        # 拿它跑"关闭思考"的请求会从服务端默认值里意外拿到 reasoning。
+        llm = get_streaming_chat_model(
+            self._settings.llm_model,
+            temperature=self._LLM_TEMPERATURE,
+            thinking=thinking_on,
+        )
+        answer_parts: list[str] = []
+        think_parts: list[str] = []
+        try:
+            async for chunk in llm.astream(prompt):
+                reasoning = extract_reasoning(chunk)
+                if reasoning:
+                    think_parts.append(reasoning)
+                    await self._emit(state, {"type": "think", "delta": reasoning})
+                piece = chunk.content if isinstance(chunk.content, str) else ""
+                if piece:
+                    answer_parts.append(piece)
+                    await self._emit(state, {"type": "token", "delta": piece})
+            return "".join(answer_parts), "".join(think_parts)
+        except Exception as exc:  # noqa: BLE001 - 流式失败不能断了本轮回答
+            if answer_parts:
+                logger.warning("token streaming broke mid-answer, keep partial: %s", exc)
+                return "".join(answer_parts), "".join(think_parts)
+            logger.warning("llm streaming unavailable, fallback to ainvoke: %s", exc)
+            resp = await llm.ainvoke(prompt)
+            answer = str(resp.content)
+            # 降级路径不丢正文: 无 run 时 _emit 静默丢弃, 前端凭 result 事件补渲染
+            await self._emit(state, {"type": "token", "delta": answer})
+            return answer, extract_reasoning(resp)
 
     # ---------------- routing ----------------
 
@@ -556,9 +913,9 @@ class AssistantOrchestrator:
             IntentType.CHITCHAT: "chitchat",
         }[intent.intent]
 
-    def _build_graph(self):
+    def _build_graph(self, checkpointer: BaseCheckpointSaver | None = None):
         g = StateGraph(AssistantState)
-        g.add_node("load_context", self.load_context)
+        g.add_node("build_context", self.build_context)
         g.add_node("resolve_time", self.resolve_time)
         g.add_node("rewrite_query", self.rewrite_query)
         g.add_node("classify_intent", self.classify_intent)
@@ -572,8 +929,8 @@ class AssistantOrchestrator:
 
         # rewrite_query 前置于意图识别: 分类器与全部四条路由共享消解后的
         # 独立问题, 避免"那帮我查一下它的余额"因指代未消解而误分类。
-        g.add_edge(START, "load_context")
-        g.add_edge("load_context", "resolve_time")
+        g.add_edge(START, "build_context")
+        g.add_edge("build_context", "resolve_time")
         g.add_edge("resolve_time", "rewrite_query")
         g.add_edge("rewrite_query", "classify_intent")
         g.add_conditional_edges(
@@ -601,7 +958,7 @@ class AssistantOrchestrator:
         for node in ("kb_generate", "tool_execute", "agent_delegate", "chitchat"):
             g.add_edge(node, "persist_memory")
         g.add_edge("persist_memory", END)
-        return g.compile()
+        return g.compile(checkpointer=checkpointer)
 
     # ---------------- public API ----------------
 
@@ -615,9 +972,25 @@ class AssistantOrchestrator:
         """Rebuild the ES BM25 index after a document (re)ingest (drift repair)."""
         if self._retriever is not None:
             await self._retriever.rebuild_bm25()
+        # 文档重新入库后旧 chunk_id 可能已被删除/重建, Retrieval Cache 必须同步失效,
+        # 否则会命中缓存里的脏 chunk_id(即使 TTL 未到)。
+        await invalidate_all()
+
+    def ensure_graph_for_studio(self):
+        """LangGraph Studio 的同步取图入口(详见 ``get_graph()``)。
+
+        Studio 的 dev server 不跑本项目的 FastAPI lifespan, 也就不会调用
+        ``setup()``; 这里同步兜底编译一份用 InMemorySaver 的图 —— 与
+        pyproject.toml 里 langgraph-cli 注释说的"内存版 in-memory 后端"一致,
+        本地调试场景下本来也不需要真的把 checkpoint 落到 Redis。
+        """
+        if self._graph is None:
+            self._graph = self._build_graph(InMemorySaver())
+        return self._graph
 
     async def handle(self, req: ChatRequest) -> ChatResponse:
-        """Handle one user turn end-to-end."""
+        """Handle one user turn end-to-end (non-streaming)."""
+        await self.setup()  # 幂等: lifespan 已初始化过就直接返回
         trace_id = new_trace_id()
         self._audit.log(
             trace_id, "user", "message_received",
@@ -625,7 +998,82 @@ class AssistantOrchestrator:
              "department": req.department, "message": req.message},
             req.session_id,
         )
-        final: AssistantState = await self._graph.ainvoke(
+        final: AssistantState = await self._run_graph(req, trace_id, run_id="", thinking=False)
+        resp = self._build_response(req, final, trace_id)
+        intent = final.get("intent") or IntentResult(intent=IntentType.CHITCHAT)
+        memory_snapshot = await self._safe_history_text(req.session_id)
+        self._audit.log(
+            trace_id,
+            "handle",
+            "final",
+            {
+                "intent": intent.intent,
+                "confidence": intent.confidence,
+                "reason": intent.reason,
+                "answer": final["answer"],
+                "route": final.get("route", "direct"),
+                "target": final.get("target"),
+                "_memory": memory_snapshot,
+            },
+            req.session_id,
+        )
+        return resp
+
+    async def handle_stream(self, req: ChatRequest) -> str:
+        """流式入口: 后台任务跑图, 事件落 StreamHub, 立即返回 run_id。
+
+        HTTP 连接与图执行解耦: 客户端断开(刷新/断网)不影响 run 继续跑,
+        重连凭 run_id + Last-Event-ID 从断点重放并续流(app/assistant/stream.py)。
+        """
+        await self.setup()
+        trace_id = new_trace_id()
+        run_id = new_run_id()
+        thinking = (
+            req.thinking if req.thinking is not None else self._settings.llm_thinking_enabled
+        )
+        get_stream_hub().create(run_id)
+        self._audit.log(
+            trace_id, "user", "message_received",
+            {"user_id": req.user_id, "role": req.role.value,
+             "department": req.department, "message": req.message,
+             "run_id": run_id, "thinking": thinking},
+            req.session_id,
+        )
+        hub = get_stream_hub()
+
+        async def _pipeline() -> None:
+            try:
+                final: AssistantState = await self._run_graph(
+                    req, trace_id, run_id=run_id, thinking=thinking
+                )
+                resp = self._build_response(req, final, trace_id)
+                event = resp.model_dump(mode="json")
+                event["type"] = "result"
+                event["thinking_text"] = final.get("thinking_text") or ""
+                await hub.append(run_id, event)
+                await hub.append(run_id, {"type": "done", "status": "completed"})
+            except asyncio.CancelledError:
+                # 服务进程优雅关停: 标记中断即可, 缓冲区保留给重启后的
+                # 前端(此时续流已无意义, done 未写入, 前端按 404/降级处理)
+                logger.warning("streaming run %s cancelled during shutdown", run_id)
+                raise
+            except Exception as exc:  # noqa: BLE001 - 异常经 error 事件透出给前端
+                logger.exception("streaming run %s failed", run_id)
+                await hub.append(run_id, {"type": "error", "message": str(exc)})
+                await hub.append(run_id, {"type": "done", "status": "error"})
+            finally:
+                await hub.finish(run_id)
+
+        task = asyncio.create_task(_pipeline(), name=f"chat-stream:{run_id}")
+        self._stream_tasks.add(task)
+        task.add_done_callback(self._stream_tasks.discard)
+        return run_id
+
+    async def _run_graph(
+        self, req: ChatRequest, trace_id: str, *, run_id: str, thinking: bool
+    ) -> AssistantState:
+        """执行一次完整图调用(流式/非流式共用同一状态初始化)。"""
+        return await self._graph.ainvoke(
             {
                 "message": req.message,
                 "session_id": req.session_id,
@@ -633,7 +1081,12 @@ class AssistantOrchestrator:
                 "role": req.role,
                 "department": req.department,
                 "trace_id": trace_id,
+                "run_id": run_id,
+                "thinking": thinking,
+                "message_id": None,
+                "thinking_text": "",
                 "history": "",
+                "memory_ctx": "",
                 "current_time": "",
                 "intent": None,
                 "rewritten_query": "",
@@ -646,24 +1099,18 @@ class AssistantOrchestrator:
                 "kb_meta_map": {},
                 "kb_attempt": 0,
                 "kb_acl_blocked": False,
-            }
-        )
-        intent = final.get("intent") or IntentResult(intent=IntentType.CHITCHAT)
-        self._audit.log(
-            trace_id,
-            "handle",
-            "final",
-            {
-                "intent": intent.intent,
-                "confidence": intent.confidence,
-                "reason": intent.reason,
-                "answer": final["answer"],
-                "route": final.get("route", "direct"),
-                "target": final.get("target"),
-                "_memory": self._memory.history_text(req.session_id),
             },
-            req.session_id,
+            # Working State Checkpoint: thread_id 用 session_id, 每轮对话都完整
+            # 传入上方所有 AssistantState 字段, 不会与上一轮残留的 checkpoint
+            # 状态串台(字段默认全量重置, 见 ``AssistantState``)。
+            {"configurable": {"thread_id": req.session_id}},
         )
+
+    def _build_response(
+        self, req: ChatRequest, final: AssistantState, trace_id: str
+    ) -> ChatResponse:
+        """由图终态组装结构化响应(非流式返回体 / 流式 result 事件同源)。"""
+        intent = final.get("intent") or IntentResult(intent=IntentType.CHITCHAT)
         return ChatResponse(
             session_id=req.session_id,
             answer=mask_text(final["answer"]),
@@ -671,6 +1118,7 @@ class AssistantOrchestrator:
             route=final.get("route", "direct"),
             target=final.get("target"),
             trace_id=trace_id,
+            message_id=final.get("message_id"),
             metadata={
                 "confidence": intent.confidence,
                 "reason": intent.reason,
@@ -694,9 +1142,10 @@ def get_graph():
     """Graph factory exposed to LangGraph Studio (see langgraph.json).
 
     Enables LangSmith tracing first so every Studio run is captured as a
-    trace under the configured project.
+    trace under the configured project. Studio 不跑 FastAPI lifespan, 因此这里
+    走同步兜底编译(见 ``ensure_graph_for_studio``), 用 InMemorySaver。
     """
     from app.tracing import init_tracing
 
     init_tracing()
-    return get_orchestrator()._graph
+    return get_orchestrator().ensure_graph_for_studio()

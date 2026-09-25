@@ -11,6 +11,8 @@ langchain>=0.3.7
 langchain-core>=0.3.15
 langchain-community>=0.3.7
 langchain-ollama>=0.2.1
+# DeepSeek 官方集成: 透出 reasoning_content(深度思考), langchain-openai v1 不提取该字段
+langchain-deepseek>=1.0.0
 
 # MCP (Model Context Protocol) - pin 1.x: FastMCP high-level API (renamed in mcp 2.x)
 mcp>=1.10.0,<2
@@ -36,3 +38,12 @@ asyncpg>=0.29.0
 psycopg[binary]>=3.1.21
 python-pptx>=1.0.0
 pillow>=10.0.0
+
+# Memory & Cache layers
+# Session Memory/Working State Checkpoint/三类 Cache 统一落 Redis;
+# langgraph-checkpoint-redis 需要 RedisJSON + RediSearch 模块, 因此 compose
+# 里跑的是 redis-stack-server 镜像, 不是裸 redis:alpine。
+redis>=5.0
+langgraph-checkpoint-redis>=0.0.5
+# Long Memory 的 Graph 通道 (实体/关系/多跳), 与 Vector 通道(pgvector)并列
+neo4j>=5.0

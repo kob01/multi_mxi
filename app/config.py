@@ -6,11 +6,17 @@ from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 敏感项对应的 Docker secret 文件(BuildKit/compose secrets 挂载路径)
+# 敏感项对应的 Docker secret 文件(BuildKit/compose secrets 挂载路径);
+# 本地宿主机直跑时回退读取项目内 docker/secrets/<name>.txt (开发调试用)
 _SECRET_FILES = {
     "pg_password": "/run/secrets/pg_password",
     "langsmith_api_key": "/run/secrets/langsmith_api_key",
     "deepseek_api_key": "/run/secrets/deepseek_api_key",
+}
+_SECRET_HOST_FALLBACK = {
+    "pg_password": "docker/secrets/pg_password.txt",
+    "langsmith_api_key": "docker/secrets/langsmith_api_key.txt",
+    "deepseek_api_key": "docker/secrets/deepseek_api_key.txt",
 }
 
 
@@ -40,6 +46,17 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     llm_model: str = "deepseek-flash"
     intent_model: str = "deepseek-flash"
+
+    # 意图识别三层漏斗: 规则快筛 -> bge-m3 语义分类 -> LLM 兜底。
+    # 下面几项只作用于第二层(bge-m3 语义分类)的命中判定, 可按线上效果调。
+    # 关闭即跳过第二层, 规则未命中直接下沉到 LLM。
+    intent_embedding_enabled: bool = True
+    # 每个意图取最相似的前 K 条种子, 用它们的相似度均值作为该意图得分。
+    intent_semantic_top_k: int = 3
+    # 最优意图得分需达到的最低相似度才视为命中(否则下沉 LLM)。
+    intent_accept_threshold: float = 0.62
+    # 最优意图需领先次优意图的最小差距, 防止边界样本在两类间摇摆。
+    intent_margin: float = 0.05
 
     # RAG (向量块与业务元数据同库: PostgreSQL + pgvector, 见 knowledge_chunks 表)
     knowledge_dir: str = "./data/knowledge"
@@ -96,6 +113,46 @@ class Settings(BaseSettings):
     assistant_port: int = 8000
     memory_max_turns: int = 10
     memory_summary_threshold: int = 20
+    # 深度思考全局默认 (deepseek-flash 默认开启思考; 单次请求可用 thinking 字段覆盖)。
+    # 关闭后生成节点走一次性 ainvoke, 不产出 reasoning_content。
+    llm_thinking_enabled: bool = True
+    # DeepSeek 思考强度: high / max (flash 仅支持这两档, 无 low)。
+    llm_reasoning_effort: str = "high"
+    # SSE run 事件缓冲区在 run 结束后的保留秒数 (断点续传窗口, 过期后前端降级为拉历史)。
+    stream_buffer_ttl: int = 600
+
+    # ---------- 记忆层: Session Memory(Redis) / Working State(Checkpoint) ----------
+    # 关闭或连接失败时一律静默降级 (内存 dict / InMemorySaver), 不阻断对话。
+    redis_enabled: bool = True
+    redis_url: str = "redis://localhost:6379/0"
+    # Session Memory 滚动窗口 + 摘要的 Redis Key TTL (秒)
+    session_memory_ttl: int = 3600
+    # Working State Checkpointer 总开关: 关闭则退回进程内 InMemorySaver
+    checkpoint_enabled: bool = True
+
+    # ---------- 长期记忆: Vector(pgvector) + Graph(Neo4j) ----------
+    # Vector 通道总开关: 关闭则不写/不查 long_term_memories, 也不做长期记忆提取。
+    long_term_memory_enabled: bool = True
+    # Graph 通道(Neo4j)总开关: 单节点内网部署, 对齐 ES 的"无认证"先例。
+    graph_memory_enabled: bool = True
+    neo4j_uri: str = "bolt://localhost:7687"
+    # Neo4j 侧 NEO4J_AUTH=none 时这两项留空即可; 若启用鉴权则填对应账号。
+    neo4j_user: str = ""
+    neo4j_password: str = ""
+    # 长期记忆语义查重的 cosine 相似度阈值: 新事实与既有记忆高于此值视为同一条,
+    # 只刷新 last_accessed_at/content, 不重复插入。
+    memory_dedup_threshold: float = 0.92
+    # 每轮召回的长期记忆条数 (Vector Top-K) 与 Graph 关联事实跳数
+    long_term_memory_top_k: int = 3
+    graph_memory_hops: int = 2
+
+    # ---------- 缓存层: Prompt Cache / Retrieval Cache / Tool Cache (统一落 Redis) ----------
+    # 总开关: 关闭后全部直连真实调用(等同于本功能上线前的行为)。
+    cache_enabled: bool = True
+    prompt_cache_ttl: int = 300
+    retrieval_cache_ttl: int = 300
+    # Tool Cache 必须最短: 余额/审批进度等是实时数据, TTL 过长会读到脏结果。
+    tool_cache_ttl: int = 30
 
     # MCP servers
     hr_mcp_url: str = "http://localhost:8001/mcp"
@@ -119,12 +176,20 @@ class Settings(BaseSettings):
     @field_validator("pg_password", "deepseek_api_key", "langsmith_api_key", mode="after")
     @classmethod
     def _read_from_secret_file(cls, value: str, info) -> str:
-        """环境变量/.env 未提供时, 回退读取 compose secret 文件。"""
+        """环境变量/.env 未提供时, 回退读取 compose secret 文件。
+
+        候选路径按序: 容器内 /run/secrets/<name> -> 宿主机 docker/secrets/<name>.txt
+        (本地直跑无挂载路径时的开发级回退)。
+        """
         if value:
             return value
-        secret_path = Path(_SECRET_FILES[info.field_name])
-        if secret_path.is_file():
-            return secret_path.read_text(encoding="utf-8").strip()
+        paths = [Path(_SECRET_FILES[info.field_name])]
+        host_rel = _SECRET_HOST_FALLBACK.get(info.field_name)
+        if host_rel:
+            paths.append(Path(__file__).resolve().parent.parent / host_rel)
+        for p in paths:
+            if p.is_file():
+                return p.read_text(encoding="utf-8").strip()
         return value
 
     @property

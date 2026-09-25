@@ -87,3 +87,7 @@ def _flatten(result: Any) -> str:
             str(block.get("text", "")) for block in result if isinstance(block, dict)
         ).strip()
     return str(result)
+
+
+# 供 app.cache.tool_cache 复用(包装 MCP 工具时要把结果压成纯文本才能写进 Redis)。
+flatten_mcp_result = _flatten

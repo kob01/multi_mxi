@@ -19,3 +19,7 @@ docker/.env
 docker/secrets/
 # PostgreSQL 本地数据目录 (若不用容器跑 PG 时可能落在仓库内)
 data/pgdata/
+
+# MS MARCO 评测：下载/采样缓存与评测报告
+data/msmarco/
+reports/

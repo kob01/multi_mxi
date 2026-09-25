@@ -44,6 +44,10 @@ class IntentResult(BaseModel):
     )
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = Field(default="", description="Why the classifier picked this intent.")
+    layer: Optional[str] = Field(
+        default=None,
+        description="Which funnel layer produced this result: rule/embedding/llm/fallback.",
+    )
 
 
 class ChatRequest(BaseModel):
@@ -54,6 +58,10 @@ class ChatRequest(BaseModel):
     role: Role = Field(default=Role.EMPLOYEE, description="Caller role for permission checks.")
     department: str = Field(default="", description="Caller department for document-level ACL checks.")
     message: str = Field(description="User utterance.")
+    thinking: Optional[bool] = Field(
+        default=None,
+        description="本轮是否开启深度思考; None 时取全局默认 LLM_THINKING_ENABLED。",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -65,6 +73,8 @@ class ChatResponse(BaseModel):
     route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct"]
     target: Optional[str] = None
     trace_id: str
+    # 会话记录落库后的助手消息 id(供前端历史对齐; DB 降级时为 None)
+    message_id: Optional[int] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
