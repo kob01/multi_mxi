@@ -24,19 +24,8 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
     </div>
 
     <div class="emp-switch">
-      <el-select
-        v-model="empId"
-        filterable
-        size="default"
-        style="width: 240px"
-        placeholder="切换员工"
-      >
-        <el-option
-          v-for="e in EMPLOYEES"
-          :key="e.empId"
-          :label="`${e.name}（${e.empId}）`"
-          :value="e.empId"
-        >
+      <el-select v-model="empId" filterable size="default" style="width: 240px" placeholder="切换员工">
+        <el-option v-for="e in EMPLOYEES" :key="e.empId" :label="`${e.name}（${e.empId}）`" :value="e.empId">
           <div class="opt-row">
             <span>{{ e.name }}</span>
             <span class="opt-meta">{{ e.department }} · {{ e.position }}</span>
@@ -47,13 +36,7 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
       <span class="dept">{{ current.department }}</span>
     </div>
 
-    <el-menu
-      :default-active="route.name"
-      mode="horizontal"
-      :ellipsis="false"
-      class="nav"
-      router
-    >
+    <el-menu :default-active="route.name" mode="horizontal" :ellipsis="false" class="nav" router>
       <el-menu-item index="chat" :route="{ name: 'chat' }">智能对话</el-menu-item>
       <el-menu-item index="upload" :route="{ name: 'upload' }">文档管理</el-menu-item>
     </el-menu>
@@ -70,8 +53,10 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   background: #1f3a93;
   color: #fff;
   flex-shrink: 0;
-  overflow: hidden; /* 窄窗口下裁掉导航而非撑破两侧 */
+  overflow: hidden;
+  /* 窄窗口下裁掉导航而非撑破两侧 */
 }
+
 .brand {
   display: flex;
   align-items: baseline;
@@ -79,49 +64,60 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   flex-shrink: 0;
   white-space: nowrap;
 }
+
 .logo {
   font-size: 18px;
   font-weight: 600;
 }
+
 .sub {
   font-size: 12px;
   opacity: 0.85;
 }
+
 .emp-switch {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
 }
+
 /* 窄屏下收窄员工选择器, 优先保证品牌与导航可见 */
 @media (max-width: 1100px) {
   .emp-switch :deep(.el-select) {
     width: 160px !important;
   }
 }
+
 @media (max-width: 900px) {
+
   .sub,
   .dept {
     display: none;
   }
+
   .app-header {
     gap: 12px;
   }
 }
+
 .dept {
   font-size: 12px;
   opacity: 0.85;
 }
+
 .opt-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
 }
+
 .opt-meta {
   font-size: 12px;
   color: #909399;
 }
+
 .nav {
   margin-left: auto;
   background: transparent;
@@ -131,9 +127,11 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   --el-menu-active-color: #fff;
   --el-menu-hover-bg-color: rgba(255, 255, 255, 0.12);
 }
+
 .nav :deep(.el-menu-item) {
   border-bottom: none !important;
 }
+
 .nav :deep(.el-menu-item.is-active) {
   border-bottom: 2px solid #fff !important;
 }

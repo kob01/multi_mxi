@@ -286,15 +286,15 @@ function historyToMessage(m) {
     m.role === 'user'
       ? { role: 'user', placement: 'end', variant: 'outlined', shape: 'corner', content: m.content }
       : {
-          role: 'ai',
-          placement: 'start',
-          variant: 'filled',
-          shape: 'corner',
-          content: m.content,
-          thinking: m.thinking || '',
-          thinkingOpen: false,
-          headerTag: { text: '马小i', type: 'info' },
-        }
+        role: 'ai',
+        placement: 'start',
+        variant: 'filled',
+        shape: 'corner',
+        content: m.content,
+        thinking: m.thinking || '',
+        thinkingOpen: false,
+        headerTag: { text: '马小i', type: 'info' },
+      }
   if (m.role !== 'user') applyRouteTag(base, { route: m.route, target: m.target, metadata: { docs: m.docs_meta || [] } })
   return base
 }
@@ -403,13 +403,8 @@ const currentSessionId = computed(() => sessionId.value)
         新对话
       </el-button>
       <div v-loading="sessionsLoading" class="session-list">
-        <div
-          v-for="s in sessions"
-          :key="s.session_id"
-          class="session-item"
-          :class="{ active: s.session_id === currentSessionId }"
-          @click="switchSession(s.session_id)"
-        >
+        <div v-for="s in sessions" :key="s.session_id" class="session-item"
+          :class="{ active: s.session_id === currentSessionId }" @click="switchSession(s.session_id)">
           <div class="s-main">
             <div class="s-title">{{ s.title }}</div>
             <div class="s-time">{{ fmtTime(s.updated_at) }}</div>
@@ -425,20 +420,9 @@ const currentSessionId = computed(() => sessionId.value)
     <!-- 右侧: 当前会话 -->
     <div class="chat-main">
       <div class="chat-card">
-        <BubbleList
-          ref="listRef"
-          :list="messages"
-          max-height="100%"
-          class="bubble-list"
-        >
+        <BubbleList ref="listRef" :list="messages" max-height="100%" class="bubble-list">
           <template #header="{ item }">
-            <el-tag
-              v-if="item.headerTag"
-              size="small"
-              :type="item.headerTag.type"
-              effect="light"
-              round
-            >
+            <el-tag v-if="item.headerTag" size="small" :type="item.headerTag.type" effect="light" round>
               {{ item.headerTag.text }}
             </el-tag>
           </template>
@@ -460,13 +444,7 @@ const currentSessionId = computed(() => sessionId.value)
           <div class="sender-toolbar">
             <el-switch v-model="thinkingOn" size="small" active-text="深度思考" />
           </div>
-          <XSender
-            ref="senderRef"
-            placeholder="请输入消息，回车发送…"
-            :loading="sending"
-            clearable
-            @submit="handleSubmit"
-          />
+          <XSender ref="senderRef" placeholder="请输入消息，回车发送…" :loading="sending" clearable @submit="handleSubmit" />
         </div>
       </div>
       <div class="hint">Assistant 统一入口 · SSE 流式输出支持刷新断点续传</div>
@@ -483,6 +461,7 @@ const currentSessionId = computed(() => sessionId.value)
   padding: 16px 20px 8px;
   gap: 14px;
 }
+
 .session-side {
   width: 230px;
   flex-shrink: 0;
@@ -494,15 +473,18 @@ const currentSessionId = computed(() => sessionId.value)
   padding: 12px 8px;
   min-height: 0;
 }
+
 .new-btn {
   width: 100%;
   margin-bottom: 10px;
 }
+
 .session-list {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
 }
+
 .session-item {
   display: flex;
   align-items: center;
@@ -511,16 +493,20 @@ const currentSessionId = computed(() => sessionId.value)
   border-radius: 8px;
   cursor: pointer;
 }
+
 .session-item:hover {
   background: #f2f5fb;
 }
+
 .session-item.active {
   background: #e9efff;
 }
+
 .s-main {
   flex: 1;
   min-width: 0;
 }
+
 .s-title {
   font-size: 13px;
   color: #303133;
@@ -528,22 +514,27 @@ const currentSessionId = computed(() => sessionId.value)
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
 .s-time {
   font-size: 11px;
   color: #98a0b3;
   margin-top: 2px;
 }
+
 .s-del {
   visibility: hidden;
   color: #c0c4cc;
   flex-shrink: 0;
 }
+
 .session-item:hover .s-del {
   visibility: visible;
 }
+
 .s-del:hover {
   color: #f56c6c;
 }
+
 .chat-main {
   flex: 1;
   display: flex;
@@ -552,6 +543,7 @@ const currentSessionId = computed(() => sessionId.value)
   max-width: 960px;
   margin: 0 auto;
 }
+
 .chat-card {
   flex: 1;
   min-height: 0;
@@ -562,10 +554,12 @@ const currentSessionId = computed(() => sessionId.value)
   border-radius: 12px;
   padding: 16px;
 }
+
 .bubble-list {
   flex: 1;
   min-height: 0;
 }
+
 .thinking {
   margin-top: 6px;
   font-size: 12px;
@@ -575,12 +569,14 @@ const currentSessionId = computed(() => sessionId.value)
   border-radius: 8px;
   max-width: 640px;
 }
+
 .thinking-head {
   padding: 4px 8px;
   cursor: pointer;
   user-select: none;
   color: #98a0b3;
 }
+
 .thinking-body {
   padding: 0 8px 6px;
   white-space: pre-wrap;
@@ -588,28 +584,33 @@ const currentSessionId = computed(() => sessionId.value)
   max-height: 220px;
   overflow-y: auto;
 }
+
 .status-line {
   font-size: 12px;
   color: #409eff;
   margin-top: 6px;
 }
+
 .cites {
   font-size: 11px;
   color: #888;
   margin-top: 6px;
   line-height: 1.5;
 }
+
 .sender-wrap {
   margin-top: 12px;
   border-top: 1px solid #eef1f6;
   padding-top: 12px;
 }
+
 .sender-toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
   margin-bottom: 6px;
 }
+
 .hint {
   font-size: 12px;
   color: #888;
