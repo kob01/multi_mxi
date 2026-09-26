@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app.assistant.router import router as assistant_router
 from app.docs.router import router as docs_router
+from app.memory.router import router as memory_router
+from app.kg.router import router as kg_router
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,9 @@ async def lifespan(app: FastAPI):
         from app.db.session import init_schema
 
         await init_schema()
-        logger.info("PostgreSQL schema ready (metadata + pgvector + long_term_memories)")
+        logger.info(
+            "PostgreSQL schema ready (metadata + pgvector + long_term_memories + user_profiles)"
+        )
     except Exception as exc:
         logger.error(
             "PostgreSQL 初始化失败, 文档管理/知识库功能不可用, 聊天将降级为无标签模式: %s", exc
@@ -59,6 +63,17 @@ async def lifespan(app: FastAPI):
         logger.info("Memory/cache layers ready (checkpoint + graph schema)")
     except Exception as exc:
         logger.error("记忆层/缓存层初始化失败, 将退回无持久化行为: %s", exc)
+    # 文档知识图谱 schema 预热(幂等; 内部已逐层降级, store 查询时也会兜底 ensure)。
+    from app.config import get_settings
+
+    if get_settings().doc_kg_enabled:
+        try:
+            from app.kg import store as kg_store
+
+            await kg_store.ensure_schema()
+            logger.info("Document knowledge graph schema ready (Neo4j :KgDoc/:KgEntity)")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("文档知识图谱 schema 初始化失败, 图谱功能降级: %s", exc)
     yield
     await orchestrator.shutdown()
     await close_redis()
@@ -76,6 +91,8 @@ def create_app() -> FastAPI:
     )
     app.include_router(assistant_router)
     app.include_router(docs_router)
+    app.include_router(memory_router)
+    app.include_router(kg_router)
 
     # --- Vue3 SPA (web/dist) 托管: 静态资源 + history 模式回退 ---
     index_file = DIST_DIR / "index.html"

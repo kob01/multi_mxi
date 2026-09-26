@@ -69,16 +69,23 @@ class MemoryStore:
             lines.append(f"助手: {assistant}")
         return "\n".join(lines)
 
-    async def _local_append(self, session_id: str, user: str, assistant: str) -> None:
+    async def _local_append(self, session_id: str, user: str, assistant: str) -> str:
+        """降级路径的追加; 返回本轮新压缩出的摘要(未发生压缩时为空串)。"""
         mem = self._local(session_id)
         mem.turns.append((user, assistant))
-        if len(mem.turns) > self._summary_threshold:
-            overflow = mem.turns[: -self._max_turns]
-            mem.turns = mem.turns[-self._max_turns :]
-            old = "\n".join(_render_turn(u, a) for u, a in overflow)
-            prompt = SUMMARY_PROMPT.format(history=f"{mem.summary}\n{old}".strip())
+        if len(mem.turns) <= self._summary_threshold:
+            return ""
+        overflow = mem.turns[: -self._max_turns]
+        old = "\n".join(_render_turn(u, a) for u, a in overflow)
+        prompt = SUMMARY_PROMPT.format(history=f"{mem.summary}\n{old}".strip())
+        try:
             resp = await self._summarizer.ainvoke(prompt)
-            mem.summary = str(resp.content).strip()
+        except Exception as exc:  # noqa: BLE001 - 摘要失败也不能丢轮次, 故先摘要后裁剪
+            logger.warning("session summary 失败, 本轮保留原文不裁剪: %s", exc)
+            return ""
+        mem.summary = str(resp.content).strip()
+        mem.turns = mem.turns[-self._max_turns :]
+        return mem.summary
 
     # -------------------------------------------------------------- Redis 路径
     async def history_text(self, session_id: str) -> str:
@@ -116,12 +123,17 @@ class MemoryStore:
             lines.append(f"助手: {assistant}")
         return "\n".join(lines)
 
-    async def append(self, session_id: str, user: str, assistant: str) -> None:
-        """Append one turn; summarize into long-term memory on overflow."""
+    async def append(self, session_id: str, user: str, assistant: str) -> str:
+        """Append one turn; summarize into long-term memory on overflow.
+
+        返回值是"本轮新折叠出来的会话摘要"(没发生溢出压缩时为空串)。调用方
+        (``persist_memory``)凭这个返回值把摘要再沉一条到 Episodic Memory ——
+        也就是架构图里 Session -> Episodic 那条边; 摘要本身仍归 Session 层管,
+        记忆层不需要为此知道 user_id。
+        """
         redis = self._redis_or_none()
         if redis is None:
-            await self._local_append(session_id, user, assistant)
-            return
+            return await self._local_append(session_id, user, assistant)
 
         turns_key, summary_key = self._turns_key(session_id), self._summary_key(session_id)
         pushed = await try_redis(
@@ -130,13 +142,12 @@ class MemoryStore:
             what="session memory rpush",
         )
         if pushed is None:  # 命令级降级 -> 退回进程内, 不能只丢掉这一轮不写
-            await self._local_append(session_id, user, assistant)
-            return
+            return await self._local_append(session_id, user, assistant)
         await try_redis(lambda: redis.expire(turns_key, self._ttl), what="session memory expire turns")
 
         overflow_n = int(pushed) - self._max_turns
         if int(pushed) <= self._summary_threshold or overflow_n <= 0:
-            return
+            return ""
 
         # 溢出: 把最老的 overflow_n 轮折叠进摘要, 再从列表里 LTRIM 掉。
         overflow_raw = await try_redis(
@@ -149,7 +160,7 @@ class MemoryStore:
             or ""
         )
         if overflow_raw is None:
-            return  # 读不到溢出内容就保持原样, 不能盲目 LTRIM 丢数据
+            return ""  # 读不到溢出内容就保持原样, 不能盲目 LTRIM 丢数据
 
         old_lines = []
         for raw in overflow_raw:
@@ -165,12 +176,13 @@ class MemoryStore:
             new_summary = str(resp.content).strip()
         except Exception as exc:  # noqa: BLE001 - 摘要失败也不能丢轮次, 保留旧摘要
             logger.warning("session summary 失败, 本轮保留旧摘要不裁剪: %s", exc)
-            return
+            return ""
         await try_redis(
             lambda: redis.set(summary_key, new_summary, ex=self._ttl),
             what="session memory set summary",
         )
         await try_redis(lambda: redis.ltrim(turns_key, overflow_n, -1), what="session memory ltrim")
+        return new_summary
 
 
 _memory_store: MemoryStore | None = None

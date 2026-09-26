@@ -40,8 +40,8 @@ Protocol:FastMCP server,streamable-http transport(`:8001/mcp`、`:8002/mcp`)。
 START
   │
   ▼
-load_context ──────────── 载入会话记忆(短期窗口 + 长期摘要)
-  │
+build_context ─────────── 汇聚 Business Context: 会话记忆(短期窗口 + 摘要),
+  │                        个人级记忆六桶(画像/偏好/习惯/情节/知识/图谱)
   ▼
 resolve_time ──────────── 问题含相对时间时预取平台时钟(东八区),
   │                        注入后续四类路由 Prompt, 不依赖模型记忆日期
@@ -61,7 +61,8 @@ classify_intent ───────── deepseek-flash 意图识别(基于�
   └── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
                           │                作为当前请求, metadata 传身份)
                           ▼
-                    persist_memory ────── 脱敏后写入会话记忆
+                    persist_memory ────── 脱敏后写会话记忆 + 一次 LLM 提取,
+                          │                分桶沉淀为个人记忆(溢出摘要另存情节)
                           │                + 全链路审计(同一 trace_id)
                           ▼
                          END
@@ -128,6 +129,14 @@ mxi/
 │   │   ├── mcp_client.py         #   MCP Client(langchain-mcp-adapters)
 │   │   ├── a2a_client.py         #   A2A Client(Agent Card 发现/message.send)
 │   │   └── router.py             #   /api/chat 统一入口
+│   ├── memory/                   # ★ 个人级记忆层(按 user_id 隔离)
+│   │   ├── taxonomy.py           #   分桶语义单一事实源(kind/注入方式/标签)
+│   │   ├── personal.py           #   编排:读路径并行召回, 写路径分桶落盘
+│   │   ├── profile_store.py      #   画像(user_profiles 表, 确定性合并)
+│   │   ├── vector_store.py       #   偏好/习惯/情节/知识(pgvector 长表)
+│   │   ├── graph_store.py        #   个人图谱(Neo4j, :MemoryUser 锚点)
+│   │   ├── extraction.py         #   一次 LLM 调用产出全部桶
+│   │   └── router.py             #   /api/memory 自服务(查看/删除/整理)
 │   ├── rag/                      # ★ RAG 知识底座
 │   │   ├── embeddings.py         #   bge-m3 (Ollama /api/embed)
 │   │   ├── vectorstore.py        #   pgvector 知识块表(ANN 检索 + ACL SQL 谓词)

@@ -191,6 +191,8 @@ services:
       # 服务; Graph 长期记忆走 neo4j 服务 (同一 compose 网络, 用服务名访问)。
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      # 文档知识图谱(GraphRAG)总开关, 复用同一个 neo4j 服务; 默认关闭, 置 true 开启
+      DOC_KG_ENABLED: ${DOC_KG_ENABLED:-true}
       # MinerU OCR: 服务跑在容器内, localhost 指向容器自身, 必须经 host.docker.internal
       MINERU_BASE_URL: ${MINERU_BASE_URL:-http://host.docker.internal:8888}
       MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}

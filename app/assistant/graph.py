@@ -12,9 +12,11 @@ Routing policy (single-entry multi-agent):
     -> [persist_memory] -> END
 
 build_context 是架构图里 "Business Context" 的汇聚点: 并行拉
-Session Memory(Redis) + 长期记忆 Vector 通道(pgvector) + 长期记忆 Graph
-通道(Neo4j), 拼成下游共享的 history/memory_ctx; 三路各自单独降级, 任一通道
-不可用只影响拼接内容, 不阻断对话。
+Session Memory(Redis) + 个人级记忆各桶(User Memory 的 profile/preference/habit、
+Episodic、Personal Knowledge、Personal Graph), 拼成下游共享的 history/memory_ctx;
+各桶各自单独降级, 任一通道不可用只影响拼接内容, 不阻断对话。写路径上
+persist_memory 把一轮对话的一次提取分桶落盘, 会话摘要溢出时还会往
+Episodic Memory 沉一条情节。注: 架构图里的 Project Memory 本轮未实现。
 
 Working State 通过 LangGraph checkpointer 持久化(Redis 可用时 AsyncRedisSaver,
 否则降级 InMemorySaver), 详见 ``AssistantOrchestrator.setup()``。
@@ -71,7 +73,7 @@ from app.config import get_settings
 from app.llm import extract_reasoning, get_chat_model, get_streaming_chat_model
 from app.memory import graph_store
 from app.memory.extraction import extract_memories
-from app.memory.vector_store import get_long_term_store
+from app.memory.personal import PersonalContext, get_personal_agent
 from app.rag.retriever import HybridRetriever
 from app.schemas import (
     ChatRequest,
@@ -103,6 +105,9 @@ _QUOTE_CHARS = "\"'`“”‘’「」『』《》"
 _MAX_REWRITE_LEN = 200
 # 消息长度达到该值且不含指代/省略标记时, 视为自包含问题, 跳过改写 LLM 调用。
 _SELF_CONTAINED_LEN = 40
+# 低于该长度的闲聊轮不触发个人记忆提取: "你好""谢谢" 这类寒暄不可能同
+# 时携带值得跨会话记住的信息, 直接挡住这部分轮次的提取成本。
+_MIN_MEMORY_MESSAGE_LEN = 12
 # 指代词/省略/追问标记: 命中则即使消息较长也必须走改写。
 # 只保留真正的上下文依赖标记(人称/指示代词、回指短语、追问语气词),
 # 不含"如何/哪个"等泛疑问词——它们大量出现在自包含问题中, 会触发无效改写。
@@ -236,9 +241,9 @@ class AssistantOrchestrator:
     async def build_context(self, state: AssistantState) -> dict[str, Any]:
         """架构图里 "Business Context" 的汇聚点(见模块 docstring)。
 
-        三路并行拉取, 各自单独 try/except: Session Memory(Redis) -> history;
-        长期记忆 Vector + Graph 通道 -> memory_ctx。任一路失败只影响自己那一
-        路的拼接内容, 不会让另一路或整条对话链路失败。
+        Session Memory(Redis) -> history; 个人级记忆各桶(profile / preference /
+        habit / episode / knowledge / graph)由 ``PersonalMemoryAgent.build`` 并行
+        拉取并各自降级, 任一路不可用只影响拼接内容, 不会让整条对话链路失败。
         """
         session_id = state.get("session_id") or ""
         user_id = state.get("user_id") or ""
@@ -248,11 +253,12 @@ class AssistantOrchestrator:
         history = await self._safe_history_text(session_id)
         memory_ctx = ""
         if self._settings.long_term_memory_enabled and user_id:
-            vector_part, graph_part = await asyncio.gather(
-                self._safe_vector_memories(user_id, message),
-                self._safe_graph_facts(user_id, message),
+            ctx = await self._safe_personal_context(user_id, message)
+            memory_ctx = ctx.as_prompt()
+            self._audit.log(
+                state.get("trace_id") or "", "assistant", "personal_context_built",
+                ctx.audit(), session_id,
             )
-            memory_ctx = "\n".join(p for p in (vector_part, graph_part) if p)
         # 长期记忆拼进 history 一起往下传: 下游各节点(rewrite/classify/generate/
         # chitchat/tool/agent)统一只读 history 一个字段, 不需要各自感知
         # memory_ctx; memory_ctx 单独留在 state 里只用于审计可观测性。
@@ -266,58 +272,13 @@ class AssistantOrchestrator:
             logger.warning("session memory 读取失败, 本轮无历史上下文: %s", exc)
             return ""
 
-    async def _safe_vector_memories(self, user_id: str, query: str) -> str:
+    async def _safe_personal_context(self, user_id: str, query: str) -> PersonalContext:
+        """个人记忆召回兜底: 编排层内部已逐桶降级, 这里只兜满意外异常。"""
         try:
-            hits = await get_long_term_store().search_memories(user_id, query)
-        except Exception as exc:  # noqa: BLE001 - PG/Embedding 不可用只是少了长期记忆
-            logger.warning("长期记忆 Vector 通道检索失败, 本轮跳过: %s", exc)
-            return ""
-        if not hits:
-            return ""
-        lines = [f"[{kind}] {content}" for content, kind, _score in hits]
-        return "[长期记忆]\n" + "\n".join(lines)
-
-    async def _safe_graph_facts(self, user_id: str, query: str) -> str:
-        """Graph 通道没有"查询->实体"的反向索引能力, 这里用查询里出现的实体名
-        做起点邻居展开(简单按中文分词后的候选实体匹配), 不做完整的 NER
-        —— 那是提取侧(写路径)的职责, 读路径只做一次轻量匹配即可。
-        """
-        if not self._settings.graph_memory_enabled:
-            return ""
-        try:
-            candidates = await self._extract_query_entities(user_id, query)
-            if not candidates:
-                return ""
-            facts = await graph_store.related_facts(user_id, candidates)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("长期记忆 Graph 通道检索失败, 本轮跳过: %s", exc)
-            return ""
-        if not facts:
-            return ""
-        return "[关联记忆]\n" + "\n".join(facts)
-
-    async def _extract_query_entities(self, user_id: str, query: str) -> list[str]:
-        """查该用户图里已存在, 且出现在本次查询文本中的实体名。
-
-        直接复用 Vector 通道已经算好的 embedding 是不行的(图里没有向量),
-        这里退而求其次做子串匹配: 拿用户已有的实体名单, 看哪些字面出现在
-        query 里 —— 避免为读路径再引入一次 NER 模型调用。
-        """
-        driver = graph_store.get_driver()
-        if driver is None:
-            return []
-        try:
-            async with driver.session() as session:
-                result = await session.run(
-                    "MATCH (e:MemoryEntity {user_id: $user_id}) RETURN e.name AS name LIMIT 200",
-                    user_id=user_id,
-                )
-                rows = await result.data()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Neo4j 实体名查询失败, 本轮 Graph 通道跳过: %s", exc)
-            return []
-        names = [r["name"] for r in rows if r.get("name")]
-        return [name for name in names if name in query]
+            return await get_personal_agent().build(user_id, query)
+        except Exception as exc:  # noqa: BLE001 - 记忆读失败只是这轮少点背景
+            logger.warning("个人记忆召回失败, 本轮无长期记忆上下文: %s", exc)
+            return PersonalContext()
 
     async def resolve_time(self, state: AssistantState) -> dict[str, Any]:
         """Pre-fetch the platform clock for time-sensitive questions.
@@ -766,8 +727,9 @@ class AssistantOrchestrator:
         masked_answer = mask_text(state["answer"])
         masked_message = mask_text(state["message"])
         session_id = state.get("session_id") or ""
-        await self._memory.append(session_id, masked_message, masked_answer)
-        await self._write_long_term_memory(state, masked_message, masked_answer)
+        # append 的返回值是本轮新折叠出的会话摘要(没发生溢出压缩时为空串)。
+        session_summary = await self._memory.append(session_id, masked_message, masked_answer)
+        await self._write_personal_memory(state, masked_message, masked_answer, session_summary)
         # 页面会话记录落库(app/chat_store.py): 失败静默降级, 不阻断对话。
         intent = state.get("intent")
         message_id = await get_chat_store().save_turn(
@@ -791,39 +753,44 @@ class AssistantOrchestrator:
         )
         return {"message_id": message_id}
 
-    async def _write_long_term_memory(
-        self, state: AssistantState, message: str, answer: str
+    async def _write_personal_memory(
+        self,
+        state: AssistantState,
+        message: str,
+        answer: str,
+        session_summary: str = "",
     ) -> None:
-        """提取并落盘长期记忆 (Vector + Graph 双通道), 失败只记审计不抛出。
+        """一次提取 -> 分桶落盘(画像/偏好/习惯/情节/知识/图谱), 失败只记日志不抛出。
 
-        跳过闲聊轮次(``route == "direct"``): 这类轮次几乎不产生值得跨会话记住
-        的事实, 白白多一次 LLM 提取调用。
+        闲聊轮不再一律跳过提取: "我在研发部""以后都用 Markdown 回复" 这类自我陈述
+        恰恰会被意图分类归为 chitchat, 按路由一律跳过就等于个人记忆永远写不进
+        去; 只保留短消息过滤(真正的寒暄不会超过 ``_MIN_MEMORY_MESSAGE_LEN``),
+        无信息量的轮次交给提取 prompt 自己返回空列表。会话摘要 -> 情节的沉淀不
+        依赖提取, 闲聊轮同样可能触发窗口溢出, 所以那一步放在路由判定之外。
         """
-        if not self._settings.long_term_memory_enabled or state.get("route") == "direct":
+        if not self._settings.long_term_memory_enabled:
             return
         user_id = state.get("user_id") or ""
         if not user_id:
             return
         session_id = state.get("session_id") or ""
+        agent = get_personal_agent()
         try:
-            extraction = await extract_memories(message, answer)
-            if extraction.is_empty:
-                return
-            store = get_long_term_store()
-            for fact in extraction.facts:
-                await store.upsert_memory(user_id, fact, source_session_id=session_id)
-            await graph_store.upsert_entities(user_id, extraction.entities, extraction.relations)
-            self._audit.log(
-                state.get("trace_id") or "", "assistant", "long_term_memory_written",
-                {
-                    "facts": len(extraction.facts),
-                    "entities": len(extraction.entities),
-                    "relations": len(extraction.relations),
-                },
-                session_id,
+            worth_extracting = (
+                state.get("route") != "direct" or len(message) >= _MIN_MEMORY_MESSAGE_LEN
             )
-        except Exception as exc:  # noqa: BLE001 - 长期记忆写失败只是少一条记忆
-            logger.warning("长期记忆写入失败, 本轮跳过: %s", exc)
+            if worth_extracting:
+                extraction = await extract_memories(message, answer)
+                stats = await agent.write(user_id, session_id, extraction)
+                if stats:
+                    self._audit.log(
+                        state.get("trace_id") or "", "assistant", "personal_memory_written",
+                        stats, session_id,
+                    )
+            if session_summary:
+                await agent.add_session_episode(user_id, session_id, session_summary)
+        except Exception as exc:  # noqa: BLE001 - 记忆写失败只是少一条记忆
+            logger.warning("个人记忆写入失败, 本轮跳过: %s", exc)
 
     # ---------------- SSE 流式推送 ----------------
 

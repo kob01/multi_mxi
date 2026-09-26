@@ -81,26 +81,40 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-# documents 表 ACL 列的轻量迁移 (create_all 不会给已存在的表加列)。
-_DOC_ACL_COLUMNS = {
-    "visibility": "VARCHAR(16) NOT NULL DEFAULT 'public'",
-    "owner_id": "VARCHAR(64) NOT NULL DEFAULT ''",
-    "dept_id": "VARCHAR(64) NOT NULL DEFAULT ''",
-    "allowed_roles": "VARCHAR(128) NOT NULL DEFAULT ''",
+# 已存在表的新增列轻量迁移 (create_all 不会给已存在的表加列):
+# 表名 -> {列名: DDL}。新表由 create_all 直接建出, 只有"老库升级"才需要补列。
+_BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
+    "documents": {
+        "visibility": "VARCHAR(16) NOT NULL DEFAULT 'public'",
+        "owner_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "dept_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "allowed_roles": "VARCHAR(128) NOT NULL DEFAULT ''",
+    },
+    "long_term_memories": {
+        "title": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "source": "VARCHAR(32) NOT NULL DEFAULT 'turn'",
+        "occurred_at": "TIMESTAMPTZ",
+    },
 }
 
+# 已存在表的新增索引同理: create_all 跳过已存在的表, 表上的新索引也不会建。
+_BACKFILL_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_long_term_memories_user_kind_access "
+    "ON long_term_memories (user_id, kind, last_accessed_at)",
+)
 
-def _documents_columns(sync_conn) -> set[str]:
-    """Existing column names of ``documents`` via the dialect inspector (no raw SQL).
 
-    表不存在时必须返空集而不是让 inspector 去查: 首次建库时 documents 还不存在,
+def _table_columns(sync_conn, table: str) -> set[str]:
+    """Existing column names of ``table`` via the dialect inspector (no raw SQL).
+
+    表不存在时必须返空集而不是让 inspector 去查: 首次建库时表还不存在,
     直接 get_columns 会让 SQLAlchemy 吐一条 "... does not exist" 的 WARNING,
     紧接着 create_all 就把表建出来了 —— 那条告警纯误导。
     """
     insp = inspect(sync_conn)
-    if not insp.has_table("documents"):
+    if not insp.has_table(table):
         return set()
-    return {c["name"] for c in insp.get_columns("documents")}
+    return {c["name"] for c in insp.get_columns(table)}
 
 
 async def init_schema() -> None:
@@ -111,9 +125,9 @@ async def init_schema() -> None:
     预建, 这里再兜底一次 —— 失败时抛明确错误, 而不是让 create_all 报难懂的
     "type vector does not exist"。
 
-    Also backfills document-ACL columns on a pre-existing ``documents`` table
-    (``create_all`` never ALTERs existing tables), so upgrading an old database
-    stays safe and idempotent.
+    Also backfills columns/indexes on pre-existing tables (``create_all`` never
+    ALTERs existing tables, 见 ``_BACKFILL_COLUMNS`` / ``_BACKFILL_INDEXES``), so
+    upgrading an old database stays safe and idempotent.
     """
     from app.db.models import Base
 
@@ -127,10 +141,13 @@ async def init_schema() -> None:
                 f"{exc}; 请让超级用户执行一次 CREATE EXTENSION IF NOT EXISTS vector"
             ) from exc
         await conn.run_sync(Base.metadata.create_all)
-        have = await conn.run_sync(_documents_columns)
-        for name, ddl in _DOC_ACL_COLUMNS.items():
-            if name not in have:
-                await conn.execute(text(f"ALTER TABLE documents ADD COLUMN {name} {ddl}"))
+        for table, columns in _BACKFILL_COLUMNS.items():
+            have = await conn.run_sync(_table_columns, table)
+            for name, ddl in columns.items():
+                if name not in have:
+                    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        for ddl in _BACKFILL_INDEXES:
+            await conn.execute(text(ddl))
 
 
 def db_available() -> bool:

@@ -24,16 +24,18 @@ function pickFiles() {
   fileInput.value?.click()
 }
 function onFileChange(e) {
-  handleFiles(e.target.files)
+  // FileList 是 input 的活引用，必须先快照成数组，否则下面清空 input 会把待处理文件一起清空
+  const list = Array.from(e.target.files || [])
   e.target.value = ''
+  handleFiles(list)
 }
 function onDrop(e) {
   dropHover.value = false
-  handleFiles(e.dataTransfer.files)
+  handleFiles(Array.from(e.dataTransfer?.files || []))
 }
 
 async function handleFiles(fileList) {
-  for (const file of fileList) {
+  for (const file of Array.from(fileList || [])) {
     const item = reactive({
       key: file.name + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
       filename: file.name,
@@ -213,7 +215,8 @@ onMounted(loadDocs)
           <div class="list-header">
             <span class="card-title">已入库文档</span>
             <div class="list-header-actions">
-              <el-button :icon="UploadFilled" size="small" type="primary" plain @click="uploadDialogVisible = true">上传</el-button>
+              <el-button :icon="UploadFilled" size="small" type="primary" plain
+                @click="uploadDialogVisible = true">上传</el-button>
               <el-button :icon="Refresh" size="small" :loading="loadingDocs" @click="loadDocs">刷新</el-button>
             </div>
           </div>
@@ -231,12 +234,8 @@ onMounted(loadDocs)
           </el-table-column>
           <el-table-column label="权限" min-width="150">
             <template #default="{ row }">
-              <el-select
-                :model-value="row.visibility"
-                size="small"
-                style="width: 92px"
-                @change="(v) => { row.visibility = v; changeAcl(row) }"
-              >
+              <el-select :model-value="row.visibility" size="small" style="width: 92px"
+                @change="(v) => { row.visibility = v; changeAcl(row) }">
                 <el-option label="全员" value="public" />
                 <el-option label="部门" value="dept" />
                 <el-option label="角色" value="role" />
@@ -245,7 +244,8 @@ onMounted(loadDocs)
               <el-tag v-if="row.visibility === 'dept' && row.dept_id" size="small" type="primary" class="vis-pill">
                 {{ row.dept_id }}
               </el-tag>
-              <el-tag v-if="row.visibility === 'role' && (row.allowed_roles || []).length" size="small" type="warning" class="vis-pill">
+              <el-tag v-if="row.visibility === 'role' && (row.allowed_roles || []).length" size="small" type="warning"
+                class="vis-pill">
                 {{ row.allowed_roles.join(',') }}
               </el-tag>
             </template>
@@ -262,15 +262,11 @@ onMounted(loadDocs)
     </div>
 
     <el-dialog v-model="uploadDialogVisible" title="上传文档" width="560px" append-to-body>
-      <div
-        class="dropzone"
-        :class="{ hover: dropHover }"
-        @click="pickFiles"
-        @dragover.prevent="dropHover = true"
-        @dragleave.prevent="dropHover = false"
-        @drop.prevent="onDrop"
-      >
-        <el-icon class="up-icon"><UploadFilled /></el-icon>
+      <div class="dropzone" :class="{ hover: dropHover }" @click="pickFiles" @dragover.prevent="dropHover = true"
+        @dragleave.prevent="dropHover = false" @drop.prevent="onDrop">
+        <el-icon class="up-icon">
+          <UploadFilled />
+        </el-icon>
         <p>点击选择或拖拽文件到此处（可多选）</p>
         <p class="accept">支持 txt / md / pdf / docx / pptx / xlsx / srt / vtt / 图片，单文件 ≤50MB</p>
         <input ref="fileInput" type="file" multiple hidden :accept="ACCEPT" @change="onFileChange" />
@@ -297,48 +293,22 @@ onMounted(loadDocs)
         <template v-if="item.state === 'parsed' || item.state === 'ingesting'">
           <div class="row">
             <span class="row-label">分类标签：</span>
-            <el-tag
-              v-for="t in item.tags"
-              :key="t"
-              closable
-              :disable-transitions="false"
-              @close="removeTag(item, t)"
-            >
+            <el-tag v-for="t in item.tags" :key="t" closable :disable-transitions="false" @close="removeTag(item, t)">
               {{ t }}
             </el-tag>
-            <el-input
-              v-model="item.customTag"
-              size="small"
-              placeholder="自定义标签，回车添加"
-              style="width: 180px"
-              @keyup.enter="addCustomTag(item)"
-            />
+            <el-input v-model="item.customTag" size="small" placeholder="自定义标签，回车添加" style="width: 180px"
+              @keyup.enter="addCustomTag(item)" />
           </div>
           <div class="row">
             <span class="row-label">文档权限：</span>
             <el-select v-model="item.visibility" size="small" style="width: 140px">
               <el-option v-for="o in VIS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
             </el-select>
-            <el-input
-              v-if="item.visibility === 'dept'"
-              v-model="item.deptId"
-              size="small"
-              placeholder="部门，如 研发部"
-              style="width: 160px"
-            />
-            <el-input
-              v-if="item.visibility === 'role'"
-              v-model="item.allowedRoles"
-              size="small"
-              placeholder="角色，逗号分隔 如 hr,finance"
-              style="width: 220px"
-            />
-            <el-button
-              type="primary"
-              size="small"
-              :loading="item.state === 'ingesting'"
-              @click="confirmIngest(item)"
-            >
+            <el-input v-if="item.visibility === 'dept'" v-model="item.deptId" size="small" placeholder="部门，如 研发部"
+              style="width: 160px" />
+            <el-input v-if="item.visibility === 'role'" v-model="item.allowedRoles" size="small"
+              placeholder="角色，逗号分隔 如 hr,finance" style="width: 220px" />
+            <el-button type="primary" size="small" :loading="item.state === 'ingesting'" @click="confirmIngest(item)">
               确认入库
             </el-button>
           </div>
@@ -361,28 +331,34 @@ onMounted(loadDocs)
   margin: 0 auto;
   align-items: flex-start;
 }
+
 .col {
   flex: 1;
   min-width: 0;
 }
+
 .block {
   border-radius: 12px;
 }
+
 .card-title {
   font-size: 15px;
   font-weight: 600;
   color: #1f3a93;
 }
+
 .list-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
+
 .list-header-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
+
 .dropzone {
   border: 2px dashed #b9c4dd;
   border-radius: 10px;
@@ -392,29 +368,35 @@ onMounted(loadDocs)
   cursor: pointer;
   transition: 0.2s;
 }
+
 .dropzone.hover {
   border-color: #1f6feb;
   background: #f0f5ff;
 }
+
 .dropzone p {
   font-size: 13px;
   line-height: 1.8;
 }
+
 .up-icon {
   font-size: 42px;
   color: #b9c4dd;
   margin-bottom: 6px;
 }
+
 .accept {
   font-size: 11px;
   color: #9aa3b8;
 }
+
 .file-item {
   border: 1px solid #e3e6ee;
   border-radius: 10px;
   padding: 12px 14px;
   margin-top: 12px;
 }
+
 .file-head {
   display: flex;
   justify-content: space-between;
@@ -422,25 +404,31 @@ onMounted(loadDocs)
   gap: 8px;
   flex-wrap: wrap;
 }
+
 .file-head-right {
   display: flex;
   gap: 6px;
 }
+
 .file-name {
   font-size: 14px;
   font-weight: 600;
 }
+
 .status {
   font-size: 12px;
   color: #67718a;
   margin-top: 4px;
 }
+
 .status.err {
   color: #cf222e;
 }
+
 .preview {
   margin-top: 8px;
 }
+
 .preview pre {
   font-size: 12px;
   color: #67718a;
@@ -451,6 +439,7 @@ onMounted(loadDocs)
   overflow: auto;
   white-space: pre-wrap;
 }
+
 .row {
   margin-top: 10px;
   display: flex;
@@ -458,13 +447,16 @@ onMounted(loadDocs)
   gap: 8px;
   align-items: center;
 }
+
 .row-label {
   font-size: 12px;
   color: #67718a;
 }
+
 .tag-pill {
   margin: 1px 2px;
 }
+
 .vis-pill {
   margin-left: 4px;
 }

@@ -39,6 +39,8 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
     <el-menu :default-active="route.name" mode="horizontal" :ellipsis="false" class="nav" router>
       <el-menu-item index="chat" :route="{ name: 'chat' }">智能对话</el-menu-item>
       <el-menu-item index="upload" :route="{ name: 'upload' }">文档管理</el-menu-item>
+      <el-menu-item index="graph" :route="{ name: 'graph' }">知识图谱</el-menu-item>
+      <el-menu-item index="memory" :route="{ name: 'memory' }">我的记忆</el-menu-item>
     </el-menu>
   </div>
 </template>

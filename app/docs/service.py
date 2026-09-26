@@ -24,6 +24,9 @@ from app.security.acl import format_allowed_roles
 
 logger = logging.getLogger(__name__)
 
+# 后台图谱构建任务的强引用: asyncio 只弱引用 task, 不持引用会被 GC 掉。
+_kg_bg_tasks: set = set()
+
 TAG_PROMPT = """你是企业知识库的分类助手。基于文档内容,给出 3~5 个中文分类标签。
 优先复用已有标签: {existing}
 
@@ -224,6 +227,19 @@ async def ingest_confirmed(
     except Exception as exc:  # ES index rebuilds on next startup anyway
         logger.warning("es bm25 refresh after ingest failed: %s", exc)
 
+    # --- build the document knowledge graph (LLM 抽取耗时, 后台执行不阻塞入库响应) ---
+    if get_settings().doc_kg_enabled:
+        try:
+            import asyncio
+
+            from app.kg.service import build_for_doc
+
+            task = asyncio.create_task(build_for_doc(doc_key))
+            _kg_bg_tasks.add(task)
+            task.add_done_callback(_kg_bg_tasks.discard)
+        except Exception as exc:  # noqa: BLE001 - 建图失败不影响入库结果
+            logger.warning("kg build scheduled after ingest failed: %s", exc)
+
     return {
         "doc_key": doc_key,
         "chunk_count": chunk_count,
@@ -310,6 +326,15 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
     # remove the uploaded file directory (best effort)
     if file_path:
         shutil.rmtree(Path(file_path).parent, ignore_errors=True)
+
+    # --- drop this document's nodes from the knowledge graph (best effort) ---
+    if get_settings().doc_kg_enabled:
+        try:
+            from app.kg import store as kg_store
+
+            await kg_store.delete_document_graph(doc_key)
+        except Exception as exc:  # noqa: BLE001 - 图谱删除失败不影响文档删除结果
+            logger.warning("kg delete after document delete failed: %s", exc)
 
     # --- refresh the ES BM25 index of the running assistant, if any ---
     try:

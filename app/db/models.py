@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块 + 会话记录."""
+"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块 + 个人记忆/用户画像 + 会话记录."""
 
 from __future__ import annotations
 
@@ -223,14 +223,19 @@ class KnowledgeChunkRow(Base):
 
 
 # ---------------------------------------------------------------------------
-# 长期记忆 (Vector 通道)
+# 个人记忆 (Vector 通道: User Memory / Episodic / Personal Knowledge)
 # ---------------------------------------------------------------------------
 class LongTermMemoryRow(Base):
-    """一条跨会话长期记忆(事实/偏好) + 稠密向量, 按 ``user_id`` 隔离。
+    """一条跨会话个人记忆(偏好/习惯/情节/知识) + 稠密向量, 按 ``user_id`` 隔离。
 
     与 ``knowledge_chunks`` 是两张不同的表: 知识库是全企业共享的文档, 长期记忆
     是"这个用户"自己的对话沉淀, 权限语义完全不同(必须按 user_id 严格隔离,
     不能像文档那样走 public/dept/role 可见性模型), 因此不复用同一张表。
+
+    个人级记忆的分桶(桶语义见 ``app/memory/taxonomy.py``)复用 ``kind`` 列而非
+    新开表: 各桶都是"一段文本 + 向量"的同一形状, 共用同一套 HNSW 索引与语义
+    查重路径, 多开表只会让召回变成 N 次 UNION。``fact`` 是引入分桶前的历史
+    取值, 仍可被召回, 但新写入不再产生。
     """
 
     __tablename__ = "long_term_memories"
@@ -245,12 +250,26 @@ class LongTermMemoryRow(Base):
         ),
         # 语义查重 / 召回都是"限定 user_id + 按向量排序", 复合索引前置 user_id。
         Index("ix_long_term_memories_user_created", "user_id", "created_at"),
+        # 偏好/习惯是"每轮都直读"的稳定桶: 限定 user_id + kind 按最近使用取 Top-N。
+        Index(
+            "ix_long_term_memories_user_kind_access",
+            "user_id",
+            "kind",
+            "last_accessed_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
-    kind: Mapped[str] = mapped_column(String(16), default="fact")  # fact/preference
+    # fact(历史遗留)/preference/habit/episode/knowledge
+    kind: Mapped[str] = mapped_column(String(16), default="fact")
+    title: Mapped[str] = mapped_column(String(128), default="")  # 情节/知识的短标题
     content: Mapped[str] = mapped_column(Text, default="")
+    # 产出来源: turn(对话轮提取) / session_summary(会话摘要折叠) / reflection(情节蒸馏)
+    source: Mapped[str] = mapped_column(String(32), default="turn")
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )  # 事件发生时间(仅情节; "上周报的销"这类时间锚点)
     source_session_id: Mapped[str] = mapped_column(String(64), default="")
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(get_settings().embedding_dim), nullable=True
@@ -260,6 +279,35 @@ class LongTermMemoryRow(Base):
     )
     last_accessed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 用户画像 (User Memory 的 profile 桶)
+# ---------------------------------------------------------------------------
+class UserProfileRow(Base):
+    """一个用户一条聚合画像: 结构化属性 + 渲染好的 prompt 摘要。
+
+    不入 ``long_term_memories`` 的原因有二: 一是画像"一人一条"、每次合并是覆盖而
+    非追加, 与逐条事实的语义不同; 二是画像每轮都要全量注入, 不需要也不应该做
+    向量相似度检索(没有 embedding 列)。摘要由属性模板渲染, 不额外调 LLM。
+    """
+
+    __tablename__ = "user_profiles"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # {"identity": [...], "role": [...], "skills": [...], "topics": [...]}
+    attributes: Mapped[dict] = mapped_column(JSON, default=dict)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    # 情节蒸馏门槛的判定基准: 上次蒸馏时间点之后新增的情节才计入触发条件
+    last_reflected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
     )
 
 

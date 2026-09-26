@@ -146,6 +146,35 @@ class Settings(BaseSettings):
     long_term_memory_top_k: int = 3
     graph_memory_hops: int = 2
 
+    # ---------- 文档知识图谱 (GraphRAG, 复用 Neo4j, 与 :MemoryEntity 隔离) ----------
+    # 总开关: 默认关闭, 关闭或 Neo4j 不可用时抽取/写入/查询全部静默降级(对齐
+    # graph_memory_enabled 的降级风格), 不阻断入库与对话。
+    doc_kg_enabled: bool = False
+    # 单文档送入 LLM 抽取实体/关系的文本上限(控成本, 超长截断)
+    kg_extraction_max_chars: int = 6000
+    # 邻域展开默认跳数与单次返回节点上限(避免整图拉取, 控前端渲染)
+    kg_graph_hops: int = 2
+    kg_graph_node_limit: int = 300
+    # 概览中度数低于此值的孤立实体节点被裁剪(降噪)
+    kg_min_entity_degree: int = 1
+
+    # ---------- 个人级记忆: User Memory / Episodic / Personal Knowledge ----------
+    # 总开关: 关闭则完全回退到旧的单一 fact 通道(仍受 long_term_memory_enabled 约束)。
+    personal_memory_enabled: bool = True
+    # 画像注入 prompt 的字符上限: 画像不检索、每轮全量带, 不设上限会随对话越滚越大。
+    profile_max_chars: int = 400
+    # 各桶每轮注入条数: 偏好/习惯是标量直读, 情节/知识是向量召回。
+    memory_preference_top_k: int = 3
+    memory_habit_top_k: int = 3
+    memory_episode_top_k: int = 2
+    memory_knowledge_top_k: int = 3
+    # 情节召回时间窗: 只取近 N 天的事件, 陈年旧事不再挤占 prompt。
+    episodic_window_days: int = 30
+    # 情节 -> 知识蒸馏门槛: 自上次蒸馏以来新增情节达到该条数才调一次 LLM。
+    memory_reflect_min_episodes: int = 3
+    # 情节陈旧判定天数: 超出后排序降权(仅影响排序, 不删数据)。
+    memory_decay_days: int = 90
+
     # ---------- 缓存层: Prompt Cache / Retrieval Cache / Tool Cache (统一落 Redis) ----------
     # 总开关: 关闭后全部直连真实调用(等同于本功能上线前的行为)。
     cache_enabled: bool = True
