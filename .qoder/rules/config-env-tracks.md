@@ -29,15 +29,15 @@ glob:
 
 `docker/.env` 中以下为红线键，不得改成 `localhost`、不得删除：
 
-| 键 | 必须的值 |
-|---|---|
-| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` |
-| `PG_HOST` | `postgres`（配合 `PG_SSLMODE=disable`） |
-| `MONGO_URL` | `mongodb://mongo:27017` |
-| `ES_URL` | `http://elasticsearch:9200` |
-| `TEI_RERANK_URL` | `http://tei-rerank:8080` |
-| `REDIS_URL` | `redis://redis:6379/0` |
-| `NEO4J_URI` | `bolt://neo4j:7687` |
+| 键                | 必须的值                                |
+| ----------------- | --------------------------------------- |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434`     |
+| `PG_HOST`         | `postgres`（配合 `PG_SSLMODE=disable`） |
+| `MONGO_URL`       | `mongodb://mongo:27017`                 |
+| `ES_URL`          | `http://elasticsearch:9200`             |
+| `TEI_RERANK_URL`  | `http://tei-rerank:8080`                |
+| `REDIS_URL`       | `redis://redis:6379/0`                  |
+| `NEO4J_URI`       | `bolt://neo4j:7687`                     |
 
 - 容器里的 `localhost` 指向容器自身，未映射端口时必定连接失败；Mongo 侧表现为写正文时 `ServerSelectionTimeoutError`。
 - `OLLAMA_BASE_URL` 是唯一例外：Ollama 不在 compose 内、只跑在宿主机，所以走 `host.docker.internal` 而不是服务名。

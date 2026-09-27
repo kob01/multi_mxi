@@ -26,12 +26,12 @@ description: 动手改配置前的红线预检清单：app/config.py 的 env_fil
 
 ## 症状 → 定位
 
-| 症状 | 先看哪条 |
-|---|---|
-| rerank 退 RRF / 会话记忆退内存 / BM25 无候选，且**无异常栈** | 不许做 1（宿主轨串味，静默降级） |
-| 容器起来了但连不上；写正文报 `ServerSelectionTimeoutError` | 不许做 2 |
-| embedding 超时、Ollama 连接类报错且无日志 | 不许做 3 |
-| 部分服务卡 `Created` / neo4j `Exited(255)`，无应用日志 | 不许做 4，跑 `netsh int ipv4 show excludedportrange protocol=tcp` |
-| 服务起来但鉴权失败，或日志/异常栈里出现口令 | 不许做 5 |
-| 改了 `app/mcp_servers/`、`app/agents/` 却不生效 | 容器跑的是旧镜像快照，`-Build` 重建 |
-| 某层能力莫名失效，原因不明 | 跑 `dev_services check`，再读 `config-env-tracks.md` §1 |
+| 症状                                                         | 先看哪条                                                          |
+| ------------------------------------------------------------ | ----------------------------------------------------------------- |
+| rerank 退 RRF / 会话记忆退内存 / BM25 无候选，且**无异常栈** | 不许做 1（宿主轨串味，静默降级）                                  |
+| 容器起来了但连不上；写正文报 `ServerSelectionTimeoutError`   | 不许做 2                                                          |
+| embedding 超时、Ollama 连接类报错且无日志                    | 不许做 3                                                          |
+| 部分服务卡 `Created` / neo4j `Exited(255)`，无应用日志       | 不许做 4，跑 `netsh int ipv4 show excludedportrange protocol=tcp` |
+| 服务起来但鉴权失败，或日志/异常栈里出现口令                  | 不许做 5                                                          |
+| 改了 `app/mcp_servers/`、`app/agents/` 却不生效              | 容器跑的是旧镜像快照，`-Build` 重建                               |
+| 某层能力莫名失效，原因不明                                   | 跑 `dev_services check`，再读 `config-env-tracks.md` §1           |
