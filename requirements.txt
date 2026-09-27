@@ -39,6 +39,10 @@ psycopg[binary]>=3.1.21
 python-pptx>=1.0.0
 pillow>=10.0.0
 
+# 文档正文外置存储 (MongoDB): 整篇正文 + 父块全文的唯一事实来源
+# 向量/元数据/ACL/子块 chunk_text 仍在 PostgreSQL, 正文按 _id 精确取, 不做全文查询
+motor>=3.6
+
 # Memory & Cache layers
 # Session Memory/Working State Checkpoint/三类 Cache 统一落 Redis;
 # langgraph-checkpoint-redis 需要 RedisJSON + RediSearch 模块, 因此 compose

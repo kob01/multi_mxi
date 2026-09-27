@@ -6,19 +6,22 @@ import json
 import logging
 import re
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import get_settings
-from app.db.models import Document, DocumentTag, Tag
+from app.bodies.store import get_body_store
+from app.db.models import DocChunkRow, DocParentRow, Document, DocumentTag, Tag
 from app.db.session import get_session_factory
+from app.docs.normalize import normalize_text
 from app.docs.parsers import modality_of, parse_blocks, supported_extensions
 from app.rag.embeddings import OllamaEmbedder
-from app.rag.ingest import compute_doc_id, ingest_blocks
-from app.rag.vectorstore import PgVectorStore
+from app.rag.ingest import build_structure, compute_doc_id, ingest_blocks
+from app.rag.vectorstore import ChunkStore, ParentStore
 from app.schemas import DocVisibility
 from app.security.acl import format_allowed_roles
 
@@ -144,6 +147,18 @@ def normalize_acl(
     return acl
 
 
+async def _set_doc_status(doc_key: str, status: str) -> None:
+    """Best-effort 更新 documents.status(入库失败时标 failed, 供检索门禁生效)。"""
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(Document).where(Document.doc_key == doc_key).values(status=status)
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - 状态刷新失败不掩盖原始异常
+        logger.warning("set doc status=%s failed for %s: %s", status, doc_key, exc)
+
+
 async def ingest_confirmed(
     doc_key: str,
     filename: str,
@@ -153,13 +168,16 @@ async def ingest_confirmed(
     dept_id: str = "",
     allowed_roles: list[str] | str = "",
 ) -> dict[str, Any]:
-    """Phase-2 ingest: parse -> chunk -> embed -> pgvector overwrite -> metadata.
+    """Phase-2 ingest: 元数据先行 + 内容后发(修掉孤儿向量)。
 
-    The document ACL (visibility/owner/dept/roles) is validated here, stamped
-    onto every knowledge chunk row for retrieval-time metadata filtering, and
-    stored on the ``documents`` row as the source of truth.
-
-    Returns a summary dict for the API response.
+    顺序(不得违背, 见方案 2.6):
+      1. 解析 + 归一化(raw -> normalized -> structure);
+      2. PG 事务1: upsert documents 行, status='ingesting', chunk_count=0, body_stored=false
+         (新文档也先插行, 不再"先建向量后补元数据");
+      3. Mongo save_doc_body(失败 -> status='failed' 后抛 UploadError, PG 不留无元数据行);
+      4. ingest_blocks(父块正文入 Mongo + 父子块入 PG);
+      5. PG 事务2: chunk_count=N, body_stored=true, status='ready' + tags 重写;
+      6. 仅当转为 ready 后才 refresh_knowledge + 后台建图。
     """
     path = _upload_dir() / doc_key / _safe_filename(filename)
     if not path.exists():
@@ -168,47 +186,89 @@ async def ingest_confirmed(
     acl = normalize_acl(visibility, uploader, dept_id, allowed_roles)
     modality = modality_of(path)
     _, blocks = await parse_blocks(path)
-    parsed_text = "\n\n".join(b.text for b in blocks)
-
-    store = PgVectorStore()
-    embedder = OllamaEmbedder()
-    title = path.stem
-    chunk_count = await ingest_blocks(
-        doc_key, path.name, title, str(path), modality, blocks, store, embedder, acl=acl
-    )
-    if not chunk_count:
+    raw = "\n\n".join(b.text for b in blocks)
+    if not raw.strip():
         raise UploadError("文档解析后无有效内容")
+    normalized = normalize_text(raw)
+    structure = build_structure(blocks, normalized)
+    title = path.stem
 
-    # --- document metadata (transactional) ---
-    # Two pages uploading the same file race here: both SELECTs miss, both
-    # INSERT, the loser hits the doc_key unique index. The explicit flush
-    # surfaces the conflict before the tag work; one retry then sees the
-    # winner's committed row and falls through to the update path.
     factory = get_session_factory()
+    # --- 事务1: 元数据先行, 置 ingesting(幂等 upsert, 并发插入重试) ---
     for attempt in range(3):
         try:
             async with factory() as session:
                 async with session.begin():
-                    existing = await session.execute(
-                        select(Document).where(Document.doc_key == doc_key)
-                    )
-                    doc = existing.scalar_one_or_none()
+                    doc = (
+                        await session.execute(
+                            select(Document).where(Document.doc_key == doc_key)
+                        )
+                    ).scalar_one_or_none()
                     if doc is None:
                         doc = Document(doc_key=doc_key, name=title, ext=path.suffix.lower(),
                                        modality=modality, created_by=uploader)
                         session.add(doc)
-                        await session.flush()  # surface duplicate doc_key early
+                        await session.flush()
                     doc.file_path = str(path)
-                    doc.parsed_text = parsed_text
-                    doc.chunk_count = chunk_count
                     doc.size_bytes = path.stat().st_size
                     doc.modality = modality
-                    # ACL 以元数据表为事实来源, 同时冗余写入向量表供检索裁剪
+                    doc.status = "ingesting"
+                    doc.chunk_count = 0
+                    doc.body_stored = False
                     doc.visibility = acl["visibility"]
                     doc.owner_id = acl["owner_id"]
                     doc.dept_id = acl["dept_id"]
                     doc.allowed_roles = acl["allowed_roles"]
+            break
+        except IntegrityError:
+            if attempt == 2:
+                raise
+            logger.warning("doc_key %s concurrently inserted, retrying pre-ingest metadata", doc_key)
 
+    # --- 步骤3: 整篇正文入 Mongo(失败标 failed 并抛, PG 不会留下 ready 的无正文行) ---
+    bodies = get_body_store()
+    try:
+        await bodies.save_doc_body(
+            doc_key, raw=raw, normalized=normalized, structure=structure,
+            meta={"name": title, "modality": modality, "source": str(path)},
+        )
+    except Exception as exc:  # noqa: BLE001 - Mongo 写失败转 502(经 UploadError)
+        await _set_doc_status(doc_key, "failed")
+        logger.error("save_doc_body 失败 doc_key=%s: %s", doc_key, exc)
+        raise UploadError(f"正文存储不可用, 入库失败: {exc}") from exc
+
+    # --- 步骤4: 父子块发布(父块正文入 Mongo + 父子块入 PG, 增量 embed) ---
+    store = ChunkStore()
+    embedder = OllamaEmbedder()
+    try:
+        chunk_count = await ingest_blocks(
+            doc_key, path.name, title, str(path), modality, blocks, store, embedder,
+            acl=acl, parent_store=ParentStore(), bodies=bodies, normalized_text=normalized,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await _set_doc_status(doc_key, "failed")
+        logger.error("ingest_blocks 失败 doc_key=%s: %s", doc_key, exc)
+        raise UploadError(f"知识块发布失败: {exc}") from exc
+    if not chunk_count:
+        await _set_doc_status(doc_key, "failed")
+        raise UploadError("文档解析后无有效内容")
+
+    # --- 事务2: 发布态转 ready + chunk_count + tags 重写(迁移期仍写 parsed_text 供回退) ---
+    for attempt in range(3):
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    doc = (
+                        await session.execute(
+                            select(Document).where(Document.doc_key == doc_key)
+                        )
+                    ).scalar_one_or_none()
+                    if doc is None:  # 极端: 事务1 后被并发删除
+                        raise UploadError("文档元数据丢失, 请重新入库")
+                    doc.parsed_text = raw
+                    doc.chunk_count = chunk_count
+                    doc.body_stored = True
+                    doc.status = "ready"
                     await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
                     for tag_name in dict.fromkeys(t.strip() for t in tags if t.strip()):
                         tag_id = await _get_or_create_tag(session, tag_name)
@@ -217,9 +277,9 @@ async def ingest_confirmed(
         except IntegrityError:
             if attempt == 2:
                 raise
-            logger.warning("doc_key %s concurrently inserted, retrying metadata write", doc_key)
+            logger.warning("doc_key %s tag concurrently inserted, retrying", doc_key)
 
-    # --- refresh the ES BM25 index of the running assistant, if any ---
+    # --- 步骤6: 仅发布成功后刷新检索缓存/ES 索引与后台建图 ---
     try:
         from app.assistant.graph import get_orchestrator
 
@@ -227,7 +287,6 @@ async def ingest_confirmed(
     except Exception as exc:  # ES index rebuilds on next startup anyway
         logger.warning("es bm25 refresh after ingest failed: %s", exc)
 
-    # --- build the document knowledge graph (LLM 抽取耗时, 后台执行不阻塞入库响应) ---
     if get_settings().doc_kg_enabled:
         try:
             import asyncio
@@ -277,7 +336,7 @@ async def update_document_acl(
         doc.allowed_roles = acl["allowed_roles"]
         await session.commit()
 
-    updated = await PgVectorStore().update_acl_by_doc(
+    updated_chunks, updated_parents = await ChunkStore().update_acl_by_doc(
         doc_key, acl["visibility"], acl["owner_id"], acl["dept_id"], acl["allowed_roles"]
     )
 
@@ -290,9 +349,12 @@ async def update_document_acl(
         logger.warning("es bm25 refresh after acl update failed: %s", exc)
 
     logger.info("document acl updated: doc_key=%s visibility=%s operator=%s", doc_key, acl["visibility"], operator)
-    result: dict[str, Any] = {"doc_key": doc_key, **acl, "chunks_updated": updated}
-    if updated == 0:
-        # 向量表里没有该文档的任何块 (常见于表被重建/迁移后未重新入库):
+    result: dict[str, Any] = {
+        "doc_key": doc_key, **acl,
+        "chunks_updated": updated_chunks, "parents_updated": updated_parents,
+    }
+    if updated_chunks == 0:
+        # 新子块表里没有该文档的任何块 (常见于表被重建/迁移后未重新入库):
         # 权限只写进了元数据表, 检索侧不会生效, 必须显式提示而不是静默"成功"。
         result["warning"] = (
             "向量库中未找到该文档的知识块, 权限变更不会生效; 请重新入库该文档。"
@@ -305,7 +367,12 @@ async def update_document_acl(
 
 
 async def delete_document(doc_key: str) -> dict[str, Any]:
-    """Delete a document: knowledge chunks + metadata + upload files."""
+    """Delete a document: PG 父子行+元数据同事务 -> 提交成功后再删 Mongo 正文。
+
+    顺序: 先删子块/父块(PG), 再删元数据(PG), 同事务提交; 只有 PG 提交成功后才
+    清 Mongo。PG 是事实来源, Mongo 残留由 --prune 回收(删除中途崩溃只会产生
+    无 ACL 风险的孤儿文本, 不会产生丢元数据的孤儿向量)。
+    """
     factory = get_session_factory()
     async with factory() as session:
         doc = (
@@ -315,17 +382,42 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
             raise UploadError("文档不存在或已删除")
         name, file_path = doc.name, doc.file_path
 
-        # Vector rows first; the metadata row is the source of truth, so a
-        # vector failure aborts before metadata is lost (chunk leftovers can
-        # be purged by a re-ingest, but a lost metadata row orphans nothing).
-        await PgVectorStore().delete_by_doc(doc_key)
-        await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
-        await session.execute(delete(Document).where(Document.doc_key == doc_key))
-        await session.commit()
+    # 父子块与元数据同事务删除(同一 session, 不留"删了子块没删元数据"的中间态)。
+    async with factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(DocChunkRow).where(DocChunkRow.doc_id == doc_key)
+            )
+            await session.execute(
+                delete(DocParentRow).where(DocParentRow.doc_id == doc_key)
+            )
+            await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
+            await session.execute(delete(Document).where(Document.doc_key == doc_key))
 
-    # remove the uploaded file directory (best effort)
+    # PG 提交成功后再清 Mongo(失败仅告警, 残留由 --prune 回收)。
+    bodies = get_body_store()
+    try:
+        await bodies.delete_parents_by_doc(doc_key)
+        await bodies.delete_doc_body(doc_key)
+    except Exception as exc:  # noqa: BLE001 - Mongo 删除失败不回滚已提交的 PG 删除
+        logger.warning("mongo body cleanup after delete failed doc_key=%s: %s", doc_key, exc)
+
+    # remove the uploaded file directory (best effort).
+    # 以"当前 upload_dir + doc_key"重新定位规范目录再删, 不直接信任 DB 里存的
+    # file_path: 它可能是容器内绝对路径(/data/uploads/...), 宿主机直跑时与真实
+    # 位置(<项目>/data/uploads/<doc_key>)不一致, rmtree 会因路径不存在而静默失败,
+    # 表现为"文档已删但源文件还在"。doc_key 跨环境稳定, 故用它重算路径最可靠。
+    upload_doc_dir = _upload_dir() / doc_key
+    shutil.rmtree(upload_doc_dir, ignore_errors=True)
+    # 兼容历史数据: file_path 若指向规范目录之外(如迁移前残留), 也补删一次。
     if file_path:
-        shutil.rmtree(Path(file_path).parent, ignore_errors=True)
+        legacy_dir = Path(file_path).parent
+        if legacy_dir != upload_doc_dir:
+            shutil.rmtree(legacy_dir, ignore_errors=True)
+    if upload_doc_dir.exists():
+        logger.warning(
+            "upload dir still present after delete (占用/权限?): %s", upload_doc_dir
+        )
 
     # --- drop this document's nodes from the knowledge graph (best effort) ---
     if get_settings().doc_kg_enabled:
@@ -346,6 +438,32 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
 
     logger.info("document deleted: doc_key=%s name=%s", doc_key, name)
     return {"doc_key": doc_key, "name": name}
+
+
+async def docs_not_ready(doc_ids: Sequence[str]) -> set[str]:
+    """返回 status != 'ready' 的 doc_id 集合(发布态门禁, 供检索出口一次性批量判)。
+
+    防"正在入库的半篇文档"被检索到: ingest_confirmed 先置 ingesting, 完成才转 ready,
+    故未就绪文档的块即使已进入新表也不会进入回答。调用方在 assemble_parents 后的
+    出口复核里一次性传入命中 doc_id, 不逐块查。
+    """
+    if not doc_ids:
+        return set()
+    factory = get_session_factory()
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                select(Document.doc_key, Document.status).where(
+                    Document.doc_key.in_(list(dict.fromkeys(doc_ids)))
+                )
+            )
+        ).all()
+    ready = {r.doc_key for r in rows if (r.status or "ready") == "ready"}
+    # 没有元数据行的 doc_id 也视为未就绪(孤儿向量, 默认拒); 仅已存在且 ready 的放行。
+    known = {r.doc_key for r in rows}
+    blocked = {d for d in doc_ids if d not in ready}
+    blocked |= {d for d in doc_ids if d not in known}
+    return blocked
 
 
 async def _get_or_create_tag(session, name: str) -> int:

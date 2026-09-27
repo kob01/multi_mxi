@@ -1,4 +1,4 @@
-.qoder
+.qoder/repowiki
 __pycache__/
 *.py[oc]
 build/
@@ -13,13 +13,25 @@ wheels/
 logs/
 data/uploads
 node_modules/
+# ---------- 本地配置与密钥 ----------
+# 真实配置/密钥不入库; 但同名后缀的 .env.example 模板必须入库(新机器靠它初始化),
+# gitignore 的 `.env` 不会匹配 `.env.example`, 因此无需额外反向规则。
 .env
 docker/.env
 .env.local
-docker/secrets/
+# 密钥目录: 用 `secrets/*` 而非 `secrets/` —— 父目录被整体排除时 git 无法再
+# 反向包含其中的文件, 那样连使用说明也提交不上去。
+docker/secrets/*
+!docker/secrets/README.md
+# 打包产物与开发期临时日志
+build/
+logs/dev.pid
 # PostgreSQL 本地数据目录 (若不用容器跑 PG 时可能落在仓库内)
 data/pgdata/
+# TEI 重排权重的宿主机预下载缓存 (供 compose 只读挂载, 体积 ~1.1GB 不入库)
+data/tei_models/
 
 # MS MARCO 评测：下载/采样缓存与评测报告
 data/msmarco/
 reports/
+.aider*

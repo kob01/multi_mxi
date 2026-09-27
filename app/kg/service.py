@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.config import get_settings
+from app.bodies.store import get_body_store
 from app.db.models import Document, DocumentTag, Tag
 from app.db.session import get_session_factory
 from app.kg import store
@@ -61,14 +62,45 @@ async def _load_doc_with_tags(doc_key: str) -> tuple[Document | None, list[str]]
     return doc, list(tag_rows)
 
 
+async def _load_doc_meta(doc_key: str) -> tuple[Any | None, list[str]]:
+    """列白名单加载建图所需元数据(**排除 parsed_text**), 避免顺手拉全篇正文。"""
+    factory = get_session_factory()
+    async with factory() as session:
+        row = (
+            await session.execute(
+                select(Document.name, Document.ext, Document.modality).where(
+                    Document.doc_key == doc_key
+                )
+            )
+        ).first()
+        if row is None:
+            return None, []
+        tag_rows = (
+            await session.execute(
+                select(Tag.name)
+                .join(DocumentTag, DocumentTag.tag_id == Tag.id)
+                .where(DocumentTag.doc_key == doc_key)
+            )
+        ).scalars().all()
+    return row, list(tag_rows)
+
+
 async def build_for_doc(doc_key: str) -> dict[str, Any]:
-    """为一篇已入库文档抽取实体关系并写入图谱; 关闭开关/缺数据/失败均安全返回。"""
+    """为一篇已入库文档抽取实体关系并写入图谱; 关闭开关/缺数据/失败均安全返回。
+
+    正文从 Mongo ``doc_bodies`` 取 head(head 始终内联, 抽取只用开头), 不再从 PG
+    ``documents.parsed_text`` 拉全篇 —— 避免建图路径顺手把整篇正文读进内存。
+    """
     if not get_settings().doc_kg_enabled:
         return {"doc_key": doc_key, "built": False, "reason": "disabled"}
-    doc, tags = await _load_doc_with_tags(doc_key)
+    doc, tags = await _load_doc_meta(doc_key)
     if doc is None:
         return {"doc_key": doc_key, "built": False, "reason": "not_found"}
-    text = doc.parsed_text or ""
+    bodies = get_body_store()
+    text = await bodies.get_doc_body(doc_key, head_only=True)
+    if not text:
+        # head 缺失(旧数据/溢出未写 head): 退回 normalized 前缀, 不阻断建图。
+        text = (await bodies.get_doc_body(doc_key, field="normalized"))[: get_settings().kg_extraction_max_chars]
     kg = await extract_doc_graph(doc.name or "", tags, text)
     if kg.is_empty:
         logger.info("文档 %s 未抽出实体关系, 跳过建图", doc_key)
@@ -117,10 +149,29 @@ async def get_graph(
     if not settings.doc_kg_enabled:
         return {"nodes": [], "edges": [], "truncated": False, "enabled": False}
     # ACL 事实来源是 PostgreSQL documents; 先算可访问 doc_key 再交给 Neo4j 裁剪。
+    # 列白名单只取 ACL 四列 + doc_key(不拉 parsed_text, 避免整表扫描顺手读全篇正文)。
     factory = get_session_factory()
     async with factory() as session:
-        docs = (await session.execute(select(Document))).scalars().all()
-    allowed_keys = [d.doc_key for d in docs if is_allowed(_doc_chunk(d), principal)]
+        rows = (
+            await session.execute(
+                select(
+                    Document.doc_key, Document.visibility, Document.owner_id,
+                    Document.dept_id, Document.allowed_roles,
+                )
+            )
+        ).all()
+    allowed_keys = [
+        r.doc_key
+        for r in rows
+        if is_allowed(
+            KnowledgeChunk(
+                chunk_id="", doc_id=r.doc_key, title="", content="", source="",
+                visibility=r.visibility or "public", owner_id=r.owner_id or "",
+                dept_id=r.dept_id or "", allowed_roles=r.allowed_roles or "",
+            ),
+            principal,
+        )
+    ]
     if focus and focus not in allowed_keys:
         # 聚焦文档本身无权访问 -> 视为无效 focus, 退回概览
         focus = None

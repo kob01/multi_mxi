@@ -1,7 +1,7 @@
 """文档知识图谱一次性回填脚本。
 
-为数据库中所有已入库文档(``documents.parsed_text``)抽取实体关系并写入 Neo4j
-文档图谱(``:KgDoc``/``:KgEntity``)。用于开启 ``doc_kg_enabled`` 后把存量文档灌入
+为数据库中所有已入库文档从 MongoDB ``doc_bodies``(head) 取正文抽取实体关系并写入
+Neo4j 文档图谱(``:KgDoc``/``:KgEntity``)。用于开启 ``doc_kg_enabled`` 后把存量文档灌入
 图谱, 无需重新上传; 新文档会在入库时自动建图, 不必再跑本脚本。
 
 需先启用图谱(``DOC_KG_ENABLED=true``)且 Neo4j 可达; PG 密码按 db.session 的既有

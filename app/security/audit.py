@@ -8,6 +8,7 @@ reconstructed for compliance review.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from datetime import datetime
@@ -16,6 +17,8 @@ from typing import Any
 
 from app.config import get_settings
 from app.security.masking import mask_sensitive
+
+logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
@@ -40,7 +43,11 @@ class AuditLogger:
         detail: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> None:
-        """Write one audit record. Sensitive fields are masked first."""
+        """Write one audit record. Sensitive fields are masked first.
+
+        落盘失败(磁盘满/权限)降级为 logger.error 而不向上抛: 审计节点若允许
+        把 IO 异常冒泡回图节点, "永不失败的留痕步骤"反而会把整轮对话打断。
+        """
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
             "trace_id": trace_id,
@@ -50,8 +57,11 @@ class AuditLogger:
             "detail": mask_sensitive(detail or {}),
         }
         line = json.dumps(record, ensure_ascii=False)
-        with _lock, self.path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        try:
+            with _lock, self.path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as exc:
+            logger.error("audit log write failed (path=%s): %s", self.path, exc)
 
 
 _audit_logger: AuditLogger | None = None

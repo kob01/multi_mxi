@@ -98,7 +98,7 @@ def render_markdown(report: dict) -> str:
     for key in (
         "num_queries", "corpus_passages", "top_k", "top_n",
         "rerank_requested", "rerank_effective", "threshold", "seed",
-        "eval_database", "es_index",
+        "eval_database", "eval_mongo_database", "es_index", "chunk_store",
     ):
         if key in cfg:
             lines.append(f"| {key} | {cfg[key]} |")
@@ -156,6 +156,10 @@ def render_markdown(report: dict) -> str:
     lines.append(f"| 端到端墙钟 (s) | {run.get('wall_seconds')} |")
     lines.append(f"| 平均单查询延迟 (s) | {run.get('avg_latency_seconds')} |")
     lines.append(f"| P95 延迟 (s) | {run.get('p95_latency_seconds')} |")
+    bf = run.get("body_fetch_ms") or {}
+    pf = run.get("parent_fetch_ms") or {}
+    lines.append(f"| 正文主键回表 body_fetch (ms avg/p95) | {bf.get('avg')} / {bf.get('p95')} |")
+    lines.append(f"| 父块 Mongo 取回 parent_fetch (ms avg/p95) | {pf.get('avg')} / {pf.get('p95')} |")
     lines.append(f"| 打分模式分布 | {run.get('score_modes')} |")
     lines.append("")
 

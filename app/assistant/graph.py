@@ -14,7 +14,8 @@ Routing policy (single-entry multi-agent):
 build_context 是架构图里 "Business Context" 的汇聚点: 并行拉
 Session Memory(Redis) + 个人级记忆各桶(User Memory 的 profile/preference/habit、
 Episodic、Personal Knowledge、Personal Graph), 拼成下游共享的 history/memory_ctx;
-各桶各自单独降级, 任一通道不可用只影响拼接内容, 不阻断对话。写路径上
+各桶各自单独降级, 任一通道不可用只影响拼接内容, 不阻断对话; 降级事实会合并成
+一条 context_degraded 审计留痕。写路径上
 persist_memory 把一轮对话的一次提取分桶落盘, 会话摘要溢出时还会往
 Episodic Memory 沉一条情节。注: 架构图里的 Project Memory 本轮未实现。
 
@@ -248,16 +249,28 @@ class AssistantOrchestrator:
         session_id = state.get("session_id") or ""
         user_id = state.get("user_id") or ""
         message = state["message"]
+        # 降级原因收集器是本轮局部字典逐层传参, 不用实例属性: orchestrator
+        # 是进程单例, 并发多个 run 同时跑 build_context 时实例态会串轮。
+        degraded_reasons: dict[str, str] = {}
         await self._emit_status(state, "understanding", "正在理解问题…")
 
-        history = await self._safe_history_text(session_id)
+        history, history_ok = await self._safe_history_text(session_id, degraded_reasons)
         memory_ctx = ""
+        memory_ok = True
         if self._settings.long_term_memory_enabled and user_id:
-            ctx = await self._safe_personal_context(user_id, message)
+            ctx, memory_ok = await self._safe_personal_context(user_id, message, degraded_reasons)
             memory_ctx = ctx.as_prompt()
             self._audit.log(
                 state.get("trace_id") or "", "assistant", "personal_context_built",
                 ctx.audit(), session_id,
+            )
+        # 降级事实进审计: 两路都挂也只记一条, 正常轮次零额外开销;
+        # detail 只落异常类名+截断摘要, 避免异常文本夹带连接串等信息入审计文件。
+        degraded = [name for name, ok in (("session_memory", history_ok), ("personal_memory", memory_ok)) if not ok]
+        if degraded:
+            self._audit.log(
+                state.get("trace_id") or "", "assistant", "context_degraded",
+                {"channels": degraded, "reasons": degraded_reasons}, session_id,
             )
         # 长期记忆拼进 history 一起往下传: 下游各节点(rewrite/classify/generate/
         # chitchat/tool/agent)统一只读 history 一个字段, 不需要各自感知
@@ -265,20 +278,35 @@ class AssistantOrchestrator:
         full_history = f"{history}\n{memory_ctx}".strip() if memory_ctx else history
         return {"history": full_history, "memory_ctx": memory_ctx}
 
-    async def _safe_history_text(self, session_id: str) -> str:
+    async def _safe_history_text(
+        self, session_id: str, degraded_reasons: dict[str, str] | None = None
+    ) -> tuple[str, bool]:
+        """返回 (历史文本, 是否成功); 失败只记日志, 降级事实由调用方合入审计。"""
         try:
-            return await self._memory.history_text(session_id)
+            return await self._memory.history_text(session_id), True
         except Exception as exc:  # noqa: BLE001 - 记忆层故障不能阻断对话
             logger.warning("session memory 读取失败, 本轮无历史上下文: %s", exc)
-            return ""
+            self._note_degraded(degraded_reasons, "session_memory", exc)
+            return "", False
 
-    async def _safe_personal_context(self, user_id: str, query: str) -> PersonalContext:
+    async def _safe_personal_context(
+        self, user_id: str, query: str, degraded_reasons: dict[str, str] | None = None
+    ) -> tuple[PersonalContext, bool]:
         """个人记忆召回兜底: 编排层内部已逐桶降级, 这里只兜满意外异常。"""
         try:
-            return await get_personal_agent().build(user_id, query)
+            return await get_personal_agent().build(user_id, query), True
         except Exception as exc:  # noqa: BLE001 - 记忆读失败只是这轮少点背景
             logger.warning("个人记忆召回失败, 本轮无长期记忆上下文: %s", exc)
-            return PersonalContext()
+            self._note_degraded(degraded_reasons, "personal_memory", exc)
+            return PersonalContext(), False
+
+    @staticmethod
+    def _note_degraded(
+        reasons: dict[str, str] | None, channel: str, exc: Exception
+    ) -> None:
+        # 只落异常类名+截断摘要, 避免异常文本夹带连接串等信息入审计文件。
+        if reasons is not None:
+            reasons[channel] = f"{exc.__class__.__name__}: {str(exc)[:200]}"
 
     async def resolve_time(self, state: AssistantState) -> dict[str, Any]:
         """Pre-fetch the platform clock for time-sensitive questions.
@@ -422,6 +450,9 @@ class AssistantOrchestrator:
         # Retrieval Cache: key 含 ACL 签名, 命中即跳过一次混合检索(Embedding +
         # ES + rerank), 但下方的 assemble_parents / is_allowed 仍然照常执行
         # —— 缓存在权限裁剪之前, 不影响最终授权校验这道纵深防御。
+        # 注: cached payload 是 retrieve() 的输出, 已在内部 attach_texts 补好子块正文,
+        # 故命中时不再走一次 chunk_id 主键回表; 文档重入库路径已调 invalidate_all(),
+        # 缓存里不会残留陈旧 chunk_id, 无需为本方案新增失效机制。
         children, score_mode, cache_hit = await cached_retrieve(
             query, self._settings.rag_top_k, self._settings.rerank_top_n,
             principal, _invoke_retrieve,
@@ -431,9 +462,23 @@ class AssistantOrchestrator:
         chunks = await retriever.assemble_parents(children) if children else []
         # 最终授权校验 (纵深防御): 进入 Context Builder 前逐条复核, 拦截
         # 父块组装/索引脏数据可能引入的越权块; 无权块在拼接前剔除并审计。
+        # 与发布态门禁(status!='ready')共用这一个出口: 一次性批量查未就绪 doc,
+        # 不逐块查, 也不新增第二套权限判断。
         authorized: list[KnowledgeChunk] = []
         dropped_docs: set[str] = set()
+        not_ready: set[str] = set()
+        if chunks:
+            try:
+                from app.docs.service import docs_not_ready
+
+                not_ready = await docs_not_ready([c.doc_id for c in chunks])
+            except Exception as exc:  # DB 抖动: 不误伤, 仅跳过发布态门禁
+                logger.warning("docs_not_ready check failed, skip status gate: %s", exc)
         for c in chunks:
+            if c.doc_id in not_ready:
+                # 正在入库/入库失败的半篇文档: 视同无权, 不进入回答(默认拒)。
+                dropped_docs.add(c.doc_id)
+                continue
             if is_allowed(c, principal):
                 authorized.append(c)
             else:
@@ -601,6 +646,14 @@ class AssistantOrchestrator:
         try:
             check_mcp_permission(role, target, "*")
         except PermissionDenied as exc:
+            # 权限拒绝是合规上最该留痕的事件(与 acl_final_check_dropped 同等对待),
+            # 转答复展示给用户的同时必须落审计, 否则拒绝记录只存在于用户界面。
+            logger.warning("MCP 权限拒绝: role=%s target=%s err=%s", role.value, target, exc)
+            self._audit.log(
+                state.get("trace_id") or "", "assistant", "mcp_permission_denied",
+                {"role": role.value, "target": target, "reason": str(exc)},
+                state.get("session_id"),
+            )
             return {"answer": f"权限不足:{exc}", "route": "mcp_tool", "target": target}
 
         all_tools = await get_mcp_pool().get_tools(target)
@@ -668,6 +721,12 @@ class AssistantOrchestrator:
         try:
             check_agent_permission(role, agent_name)
         except PermissionDenied as exc:
+            logger.warning("A2A 委派权限拒绝: role=%s agent=%s err=%s", role.value, agent_name, exc)
+            self._audit.log(
+                state.get("trace_id") or "", "assistant", "a2a_permission_denied",
+                {"role": role.value, "agent": agent_name, "reason": str(exc)},
+                state.get("session_id"),
+            )
             return {"answer": f"权限不足:{exc}", "route": "a2a_agent", "target": target}
 
         # 任务文本不含操作者工号: 身份经协议级 metadata 结构化下发(见下方 send,
@@ -968,7 +1027,7 @@ class AssistantOrchestrator:
         final: AssistantState = await self._run_graph(req, trace_id, run_id="", thinking=False)
         resp = self._build_response(req, final, trace_id)
         intent = final.get("intent") or IntentResult(intent=IntentType.CHITCHAT)
-        memory_snapshot = await self._safe_history_text(req.session_id)
+        memory_snapshot, _ = await self._safe_history_text(req.session_id)
         self._audit.log(
             trace_id,
             "handle",

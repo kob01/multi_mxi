@@ -2,7 +2,7 @@
 
 End-to-end MS MARCO retrieval evaluation of the project's hybrid RAG pipeline:
 
-    load/sample dataset  ->  build isolated Milvus + ES index  ->
+    load/sample dataset  ->  build isolated PostgreSQL db + Mongo db + ES index  ->
     run queries through HybridRetriever  ->  score IR metrics  ->
     write JSON + Markdown report
 
@@ -59,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="optional local MS MARCO train.jsonl(.gz) to use instead of downloading",
     )
     p.add_argument("--out-dir", type=Path, default=None, help="report output dir (default <root>/reports)")
-    p.add_argument("--cleanup", action="store_true", help="drop the eval Milvus collection + ES index when done")
+    p.add_argument("--cleanup", action="store_true", help="drop the eval PostgreSQL db + Mongo db + ES index when done")
     p.add_argument("--log-level", default="INFO", help="logging level (INFO/DEBUG/...)")
     return p.parse_args(argv)
 
@@ -81,11 +81,12 @@ async def run(args: argparse.Namespace) -> int:
     )
     print(f"      queries={sample.n_queries} corpus_passages={sample.n_corpus}")
 
-    # 2) isolated index (separate PostgreSQL db + separate ES index)
+    # 2) isolated index (separate PostgreSQL db + separate Mongo db + separate ES index)
     print(f"[2/4] provisioning isolated eval store: pg={harness.DEFAULT_EVAL_DB} "
-          f"es={harness.DEFAULT_EVAL_ES_INDEX} ...")
+          f"mongo={harness.DEFAULT_EVAL_MONGO_DB} es={harness.DEFAULT_EVAL_ES_INDEX} ...")
     engine = await harness.provision_eval_database()
     harness.install_eval_engine(engine)
+    harness.install_eval_mongo(harness.DEFAULT_EVAL_MONGO_DB)
     retriever = harness.make_retriever(es_index=harness.DEFAULT_EVAL_ES_INDEX)
     index_stats = await harness.ingest_corpus(retriever, sample.corpus)
     print(f"      indexed {index_stats['chunks_indexed']} chunks "
@@ -96,8 +97,8 @@ async def run(args: argparse.Namespace) -> int:
     if args.rerank:
         rerank_effective = await harness.rerank_available()
         if not rerank_effective:
-            print("      NOTE: cross-encoder reranker unavailable on this host "
-                  "(Ollama GGUF crash); measuring dense+BM25+RRF order instead.")
+            print("      NOTE: TEI cross-encoder reranker unreachable "
+                  "(docker compose up -d tei-rerank); measuring dense+BM25+RRF order instead.")
     print(f"[3/4] running {len(sample.queries)} queries "
           f"(top_k={args.top_k} top_n={args.top_n} rerank={rerank_effective}) ...")
     rankings, run_stats = await harness.run_queries(
@@ -125,7 +126,9 @@ async def run(args: argparse.Namespace) -> int:
         "threshold": args.threshold,
         "seed": args.seed,
         "eval_database": harness.DEFAULT_EVAL_DB,
+        "eval_mongo_database": harness.DEFAULT_EVAL_MONGO_DB,
         "es_index": harness.DEFAULT_EVAL_ES_INDEX,
+        "chunk_store": "two_tables",
     }
     report = build_report(
         sample_summary={**sample.summary(), "counts": eval_result["counts"]},
@@ -153,9 +156,12 @@ async def run(args: argparse.Namespace) -> int:
             es_index=harness.DEFAULT_EVAL_ES_INDEX,
         )
         print(f"[cleanup] {res}")
-    # Best-effort ES client close (avoids the aiohttp 'unclosed session' warning).
+    # Best-effort 关闭外部客户端(避免 aiohttp 'unclosed session' 与 httpx 连接泄漏告警)。
     try:
         await retriever.bm25._client.close()  # noqa: SLF001
+        from app.rag.reranker import close_reranker_client
+
+        await close_reranker_client()
     except Exception:  # noqa: BLE001
         pass
     return 0

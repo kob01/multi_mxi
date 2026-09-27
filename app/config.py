@@ -3,47 +3,56 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 敏感项对应的 Docker secret 文件(BuildKit/compose secrets 挂载路径);
-# 本地宿主机直跑时回退读取项目内 docker/secrets/<name>.txt (开发调试用)
+# 本地宿主机直跑时回退读取项目内 docker/secrets/<name>.txt (开发调试用)。
+# 真实密钥只允许落在这两个位置之一, 禁止写进 .env / docker/.env。
 _SECRET_FILES = {
     "pg_password": "/run/secrets/pg_password",
     "langsmith_api_key": "/run/secrets/langsmith_api_key",
     "deepseek_api_key": "/run/secrets/deepseek_api_key",
+    "mongo_password": "/run/secrets/mongo_password",
 }
 _SECRET_HOST_FALLBACK = {
     "pg_password": "docker/secrets/pg_password.txt",
     "langsmith_api_key": "docker/secrets/langsmith_api_key.txt",
     "deepseek_api_key": "docker/secrets/deepseek_api_key.txt",
+    "mongo_password": "docker/secrets/mongo_password.txt",
 }
 
 
 class Settings(BaseSettings):
     """Central configuration for the whole platform.
 
-    Real environment variables take precedence over the .env files
-    (.env and docker/.env are both supported for local convenience).
+    取值优先级(高->低): 真实环境变量 -> .env.local -> .env -> 字段默认值。
+
+    配置只有一条宿主轨: ``.env`` 是**宿主机视角**(全部指向 docker 已发布端口),
+    ``.env.local`` 是同一视角的机器私有覆盖(均已 gitignore)。**不要**把
+    ``docker/.env`` 加进 env_file: pydantic-settings 是后者覆盖前者, 那会把容器
+    服务名(tei-rerank/elasticsearch/mongo/...)灌进宿主机进程, 解析失败后静默降级
+    (见 CONFIG_RULES.md 第 5 条)。容器侧一律靠 docker-compose 的
+    ``env_file: docker/.env`` + ``environment:`` 注入真实环境变量。
     """
 
     model_config = SettingsConfigDict(
-        env_file=(".env", "docker/.env"),
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore",
         # 字段取默认值(环境变量缺失)时也运行校验器, 以便回退读取 /run/secrets/*
         validate_default=True,
     )
 
-    # Ollama (仅 embedding / rerank 仍走本地 Ollama)
+    # Ollama (仅 embedding 走本地 Ollama; rerank 已迁 TEI, 见下方 tei_rerank_url)
     ollama_base_url: str = "http://localhost:11434"
     embedding_model: str = "bge-m3"
-    rerank_model: str = "dengcao/bge-reranker-v2-m3"
 
     # DeepSeek 在线 API (OpenAI 兼容格式, 用于 LLM / 意图识别)
     deepseek_base_url: str = "https://api.deepseek.com"
     # 密钥优先取环境变量, 其次由校验器读取 /run/secrets/deepseek_api_key
-    deepseek_api_key: str = ""
+    # repr=False: 防止 print(settings)/异常栈/LangSmith trace 把密钥带进日志
+    deepseek_api_key: str = Field(default="", repr=False)
     llm_model: str = "deepseek-flash"
     intent_model: str = "deepseek-flash"
 
@@ -62,12 +71,21 @@ class Settings(BaseSettings):
     knowledge_dir: str = "./data/knowledge"
     rag_top_k: int = 8
     rerank_top_n: int = 4
-    # Rerank fails -> graceful fallback to RRF fusion order (e.g. Windows
-    # Ollama llama.cpp crashes on bge-reranker GGUF); set false to skip.
+    # Rerank 走 TEI 容器的真 cross-encoder (/rerank), 不再借道 Ollama /api/embed。
+    # 容器内必须用服务名 tei-rerank; 宿主机直跑用 http://localhost:8080 (见 CONFIG_RULES)。
+    tei_rerank_url: str = "http://localhost:8080"
+    # 总超时 3s / 建连 0.5s: TEI 半死不能拖垮整条对话链路(超时报错即降级 RRF)。
+    rerank_timeout: float = 3.0
+    rerank_connect_timeout: float = 0.5
+    # 单条候选送打分前的字符截断, 控 batch token 规模(bge-reranker-v2-m3 上限 8k token)。
+    rerank_max_chars: int = 1024
+    # TEI 不可用/超时 -> 优雅降级为 RRF 融合序; 也可置 false 作为总开关跳过重排。
     rerank_enabled: bool = True
     # 全链路唯一的相关性阈值, 只作用于 rerank 阶段: rerank 分低于该值的块
     # 视为噪声剔除; 剔除后为空即"未检索到相关文档", 触发改写重检或拒答。
     # 检索通道(稠密向量 / ES BM25)与 RRF 融合均不设阈值, 只负责召回。
+    # 分数标度: 真 rerank 输出 TEI sigmoid 后的 0~1 相关性(相关块常 >0.9, 噪声常 <0.05),
+    # 与旧的 Ollama cosine 标度不同; 降级为 RRF 时本阈值不生效(见 HybridRetriever)。
     retrieval_score_threshold: float = 0.4
     # 无结果重检的最大次数 (0 = 关闭重检, 只检索一次)
     retrieval_max_retries: int = 1
@@ -84,7 +102,7 @@ class Settings(BaseSettings):
     pg_host: str = "localhost"
     pg_port: int = 5432
     pg_user: str = "mxi"
-    pg_password: str = ""
+    pg_password: str = Field(default="", repr=False)
     pg_database: str = "mxi"
     # disable: 本机/compose 内网直连; require: 自签证书云实例(只加密不校验 CA)。
     pg_sslmode: str = "disable"
@@ -96,6 +114,31 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     # 单次 ON CONFLICT upsert 的行数 (避免单语句参数过多)。
     upsert_batch_size: int = 500
+
+    # ---------- 正文外置存储: MongoDB ----------
+    # 整篇 raw_text/normalized_text/structure 与父块全文存 Mongo;
+    # PG 只存向量 + 窄标量 + 子块 chunk_text。热路径按 parent_id 精确取, 不做全文查询。
+    # 关闭(MONGO_ENABLED=false)则父块上下文降级为子块文本(不阻断对话), 入库则直接报错。
+    mongo_enabled: bool = True
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_database: str = "mxi"
+    # 可选鉴权: 内网单节点默认无认证(对齐 ES/Neo4j); 云部署启用时走 URI 或这两项。
+    mongo_user: str = ""
+    mongo_password: str = Field(default="", repr=False)
+    mongo_max_pool_size: int = 50
+    mongo_server_selection_ms: int = 3000
+    mongo_connect_timeout_ms: int = 5000
+    # Mongo 单文档 16MB 硬上限: 整篇正文超过该阈值时溢出到 doc_body_parts 分片。
+    mongo_body_max_bytes: int = 15_000_000
+    # 批量读写分页大小(Mongo $in 分块 / bulk_write 批次 / chunk_text 主键批量 / 语料流式页)。
+    mongo_batch_page_size: int = 500
+
+    # ---------- 文本规范化与入库 ----------
+    # offset 基准是 normalized_text; 归一化规则一改, 全库旧 offset 集体失效。
+    # 任何修改 normalize_text() 的提交必须同步递增此值(见 CONFIG_RULES.md)。
+    normalizer_version: str = "n1"
+    # 增量入库: 块 content_hash 未变则不重新 embed(embedding 走 Ollama, 是最慢一环)。
+    rag_incremental_ingest: bool = True
 
     # Document upload & metadata
     upload_dir: str = "./data/uploads"
@@ -132,13 +175,13 @@ class Settings(BaseSettings):
 
     # ---------- 长期记忆: Vector(pgvector) + Graph(Neo4j) ----------
     # Vector 通道总开关: 关闭则不写/不查 long_term_memories, 也不做长期记忆提取。
-    long_term_memory_enabled: bool = True
+    long_term_memory_enabled: bool = False
     # Graph 通道(Neo4j)总开关: 单节点内网部署, 对齐 ES 的"无认证"先例。
     graph_memory_enabled: bool = True
     neo4j_uri: str = "bolt://localhost:7687"
     # Neo4j 侧 NEO4J_AUTH=none 时这两项留空即可; 若启用鉴权则填对应账号。
     neo4j_user: str = ""
-    neo4j_password: str = ""
+    neo4j_password: str = Field(default="", repr=False)
     # 长期记忆语义查重的 cosine 相似度阈值: 新事实与既有记忆高于此值视为同一条,
     # 只刷新 last_accessed_at/content, 不重复插入。
     memory_dedup_threshold: float = 0.92
@@ -184,8 +227,11 @@ class Settings(BaseSettings):
     tool_cache_ttl: int = 30
 
     # MCP servers
-    hr_mcp_url: str = "http://localhost:8001/mcp"
-    finance_mcp_url: str = "http://localhost:8002/mcp"
+    # 默认值 = Docker 已发布的宿主端口 (Windows winnat 把 7956-8055 列进 TCP 排除段,
+    # 8001/8002 无法 bind; 详见 docker-compose.yml 顶部"宿主端口映射约定")。
+    # 容器内由 compose 注入 http://<svc>:8001/mcp 等服务名地址覆盖本默认值。
+    hr_mcp_url: str = "http://localhost:18001/mcp"
+    finance_mcp_url: str = "http://localhost:18002/mcp"
 
     # A2A agents
     hr_agent_url: str = "http://localhost:9001"
@@ -194,15 +240,16 @@ class Settings(BaseSettings):
     # Security
     audit_log_path: str = "./logs/audit.jsonl"
 
-    # LangSmith / LangGraph Studio (仅本地开发环境启用; 生产容器默认关闭)
+    # LangSmith / LangGraph Studio (仅本地开发环境启用; 生产容器必须关闭)
     # 开启后 trace 会上传到 langsmith_endpoint 指向的服务, 含对话内容,
-    # 受内网合规约束: 生产环境务必保持 LANGSMITH_TRACING=false。
+    # 受内网合规约束: 默认 false, 只有开发机在 .env 里显式置 true 才启用
+    # (容器侧由 docker/.env 的 LANGSMITH_TRACING=false 锁死)。
     langsmith_tracing: str = "false"
-    langsmith_api_key: str = ""
+    langsmith_api_key: str = Field(default="", repr=False)
     langsmith_project: str = "mxi-assistant"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
-    @field_validator("pg_password", "deepseek_api_key", "langsmith_api_key", mode="after")
+    @field_validator("pg_password", "deepseek_api_key", "langsmith_api_key", "mongo_password", mode="after")
     @classmethod
     def _read_from_secret_file(cls, value: str, info) -> str:
         """环境变量/.env 未提供时, 回退读取 compose secret 文件。

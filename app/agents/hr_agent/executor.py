@@ -121,7 +121,9 @@ class HRAgent:
             # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号。
             tools = [*tools, lookup_employee_by_name]
             self._agents[role] = create_agent(
-                self._llm, tools, prompt=_build_role_prompt(role)
+                # langchain 1.x 把 create_agent 的提示词参数改名为 system_prompt
+                # (旧写法 prompt= 会直接 TypeError, 表现为"工单智能体处理失败")。
+                self._llm, tools, system_prompt=_build_role_prompt(role)
             )
         return self._agents[role]
 

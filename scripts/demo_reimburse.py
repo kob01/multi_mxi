@@ -6,17 +6,21 @@ locally) and Ollama models pulled.
 
 Usage:
     python -m scripts.demo_reimburse
+    # 指向其他入口: python -m scripts.demo_reimburse  (改 MXI_BASE)
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import uuid
 
 import httpx
 
-ASSISTANT = "http://localhost:8000/api/chat"
+# 宿主发布端口 18000 (容器内仍为 8000), 见 docker/docker-compose.yml 顶部约定。
+ASSISTANT = os.environ.get("MXI_BASE", "http://localhost:18000") + "/api/chat"
 
 
 async def turn(client: httpx.AsyncClient, session: str, message: str) -> dict:
@@ -59,4 +63,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Windows 控制台默认 GBK, 而智能体回答里常带 emoji/表格符号 —— 不重配编码会在
+    # print 那一步直接 UnicodeEncodeError, 看起来像链路挂了其实是打印挂了。
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     asyncio.run(main())

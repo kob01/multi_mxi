@@ -8,6 +8,27 @@ x-build: &build
 
 # 运行时敏感信息以 secret 文件挂载到容器 /run/secrets/<name>,
 # 不进镜像、不进环境变量、不提交 git (docker/secrets/ 已被 .gitignore 排除)。
+#
+# ---------- 宿主端口映射约定 (Windows 开发机必读) ----------
+# 下列 *_HOST_PORT 只影响"宿主机暴露端口", 容器内监听端口恒为 8000/8001/8002/7474/7687,
+# compose 网络内部一律走服务名+容器端口 (assistant -> http://hr-mcp:8001/mcp), 故改映射
+# 不影响容器间连通性。之所以前移 10000, 是因为 Windows 的 winnat/Hyper-V 开机时会把
+# 一段段端口写进"TCP 端口排除范围"(netsh int ipv4 show excludedportrange protocol=tcp),
+# 落在排除段内的端口即使无人监听也无法 bind, Docker 报:
+#   ports are not available: ... bind: An attempt was made to access a socket
+#   in a way forbidden by its access permissions
+# 容器卡在 Created/Exited(255)。若换机后 18xxx/17xxx 也被排除, 用同名环境变量再挪一次即可:
+#   $env:ASSISTANT_HOST_PORT=20000; docker compose -f docker/docker-compose.yml up -d assistant
+# 实测本机(2026-09)排除段为 7254-7353 / 7354-7453 / 7454-7553 / 7554-7653 / 7956-8055,
+# 故 7474 与 8000/8001/8002 全部不可 bind; 7687 恰好不在段内, 保持原值不动。
+#
+# ---------- 容器侧配置注入约定 (改动前必读 CONFIG_RULES.md 第 5 条) ----------
+# app/config.py 的 env_file 只读宿主侧 .env / .env.local, 不再读 docker/.env, 所以容器配置
+# 必须由 compose 显式注入, 分两条通道:
+#   1) env_file: [.env]  -> 项目目录 = docker/, 整份以真实环境变量注入(可调参数);
+#   2) environment:      -> 锁死"红线"键(服务名地址、/data 卷路径、tracing 开关);
+#                          compose 中 environment 优先级高于 env_file, 会覆盖 1) 的同名键。
+# 宿主 .env 里的 HR_MCP_URL/FINANCE_MCP_URL 是宿主端口(18001/18002), 容器内靠 2) 覆盖回服务名。
 secrets:
   pg_password:
     file: ./secrets/pg_password.txt
@@ -39,12 +60,14 @@ services:
   hr-mcp:
     build: *build
     command: python -m app.mcp_servers.hr_server
-    ports: ["8001:8001"]
+    ports: ["${HR_MCP_HOST_PORT:-18001}:8001"]
+    env_file: [.env]
     environment:
       PG_HOST: ${PG_HOST:-postgres}
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
     secrets: [pg_password]
     depends_on:
       postgres:
@@ -54,12 +77,14 @@ services:
   finance-mcp:
     build: *build
     command: python -m app.mcp_servers.finance_server
-    ports: ["8002:8002"]
+    ports: ["${FINANCE_MCP_HOST_PORT:-18002}:8002"]
+    env_file: [.env]
     environment:
       PG_HOST: ${PG_HOST:-postgres}
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
     secrets: [pg_password]
     depends_on:
       postgres:
@@ -70,14 +95,25 @@ services:
     build: *build
     command: python -m app.agents.hr_agent.server
     ports: ["9001:9001"]
+    env_file: [.env]
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       HR_MCP_URL: http://hr-mcp:8001/mcp
+      # Agent Card 的通告地址: Assistant 侧以配置端点为准(见 a2a_client 的 url 覆盖),
+      # 所以这里写容器内服务名不会让宿主直跑的网关连不上。
       HR_AGENT_URL: http://hr-agent:9001
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-    secrets: [deepseek_api_key]
+      # 专业智能体经 common_tools 直连 PG 按姓名查工号: 缺这几项会退回代码默认值
+      # localhost(容器内=自身), 表现为"查不到员工"的静默降级而非启动报错。
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+    secrets: [deepseek_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [hr-mcp]
@@ -89,14 +125,21 @@ services:
     build: *build
     command: python -m app.agents.finance_agent.server
     ports: ["9002:9002"]
+    env_file: [.env]
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
       FINANCE_AGENT_URL: http://finance-agent:9002
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-    secrets: [deepseek_api_key]
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+    secrets: [deepseek_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [finance-mcp]
@@ -135,17 +178,72 @@ services:
     image: ${NEO4J_IMAGE:-docker.m.daocloud.io/library/neo4j:5-community}
     environment:
       NEO4J_AUTH: none
-    ports: ["7474:7474", "7687:7687"]
+    ports:
+      [
+        "${NEO4J_HTTP_HOST_PORT:-17474}:7474",
+        "${NEO4J_BOLT_HOST_PORT:-7687}:7687",
+      ]
     volumes:
       - neo4j_data:/data
+    healthcheck:
+      # 探 bolt 上的真实查询能力而非 7474 首页: assistant 需要的是 7687 能跑 Cypher。
+      # neo4j 启动到 bolt 就绪有十几秒, 而 ensure_schema() 失败只留 WARNING 并静默降级,
+      # 故必须靠健康门禁而非"started"。镜像自带 cypher-shell(无 curl), NEO4J_AUTH=none 无需凭据。
+      test: ["CMD-SHELL", "cypher-shell 'RETURN 1' > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
     networks: [mxi]
 
-  # MinerU OCR 服务 (图片解析). 按需启动:
-  #   docker compose -f docker/docker-compose.yml --profile mineru up -d mineru
+  # MongoDB: 文档正文外置存储 (整篇 raw_text/normalized_text/structure + 父块全文)。分工:
+  # PG 存可索引的窄行(向量/元数据/ACL/子块 chunk_text), ES 存派生倒排(content_tokens),
+  # Mongo 存正文本体。检索时按 _id 精确批量取, 不做全文查询。
+  # 单节点内网无认证, 对齐 elasticsearch/neo4j 的部署取舍。
+  mongo:
+    image: ${MONGO_IMAGE:-docker.m.daocloud.io/library/mongo:7.0}
+    command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "1"]
+    ports: ["27017:27017"]
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test:
+        ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping: 1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [mxi]
+
+  # TEI: 真 cross-encoder 重排 (BAAI/bge-reranker-v2-m3 序列分类头, /rerank), 取代原先
+  # 借道 Ollama /api/embed 的伪 rerank —— 那个 GGUF 在 Windows llama.cpp 上调用即崩。
+  # 镜像按 GPU 架构选: sm_89(Ada/RTX 40 系)=89-1.9; 无 GPU 或驱动不匹配退 cpu-1.9
+  # (只改 TEI_IMAGE 一个变量即可, 启动命令与应用代码零变动)。
+  # 权重由宿主机预下载到 data/tei_models 后只读挂载: 内网 huggingface.co 不可达,
+  # 不能让容器自下载, 故走 TEI 的 air-gapped 本地目录模式 (--model-id /data/models/...)。
+  tei-rerank:
+    image: ${TEI_IMAGE:-ghcr.m.daocloud.io/huggingface/text-embeddings-inference:89-1.9}
+    command: >-
+      --model-id /data/models/BAAI/bge-reranker-v2-m3
+      --dtype float16 --max-batch-tokens 8192 --port 8080
+    environment:
+      # 权重已在卷里, 禁止任何回源下载尝试(失败会拖慢启动并留下迷惑报错)。
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    # 容器内外统一用 8080 (TEI 默认监听 80, 若不改则容器内 URL 得写 tei-rerank:80)。
+    ports: ["${TEI_PORT:-8080}:8080"]
+    volumes:
+      - ../data/tei_models:/data/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks: [mxi]
+
   # assistant 通过 MINERU_BASE_URL=http://host.docker.internal:8888 访问宿主机端口。
   # 模型缓存在 mineru_models 卷中, 首次启动自动从 ModelScope 下载。
   mineru:
-    profiles: [mineru]
     build:
       context: ./mineru
       dockerfile: Dockerfile
@@ -161,20 +259,28 @@ services:
   assistant:
     build: *build
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    ports: ["8000:8000"]
+    ports: ["${ASSISTANT_HOST_PORT:-18000}:8000"]
+    env_file: [.env]
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
-      RERANK_MODEL: ${RERANK_MODEL:-dengcao/bge-reranker-v2-m3}
+      # 合规红线: trace 会把对话内容上传到 LangSmith, 容器侧永远置 false;
+      # 开发机如需 trace 在宿主 .env 里显式打开(代码默认值也是 false, 双保险)。
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      # Rerank 走同网络内的 TEI 服务 (容器内必须用服务名 tei-rerank, 非 localhost)。
+      TEI_RERANK_URL: ${TEI_RERANK_URL:-http://tei-rerank:8080}
       # ES 跑在同一 compose 网络, 用服务名访问; 无需 host.docker.internal
       ES_URL: ${ES_URL:-http://elasticsearch:9200}
       ES_INDEX: ${ES_INDEX:-kb_chunks}
       # 上传文件必须落在持久卷 /data (../data:/data), 否则默认 ./data/uploads
       # 会解析到容器工作目录 /srv/data/uploads, 容器重启即丢失原始上传文件。
       UPLOAD_DIR: /data/uploads
+      # 同理: 镜像里的 ./data/knowledge 是构建时 COPY 的快照, 新增文件不重建镜像就读不到,
+      # 所以容器侧必须指向卷里的绝对路径 (见 README "知识文件放宿主机 data/knowledge" 一段)。
+      KNOWLEDGE_DIR: /data/knowledge
       HR_MCP_URL: http://hr-mcp:8001/mcp
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
       HR_AGENT_URL: http://hr-agent:9001
@@ -193,8 +299,14 @@ services:
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       # 文档知识图谱(GraphRAG)总开关, 复用同一个 neo4j 服务; 默认关闭, 置 true 开启
       DOC_KG_ENABLED: ${DOC_KG_ENABLED:-true}
-      # MinerU OCR: 服务跑在容器内, localhost 指向容器自身, 必须经 host.docker.internal
-      MINERU_BASE_URL: ${MINERU_BASE_URL:-http://host.docker.internal:8888}
+      # 正文外置存储: MongoDB (容器内用 compose 服务名 mongo, 非 localhost)
+      MONGO_URL: ${MONGO_URL:-mongodb://mongo:27017}
+      MONGO_DATABASE: ${MONGO_DATABASE:-mxi}
+      MONGO_ENABLED: ${MONGO_ENABLED:-true}
+      NORMALIZER_VERSION: ${NORMALIZER_VERSION:-n1}
+      # 不再绕 host.docker.internal 的宿主发布端口(多一跳且受 Windows 端口排除影响)。
+      # 若要改回宿主机自跑的 mineru-api: 置 MINERU_BASE_URL=http://host.docker.internal:8888
+      MINERU_BASE_URL: ${MINERU_BASE_URL:-http://mineru:8888}
       MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
       MINERU_TIMEOUT: ${MINERU_TIMEOUT:-300}
     secrets:
@@ -214,6 +326,11 @@ services:
       redis:
         condition: service_started
       neo4j:
+        # service_started 只能保证进程拉起, 不能保证 bolt 可查; schema 初始化会静默降级。
+        condition: service_healthy
+      mongo:
+        condition: service_started
+      tei-rerank:
         condition: service_started
       postgres:
         condition: service_healthy
@@ -227,6 +344,7 @@ volumes:
   pg_data:
   redis_data:
   neo4j_data:
+  mongo_data:
 
 networks:
   mxi:

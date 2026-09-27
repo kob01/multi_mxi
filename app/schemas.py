@@ -90,16 +90,48 @@ class KnowledgeChunk(BaseModel):
     chunk_id: str
     doc_id: str
     title: str
-    content: str
+    content: str = ""          # 窄行构造点不再必须传正文(子块文本靠主键回表补)
     source: str
     modality: Literal["text", "video_transcript", "image"] = "text"
     parent_id: str = ""          # child -> parent chunk_id; parents keep ""
-    is_parent: bool = False      # parent rows are excluded from retrieval
+    is_parent: bool = False      # 值由"来自哪张表"推导, 不再是 SQL 过滤条件
     page_no: int = -1            # pdf page / pptx slide / xlsx sheet; -1 unknown
     section: str = ""            # section heading path, slide title, sheet name
     score: float = 0.0
+    # --- 父子双表新增定位/展示字段 ---
+    parent_type: str = "section"
+    chunk_index: int = 0
+    ord: int = 0
+    start_offset: int = -1
+    end_offset: int = -1
+    content_hash: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)  # 仅展示, 权限字段禁止入内
     # --- 文档级 ACL (冗余存储在每个 chunk 上, 供向量库 Metadata Filter 前置裁剪) ---
     visibility: str = "public"   # DocVisibility 值: public/dept/role/private
     owner_id: str = ""           # 文档所有者工号 (private 判定)
     dept_id: str = ""            # 授权部门 (dept 判定)
     allowed_roles: str = ""      # 授权角色, 逗号分隔 (role 判定)
+
+
+class ParentBlock(BaseModel):
+    """父块轻量 DTO: 供 assemble_parents 与 Mongo 回填使用。
+
+    与 ``KnowledgeChunk`` 区分两种粒度: 父块走 Mongo 文本, 子块走 PG ``chunk_text``。
+    ``content`` 默认空(从 Mongo parent_texts 回填后才非空)。
+    """
+
+    parent_id: str
+    doc_id: str
+    title: str = ""
+    section: str = ""
+    page_no: int = -1
+    parent_type: str = "section"
+    ord: int = 0
+    start_offset: int = -1
+    end_offset: int = -1
+    content_hash: str = ""
+    content: str = ""
+    visibility: str = "public"
+    owner_id: str = ""
+    dept_id: str = ""
+    allowed_roles: str = ""

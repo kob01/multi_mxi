@@ -1,4 +1,4 @@
-"""SSE 流式 + 断点续传 + 会话持久化 端到端验证(需服务已在 8000 端口运行)。
+"""SSE 流式 + 断点续传 + 会话持久化 端到端验证(需服务已在宿主 18000 端口运行)。
 
 流程:
   1) POST /api/chat/stream 开始流式问答, 读到若干 token 后主动断开连接
@@ -16,7 +16,7 @@ import uuid
 
 import httpx
 
-BASE = os.environ.get("MXI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("MXI_BASE", "http://127.0.0.1:18000")
 SESSION_ID = f"test-{uuid.uuid4().hex[:8]}"
 
 
@@ -125,6 +125,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # 同 demo_reimburse: Windows 控制台默认 GBK, 回答里的 emoji 会在 print 处抱
+    # UnicodeEncodeError, 把已经跑通的链路误报成失败。
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     t0 = time.time()
     try:
         asyncio.run(main())

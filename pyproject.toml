@@ -24,6 +24,9 @@ dependencies = [
     # 因此 compose 中用的是 redis-stack-server 镜像(非裸 redis:alpine)。
     "langgraph-checkpoint-redis>=0.0.5",
     "mcp>=1.10.0,<2",
+    # 文档正文外置存储 (MongoDB): 整篇 raw/normalized/structure + 父块全文的唯一事实来源;
+    # 异步驱动, 与 asyncpg / AsyncElasticsearch / neo4j async 的技术取向保持一致。
+    "motor>=3.6",
     "neo4j>=5.0",
     "openpyxl>=3.1.5",
     "pgvector>=0.2.9",

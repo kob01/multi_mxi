@@ -26,6 +26,8 @@ from app.db.session import get_session_factory
 logger = logging.getLogger(__name__)
 
 # 单值槽位: 新值直接顶掉旧值(身份类属性不会同时成立两条)。
+# 身体/人口学属性也归这里: 体重这类值是随时间变的"当前态", 用户再说一次
+# "我现在 75kg" 应当顶掉 70kg, 而不是在多值槽里越积越多。
 _SINGLE_VALUE_KEYS = {
     "姓名", "name",
     "工号", "employee_id", "emp_id",
@@ -35,6 +37,12 @@ _SINGLE_VALUE_KEYS = {
     "汇报对象", "manager", "leader",
     "所在地", "城市", "location", "city",
     "入职时间", "hire_date",
+    "出生日期", "birthday", "birth_date", "date_of_birth",
+    "年龄", "age",
+    "身高", "height",
+    "体重", "weight",
+    "学历", "education",
+    "毕业院校", "school",
     "邮箱", "email",
     "电话", "phone",
 }
@@ -70,6 +78,18 @@ _KEY_ALIASES = {
     "工作内容": "负责事务",
     "技能特长": "技能",
     "能力": "技能",
+    "birthday": "出生日期",
+    "birth_date": "出生日期",
+    "date_of_birth": "出生日期",
+    "生日": "出生日期",
+    "age": "年龄",
+    "height": "身高",
+    "weight": "体重",
+    "education": "学历",
+    "教育背景": "学历",
+    "school": "毕业院校",
+    "毕业学校": "毕业院校",
+    "母校": "毕业院校",
 }
 
 

@@ -3,7 +3,8 @@
 FastMCP tools run as plain sync functions, so the MCP servers use a
 synchronous SQLAlchemy engine (psycopg3) instead of the async engine in
 app.db.session. Connection settings come from the same Settings source
-(.env / docker/.env / 环境变量 / /run/secrets/pg_password).
+(宿主 .env / .env.local, 容器侧 compose env_file+environment, 环境变量, 以及
+/run/secrets/pg_password 回退)。
 """
 
 from __future__ import annotations

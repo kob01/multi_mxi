@@ -8,6 +8,7 @@ Implements the Agent2Agent protocol client flow:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -25,10 +26,28 @@ from a2a.types import (
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 AGENT_URLS = {
     "finance": lambda: get_settings().finance_agent_url,
     "hr": lambda: get_settings().hr_agent_url,
 }
+
+
+def _pin_card_url(card, base_url: str, domain: str):
+    """把卡片里的端点地址强制换成配置地址。
+
+    Agent Card 的 ``url`` 是智能体自己通告的地址, 在 compose 里写的是容器内服务名
+    (如 ``http://hr-agent:9001``); 而 a2a-sdk 的 JSON-RPC transport 正是拿 ``card.url``
+    发 ``message/send``。宿主直跑网关 + 容器跑智能体时, 宿主解析不到该服务名, 委派
+    会在卡片发现成功后的下一步静默失败。以配置端点(调用方真正要连的地址)为准,
+    两种拓扑都成立, 同时避免被外部构造的卡片把请求引到非预期主机。
+    """
+    pinned = base_url.rstrip("/") + "/"
+    if card.url != pinned:
+        logger.info("A2A %s: 卡片通告地址 %s -> 按配置覆盖为 %s", domain, card.url, pinned)
+        card = card.model_copy(update={"url": pinned})
+    return card
 
 
 class A2AClientPool:
@@ -46,6 +65,7 @@ class A2AClientPool:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
         card = await A2ACardResolver(httpx_client=self._http, base_url=base_url).get_agent_card()
+        card = _pin_card_url(card, base_url, domain)
         client = A2AClient(httpx_client=self._http, agent_card=card)
         self._clients[domain] = client
         return client

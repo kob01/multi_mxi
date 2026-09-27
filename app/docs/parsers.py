@@ -6,7 +6,7 @@ chunks. Supported types:
 
 - text:  txt / md (md split by headings) / pdf (per real page; pages without a
          text layer are OCR'd) / docx (split by Heading styles) / pptx (per
-         slide) / xlsx (per sheet)
+         slide) / xlsx (per sheet, table-row group chunks)
 - video transcripts: srt / vtt / *.transcript.txt (timeline merged)
 - images: jpg / jpeg / png / webp / bmp -> OCR'd by the local MinerU service
   (mineru-api /file_parse) so image content becomes searchable text.
@@ -33,11 +33,20 @@ SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 @dataclass
 class ParsedBlock:
-    """A section-level block of parsed document text."""
+    """A section-level block of parsed document text.
+
+    ``start_offset/end_offset/anchor/parent_type`` 是正文外置后的定位字段, 默认未填:
+    offset 基准是 normalized_text, 由入库侧统一回算(build_parent_child 的 _locate);
+    无锦点时 parent_type 退化为 "section"。
+    """
 
     section: str       # heading path / slide title / sheet name; "" if none
     page_no: int       # pdf page / pptx slide / xlsx sheet number; -1 unknown
     text: str
+    start_offset: int = -1
+    end_offset: int = -1
+    anchor: dict | None = None
+    parent_type: str = "section"  # section/clause/table/faq
 
 
 def supported_extensions() -> set[str]:
@@ -196,21 +205,81 @@ def _parse_pptx(path: Path) -> list[ParsedBlock]:
     return blocks
 
 
+# 表格父块预算: 与 settings.parent_chunk_max 保持一致, 保证每个块都是单 child
+# (父块 <= parent_chunk_max 时不再滑窗切分), 且切分只发生在行边界。
+_TABLE_PARENT_BUDGET = 1200
+
+
 def _parse_xlsx(path: Path) -> list[ParsedBlock]:
-    """One block per sheet; rows rendered as `cell | cell` lines."""
+    """Render each sheet as `列名: 值` lines, grouped into row-aligned table blocks.
+
+    两个设计点都直接决定表格问答的正确率:
+    1. 合并单元格回填 + 每行携带列名 —— 托管商类表格把同组公用的地址/电话/账号
+       做成纵向合并区, openpyxl 只在区域左上角存值, 其余行读出来是 None;
+       不回填则"某分公司账号是多少"根本拼不出完整一行。裸 `值 | 值` 行里
+       电话/账号/纳税人识别号全是数字串, 列含义只能靠位置推断, LLM 极易取错列;
+    2. 按行边界分块(每块 <= _TABLE_PARENT_BUDGET) —— 整表一个 block 会被 512
+       滑窗拦腰截断目标行, 且父块重装配时 24 行相似记录互相干扰。
+    """
     from openpyxl import load_workbook
 
-    wb = load_workbook(str(path), read_only=True, data_only=True)
+    # 不用 read_only: 只读模式拿不到 merged_cells 布局, 无法回填合并区值
+    wb = load_workbook(str(path), data_only=True)
     blocks: list[ParsedBlock] = []
     for idx, sheet in enumerate(wb.worksheets, 1):
+        # 合并区锚点(左上角)值回填到区内每个格子, 让每一行自包含
+        merged: dict[tuple[int, int], object] = {}
+        for rng in sheet.merged_cells.ranges:
+            anchor = sheet.cell(rng.min_row, rng.min_col).value
+            if anchor is None or str(anchor).strip() == "":
+                continue
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    if (r, c) != (rng.min_row, rng.min_col):
+                        merged[(r, c)] = anchor
+
         lines: list[str] = []
-        for row in sheet.iter_rows(values_only=True):
-            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
-            if cells:
-                lines.append(" | ".join(cells))
-        body = "\n".join(lines).strip()
-        if body:
-            blocks.append(ParsedBlock(section=sheet.title, page_no=idx, text=body))
+        headers: list[str] = []
+        for r, row in enumerate(sheet.iter_rows(values_only=True), 1):
+            cells: list[str] = []
+            for c, val in enumerate(row, 1):
+                if val is None:
+                    val = merged.get((r, c))
+                cells.append(str(val).strip() if val is not None else "")
+            if not any(cells):
+                continue
+            if not headers:  # 首行非空行视为表头
+                headers = cells
+                continue
+            if headers:
+                pairs = [
+                    f"{h}: {v}"
+                    for h, v in zip(headers, cells)
+                    if v and h and h != v  # 空单元格丢列; 与表头同值的列(公司名自引用)省略
+                ]
+                line = " | ".join(pairs)
+            else:
+                line = " | ".join(c for c in cells if c)
+            if line:
+                lines.append(line)
+        # 按行贪心装桶: 单行超预算时保持完整不切开(带列名的长行仍自解释)
+        group: list[str] = []
+        size = 0
+        for line in lines:
+            span = len(line) + (1 if group else 0)
+            if group and size + span > _TABLE_PARENT_BUDGET:
+                blocks.append(ParsedBlock(
+                    section=sheet.title, page_no=idx, text="\n".join(group),
+                    parent_type="table",
+                ))
+                group, size = [], 0
+            group.append(line)
+            size += span
+        if group:
+            blocks.append(ParsedBlock(
+                section=sheet.title, page_no=idx, text="\n".join(group),
+                parent_type="table",
+            ))
     wb.close()
     return blocks
 

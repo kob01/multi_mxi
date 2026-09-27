@@ -49,6 +49,12 @@ class Document(Base):
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     created_by: Mapped[str] = mapped_column(String(64), default="")
+    # --- 发布态门禁 / 正文外置标记 (老库升级走 _BACKFILL_COLUMNS 补列) ---
+    # status: ready / ingesting / failed。ingesting 期间该文档的块一律不可被检索命中
+    # (防"正在入库的半篇文档"泄漏), 见 docs/service.py 的发布态与 security/acl 门禁。
+    status: Mapped[str] = mapped_column(String(16), default="ready")
+    # body_stored: 正文已落 MongoDB 的标记, 迁移脚本与运维排查用。
+    body_stored: Mapped[bool] = mapped_column(Boolean, default=False)
     # --- 文档级 ACL (权限存储在元数据中; 检索时经 pgvector Metadata Filter 前置裁剪) ---
     visibility: Mapped[str] = mapped_column(String(16), default="public")  # public/dept/role/private
     owner_id: Mapped[str] = mapped_column(String(64), default="")         # private: 所有者工号
@@ -219,6 +225,104 @@ class KnowledgeChunkRow(Base):
     allowed_roles: Mapped[str] = mapped_column(String(128), default="")  # ",hr,admin,"
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(get_settings().embedding_dim), nullable=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# 文档正文外置: PG 父子双表 (去版本化, chunk_text 留 PG, 父块全文在 Mongo)
+# ---------------------------------------------------------------------------
+class DocParentRow(Base):
+    """父块: 结构定位与上下文单位。**不存正文**, 正文在 Mongo parent_texts。
+
+    ``parent_id`` 全局唯一(``{doc_id}-p{seq:04d}``), 既是本表主键、
+    ``doc_chunks.parent_id`` 的外键(父子引用只在 PG 内成立), 又直接当 Mongo
+    ``parent_texts`` 的 ``_id``。offset 基准是 normalized_text, 由 structure 单向派生,
+    不回写 Mongo(不变量 4)。``start_offset/end_offset`` 为 -1 表示未知(迁移回算失败)。
+    """
+
+    __tablename__ = "doc_parents"
+    __table_args__ = (
+        Index("ix_doc_parents_doc_ord", "doc_id", "ord"),
+    )
+
+    parent_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    doc_id: Mapped[str] = mapped_column(String(64), index=True)
+    ord: Mapped[int] = mapped_column(Integer, default=0)  # 全篇序号(相邻块扩展用)
+    parent_type: Mapped[str] = mapped_column(String(16), default="section")  # section/clause/table/faq
+    title: Mapped[str] = mapped_column(String(512), default="")
+    section: Mapped[str] = mapped_column(String(256), default="")  # 派生自 structure, 不回写
+    page_no: Mapped[int] = mapped_column(Integer, default=-1)
+    start_offset: Mapped[int] = mapped_column(Integer, default=-1)  # normalized_text 字符区间
+    end_offset: Mapped[int] = mapped_column(Integer, default=-1)
+    content_hash: Mapped[str] = mapped_column(String(32), default="")
+    char_count: Mapped[int] = mapped_column(Integer, default=0)
+    child_count: Mapped[int] = mapped_column(Integer, default=0)
+    normalizer_version: Mapped[str] = mapped_column(String(8), default="n1")
+    # --- 4 个 ACL 标量列(安全边界, 与 doc_chunks 逐条对应; 禁止入 extra) ---
+    visibility: Mapped[str] = mapped_column(String(16), default="public")
+    owner_id: Mapped[str] = mapped_column(String(64), default="")
+    dept_id: Mapped[str] = mapped_column(String(64), default="")
+    allowed_roles: Mapped[str] = mapped_column(String(128), default="")
+    # 仅承载展示字段, 权限字段禁止入 JSONB。
+    extra: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+class DocChunkRow(Base):
+    """子块: 向量与它的 embedding 输入同表(一致性优先), 但 chunk_text 不进扫描列。
+
+    与旧 ``knowledge_chunks`` 的关键区别: 没有父块行(父块占旧表约一半且均带无用
+    向量), HNSW 图只装可检索子块; ``is_parent`` 列消失(表本身就分开了)。
+    ``chunk_text`` 存于此但**不列入** vectorstore.NARROW_COLUMNS —— TopK 只取窄列,
+    命中后按 chunk_id 主键点查批量取文本。
+    """
+
+    __tablename__ = "doc_chunks"
+    __table_args__ = (
+        Index(
+            "ix_doc_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        Index("ix_doc_chunks_doc_ord", "doc_id", "ord"),
+        Index("ix_doc_chunks_parent_ord", "parent_id", "chunk_index"),
+    )
+
+    chunk_id: Mapped[str] = mapped_column(String(80), primary_key=True)  # {doc_id}-p{seq:04d}-c{idx:02d}
+    doc_id: Mapped[str] = mapped_column(String(64), index=True)
+    parent_id: Mapped[str] = mapped_column(String(80), index=True)  # PG 内引用 DocParentRow
+    chunk_index: Mapped[int] = mapped_column(Integer, default=0)  # parent 内序号
+    ord: Mapped[int] = mapped_column(Integer, default=0)  # 全篇序号
+    chunk_text: Mapped[str] = mapped_column(Text, default="")  # 不列入 NARROW_COLUMNS
+    content_hash: Mapped[str] = mapped_column(String(32), default="")  # 决定要不要重 embed
+    char_count: Mapped[int] = mapped_column(Integer, default=0)
+    embedding_model: Mapped[str] = mapped_column(String(64), default="")  # 向量仅在同模型内可比
+    title: Mapped[str] = mapped_column(String(512), default="")
+    source: Mapped[str] = mapped_column(String(512), default="")
+    modality: Mapped[str] = mapped_column(String(32), default="text")
+    section: Mapped[str] = mapped_column(String(256), default="")
+    page_no: Mapped[int] = mapped_column(Integer, default=-1)
+    # --- ACL 前置裁剪(安全边界) ---
+    visibility: Mapped[str] = mapped_column(String(16), default="public")
+    owner_id: Mapped[str] = mapped_column(String(64), default="")
+    dept_id: Mapped[str] = mapped_column(String(64), default="")
+    allowed_roles: Mapped[str] = mapped_column(String(128), default="")
+    extra: Mapped[dict] = mapped_column(JSON, default=dict)  # 仅展示
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
     )
 
 

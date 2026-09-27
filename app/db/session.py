@@ -89,6 +89,9 @@ _BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
         "owner_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         "dept_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         "allowed_roles": "VARCHAR(128) NOT NULL DEFAULT ''",
+        # 正文外置: 发布态门禁 + 正文已落 Mongo 标记(老库升级补列)。
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'ready'",
+        "body_stored": "BOOLEAN NOT NULL DEFAULT false",
     },
     "long_term_memories": {
         "title": "VARCHAR(128) NOT NULL DEFAULT ''",

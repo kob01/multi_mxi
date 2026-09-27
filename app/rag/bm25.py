@@ -86,13 +86,16 @@ def _acl_filter(principal: Principal | None) -> list[dict]:
 
 
 def _doc_source(chunk: KnowledgeChunk) -> dict:
-    """Serialise one child chunk into its ES source document."""
+    """Serialise one child chunk into its ES source document。
+
+    **不存 ``content``**: 正文唯一副本在 PG ``doc_chunks.chunk_text``(子块)与
+    Mongo ``parent_texts``(父块); ES 只存派生的 ``content_tokens``(去掉第三副本)。
+    """
     return {
         "chunk_id": chunk.chunk_id,
         "doc_id": chunk.doc_id,
         "title": chunk.title[:512],
-        "content": chunk.content[:8192],
-        # 检索文本 = 标题分词 + 正文分词, 与旧进程内 BM25 的索引文本一致。
+        # 检索文本 = 标题分词 + 正文分词(正文不入库, 仅用于生成分词)。
         "content_tokens": _token_field(f"{chunk.title} {chunk.content}"),
         "source": chunk.source[:512],
         "modality": chunk.modality,
@@ -130,8 +133,8 @@ class ElasticBM25Retriever:
                     "chunk_id": {"type": "keyword"},
                     "doc_id": {"type": "keyword"},
                     "title": {"type": "keyword"},
-                    "content": {"type": "text", "index": False},
                     # 预分词文本: whitespace + lowercase 复现 jieba 词元, 无需分词插件。
+                    # (不再存 content: 正文唯一副本在 PG/Mongo, ES 只存派生倒排)
                     "content_tokens": {"type": "text", "analyzer": "chunk_tokens"},
                     "source": {"type": "keyword"},
                     "modality": {"type": "keyword"},
@@ -159,14 +162,23 @@ class ElasticBM25Retriever:
             },
         )
 
-    async def rebuild(self, chunks: Sequence[KnowledgeChunk]) -> None:
-        """Drop and rebuild the whole index (initial migration / drift repair)."""
+    async def rebuild(self, chunks_or_iter) -> None:
+        """Drop + rebuild the whole index from a list or an async iterator of batches.
+
+        流式重建时批间不 refresh(最后一批才 refresh), 避免大语料重建的 refresh 抖动。
+        语料源 = PG ``doc_chunks``(title + chunk_text), 与向量同一张表, 不依赖 Mongo。
+        """
         await self._client.indices.delete(index=self.index, ignore=[404])
         await self.ensure_index()
-        await self.index_chunks(chunks)
+        if hasattr(chunks_or_iter, "__aiter__"):
+            async for batch in chunks_or_iter:
+                await self.index_chunks(batch, refresh=False)
+            await self._client.indices.refresh(index=self.index)
+        else:
+            await self.index_chunks(list(chunks_or_iter))
 
-    async def index_chunks(self, chunks: Sequence[KnowledgeChunk]) -> None:
-        """Upsert child chunks (bulk, refresh immediately for searchability)."""
+    async def index_chunks(self, chunks: Sequence[KnowledgeChunk], refresh: bool = True) -> None:
+        """Upsert child chunks (bulk); refresh=False 供流式分批末尾统一刷新。"""
         if not chunks:
             return
         await self.ensure_index()
@@ -174,7 +186,7 @@ class ElasticBM25Retriever:
             {"_index": self.index, "_id": c.chunk_id, "_source": _doc_source(c)}
             for c in chunks
         ]
-        await async_bulk(self._client, actions, refresh=True)
+        await async_bulk(self._client, actions, refresh=refresh)
 
     async def search(
         self, query: str, top_k: int, principal: Principal | None = None
@@ -197,7 +209,7 @@ class ElasticBM25Retriever:
                 size=top_k,
                 query={"bool": bool_query},
                 source=[
-                    "chunk_id", "doc_id", "title", "content", "source", "modality",
+                    "chunk_id", "doc_id", "title", "source", "modality",
                     "parent_id", "page_no", "section",
                     "visibility", "owner_id", "dept_id", "allowed_roles",
                 ],
@@ -215,7 +227,7 @@ class ElasticBM25Retriever:
                     chunk_id=src["chunk_id"],
                     doc_id=src["doc_id"],
                     title=src.get("title", ""),
-                    content=src.get("content", ""),
+                    content="",  # 正文不存 ES, 后续由 chunk_id 主键回表补
                     source=src.get("source", ""),
                     modality=src.get("modality", "text"),
                     parent_id=src.get("parent_id", ""),

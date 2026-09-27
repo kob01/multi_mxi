@@ -1,5 +1,49 @@
-logs/
-.venv/
-__pycache__/
-*.pyc
+# 构建上下文排除清单 (compose build context = 仓根, dockerfile = docker/Dockerfile)。
+#
+# 两类目的:
+# 1) 密钥/隐私不进上下文 —— `docker build` 会把整个上下文传给 daemon, 命中文件即使
+#    没被 COPY 进镜像也已离开本机权限边界; 生产镜像里的密钥只能来自运行时 /run/secrets。
+# 2) 体积与可复现性 —— 模型权重(~1.1GB)、上传件、评测缓存、node_modules 不进上下文,
+#    否则每次 build 都要重传一遍, 且换机后产物不可复现。
+#
+# 注意: web/dist 不在排除清单里 —— Dockerfile 用 `COPY web ./web` 把前端构建产物打进
+# 镜像, 由 FastAPI 直接托管(:8000/:18000)。开发期不需要它(前端走 vite dev),
+# 但打包部署前必须先跑 `scripts/package.py`(内部执行 pnpm build)生成 web/dist。
+
+# ---------- 密钥与本地配置 ----------
 .env
+.env.local
+.env.*.local
+docker/.env
+docker/secrets/
+*.pem
+*.key
+
+# ---------- 运行期数据与日志 ----------
+logs/
+reports/
+data/uploads/
+data/pgdata/
+data/tei_models/
+data/msmarco/
+data/logs/
+
+# ---------- 依赖与工具产物 ----------
+.venv/
+venv/
+__pycache__/
+*.py[oc]
+node_modules/
+web-ui/node_modules/
+build/
+/dist/
+wheels/
+*.egg-info
+
+# ---------- 本地 IDE / 调试状态 ----------
+.git/
+.langgraph_api/
+.qoder/
+.trae/
+.idea/
+.vscode/
