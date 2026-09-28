@@ -72,10 +72,17 @@ def get_sync_engine() -> Engine:
     return _engine
 
 
-def execute_readonly_sql(sql: str, allowed_tables: set[str]) -> list[dict]:
+def execute_readonly_sql(
+    sql: str, allowed_tables: set[str], params: dict | None = None
+) -> list[dict]:
     """安全执行 Text2SQL 生成的只读 SELECT, 返回行字典列表。
 
     统一 json 化处理 Decimal / datetime, 便于 MCP 工具直接返回。
+
+    ``params`` 只服务于"服务端自己拼的指标 SQL"(见 app/analytics/reports.py):
+    走绑定参数而不是字符串内插, 既免转义又防注入。LLM 生成的 Text2SQL 一律
+    不传 params —— 它已经被 sql_guard 按整条语句校验过, 加参数通道只会多一个
+    绕过白名单的面。
     """
     from app.db.sql_guard import validate_readonly_select
 
@@ -86,7 +93,7 @@ def execute_readonly_sql(sql: str, allowed_tables: set[str]) -> list[dict]:
         # statement_timeout: SET LOCAL 只在当前(隐式)事务内生效, 不污染连接池。
         timeout_ms = int(get_settings().pg_statement_timeout_ms)
         conn.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
-        result = conn.execute(text(safe_sql))
+        result = conn.execute(text(safe_sql), params or {})
         cols = list(result.keys())
         rows = []
         for row in result.mappings():

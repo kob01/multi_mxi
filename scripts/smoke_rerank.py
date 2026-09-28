@@ -105,7 +105,10 @@ async def run(args: argparse.Namespace) -> int:
             if mode == "rerank" and kept:
                 reranked_hits += 1
             if dt > 5:
-                print(f"  [WARN] 单查询 {dt:.2f}s, 疑似在撞 rerank 超时(应 ≤{settings.rerank_timeout}s)")
+                # 不必然是 rerank 超时(rerank 已被限制在 rerank_timeout 内): 首条查询还含
+                # bge-m3 模型加载 + jieba/ES 冷启动。每条都这慢才需要查链路。
+                print(f"  [WARN] 单查询 {dt:.2f}s 偏高"
+                      f"(首条含 bge-m3/ES 冷启动; 若每条都这慢则查 rerank 超时 {settings.rerank_timeout}s)")
     finally:
         await close_reranker_client()
         try:

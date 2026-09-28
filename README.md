@@ -33,7 +33,15 @@ MCP 工具调用、A2A 专业智能体委派。
 
 A2A 遵循 Agent2Agent 协议:Agent Card 发布于 `/.well-known/agent-card.json`,
 通信为 JSON-RPC 2.0 over HTTP(`message/send`)。MCP 遵循 Model Context
-Protocol:FastMCP server,streamable-http transport(`:8001/mcp`、`:8002/mcp`)。
+Protocol:FastMCP server,streamable-http transport(服务自身监听 `:8001/mcp`、`:8002/mcp`、
+`:8005/mcp`、`:8006/mcp`;compose 已把它们发布到宿主 `18001`/`18002`/`18005`/`18006`,
+宿主机直连走后者, 容器间走服务名+原端口)。
+
+> 四个专业智能体与四个 MCP 域一一对应: `HR_Agent`(:9001)/`Finance_Agent`(:9002) 各走
+> hr/finance 域; 新增 `Analyst_Agent`(:9005) 走 analytics 域(跨 HR/财务/采购的 Text2SQL
+> 只读洞察 + SVG 图表 + 周期报告), `Contract_Agent`(:9006) 走 procurement 域(采购申请单
+> 合规初审 + 合同条款初审, 规则引擎保底 + 模型补充语义风险)。分析产物落 `data/reports`,
+> 由网关 `/api/files/reports/{name}` 静态回取。
 
 ### LangGraph 编排图
 
@@ -170,10 +178,20 @@ mxi/
 │   │   └── service.py            #   上传/入库(发布态门禁)/ACL/删除/列表
 │   ├── mcp_servers/              # ★ MCP 工具层(业务系统封装)
 │   │   ├── hr_server.py          #   HR 工单系统(:8001/mcp)
-│   │   └── finance_server.py     #   财务报销系统(:8002/mcp)
+│   │   ├── finance_server.py     #   财务报销系统(:8002/mcp)
+│   │   ├── analytics_server.py   #   数据洞察(:8005/mcp, Text2SQL/图表/周报)
+│   │   └── procurement_server.py #   采购与合同初审(:8006/mcp)
+│   ├── analytics/                # ★ 数据洞察支撑(零依赖, 不引 matplotlib)
+│   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie)
+│   │   ├── reports.py            #   固定口径指标 SQL + Markdown 报告组装
+│   │   └── store.py              #   产物落 data/reports + 台账 + 相对 URL 寻址
+│   ├── procurement/              # ★ 采购/合同确定性规则引擎
+│   │   └── rules.py              #   必备条款/高风险表述/金额分级/预算余额
 │   ├── agents/                   # ★ A2A 专业智能体
 │   │   ├── finance_agent/        #   agent_card / executor / server(:9002)
-│   │   └── hr_agent/             #   agent_card / executor / server(:9001)
+│   │   ├── hr_agent/             #   agent_card / executor / server(:9001)
+│   │   ├── analyst_agent/        #   数据洞察 agent_card/executor/server(:9005)
+│   │   └── contract_agent/       #   采购合同 agent_card/executor/server(:9006)
 │   └── security/                 # ★ 安全治理
 │       ├── auth.py               #   角色→工具/Agent 白名单
 │       ├── acl.py                #   文档级 ACL(Principal→谓词/SQL/ES filter)
@@ -263,17 +281,35 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.ing
 # 重刷业务数据(可选)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.seed_business_data --force
 # Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload
-# Neo4j Browser: http://localhost:17474   (bolt 仍是 localhost:7687)
+# Neo4j Browser: http://localhost:17474   (bolt: localhost:17687; 原 7687 已落进本机 winnat 排除段)
 ```
 
-> **宿主端口已避开 Windows 保留段**:`assistant`/`hr-mcp`/`finance-mcp`/`neo4j` 的宿主端口
-> 默认为 `18000`/`18001`/`18002`/`17474`(容器内监听端口不变,仍是 `8000`/`8001`/`8002`/`7474`)。
-> 原因:Windows 的 `winnat`/Hyper-V 开机会把 `7956-8055`、`7454-7553` 等整段写入
-> "TCP 端口排除范围",段内端口即使无人监听也无法 bind,Docker 会报
-> `ports are not available: ... forbidden by its access permissions` 而容器卡在 `Created`。
-> 排查命令:`netsh int ipv4 show excludedportrange protocol=tcp`。
-> 换机后若 `18xxx` 也被排除,用 `ASSISTANT_HOST_PORT` 等环境变量再抬一段即可,
-> 无需改 compose(见 `docker/docker-compose.yml` 顶部约定)。
+> **宿主发布端口对照(当前实测)**:
+>
+> | 服务                                                                                               | 宿主端口                                                                        | 容器内监听      | 说明                                          |
+> | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------- | --------------------------------------------- |
+> | assistant                                                                                          | `18000`                                                                         | `8000`          | Web 聊天 / API / 文档管理                     |
+> | hr-mcp / finance-mcp                                                                               | `18001` / `18002`                                                               | `8001` / `8002` | MCP 服务                                      |
+> | analytics-mcp / procurement-mcp                                                                    | `18005` / `18006`                                                               | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
+> | neo4j HTTP                                                                                         | `17474`                                                                         | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
+> | neo4j Bolt                                                                                         | `17687`                                                                         | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
+> | tei-rerank                                                                                         | `8080`                                                                          | `8080`          | 重排服务 `/rerank`与`/health`                 |
+> | postgres / ES / Redis / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `6379` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左            | 未抬, 保持原值                                |
+>
+> 抬端口只动**宿主发布端口**, 容器内监听端口与 compose 网络内的服务名地址(`bolt://neo4j:7687` 等)
+> 一律不变, 所以容器间连通性不受影响; 受影响的是宿主直连 —— 宿主 `.env` 必须写发布端口。
+>
+> 原因: Windows 的 `winnat`/Hyper-V 开机时会把整段端口写进"TCP 端口排除范围", 段内端口即使无人
+> 监听也无法 bind, Docker 报 `ports are not available: ... forbidden by its access permissions`,
+> 容器卡在 `Created`/`Exited(255)` 且**没有任何应用日志**。**排除段内容每次开机都会变**, 不要假设
+> 某端口"一直能用": 本机 2026-09 两次实测分别为
+> `7254-7353 / 7354-7453 / 7454-7553 / 7554-7653 / 7956-8055` 与
+> `7137-7236 / 7237-7336 / 7530-7629 / 7630-7729` —— 后者把 `7687` 也括了进去。
+> 排查命令: `netsh int ipv4 show excludedportrange protocol=tcp`。若某个服务因端口起不来,
+> 其他容器里会报 `Failed to DNS resolve address <svc>:<port> ([Errno -2])` —— Docker 内置 DNS
+> 不解析已退出容器的服务名, 根因不在报错那一层。
+> 换机后若 `18xxx`/`17xxx` 也被排除, 改 `docker/.env` 里对应的 `*_HOST_PORT`/`TEI_PORT` 再抬一段
+> 即可, 无需改 compose 默认值(见 `docker/docker-compose.yml` 顶部约定)。
 
 ### 本地开发
 
@@ -311,7 +347,7 @@ uv run python -m scripts.dev_services down         # 停掉 docker 依赖(只停
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d \
-  postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp hr-agent finance-agent
+  postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp hr-agent finance-agent analyst-agent contract-agent
 uv run python -m scripts.dev_services check
 uv run uvicorn app.main:app --host 0.0.0.0 --port 18000 --reload   # 宿主网关(cd .venv 已激活或用 uv run)
 cd web-ui && pnpm install && pnpm dev                              # 前端 dev, /api 代理到上面的端口
@@ -330,9 +366,10 @@ cd web-ui && pnpm install && pnpm dev                              # 前端 dev,
 - **SSE 在 dev 模式可用**: vite 代理是 http-proxy 非缓冲透传, `POST /api/chat/stream` 与断点续传
   都正常:`MXI_BASE=http://127.0.0.1:5173 uv run python scripts/test_sse_resume.py`。
 
-> Windows 上 `8000`/`8001`/`8002`/`7474` 若落在端口排除段内(见上节), 宿主直跑也无法 bind;
-> 因此宿主端口默认抬到 `18000/18001/18002/17474`, 与 docker 发布端口一致 —— 换机后若 `18xxx`
-> 也被排除, 改 `docker/.env` 的 `*_HOST_PORT` 与 `.env` 的 `ASSISTANT_PORT`/`*_MCP_URL` 即可。
+> Windows 上 `8000`/`8001`/`8002`/`7474`/`7687` 若落在端口排除段内(见上节, 段内容每次开机都变),
+> 宿主直跑也无法 bind; 因此宿主发布端口抬到 `18000/18001/18002/17474/17687`。换机后若再撞上,
+> 改 `docker/.env` 的 `*_HOST_PORT` 与宿主 `.env` 的 `ASSISTANT_PORT`/`*_MCP_URL`/`NEO4J_URI` 即可
+> (代码默认值在 `app/config.py`, 同步跟一下, 见 `CONFIG_RULES.md` 第 6 条)。
 
 知识文件放宿主机 `data/knowledge/`,经 assistant 服务的 `../data:/data` 挂载映射为容器内
 `/data/knowledge`。镜像 WORKDIR 是 `/srv`,写成 `--dir ./data/knowledge` 会解析到

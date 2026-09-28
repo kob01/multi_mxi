@@ -54,18 +54,22 @@ glob:
 
 ## 4. 宿主端口只用 `*_HOST_PORT` 插值
 
-compose 的 `ports:` 里，assistant / hr-mcp / finance-mcp / neo4j 的**宿主侧**端口必须是插值形式，默认值不得改回 8000/8001/8002/7474：
+compose 的 `ports:` 里，assistant / hr-mcp / finance-mcp / neo4j 的**宿主侧**端口必须是插值形式，默认值不得改回 8000/8001/8002/7474/7687：
 
 ```yaml
 assistant:     ports: ["${ASSISTANT_HOST_PORT:-18000}:8000"]
 hr-mcp:        ports: ["${HR_MCP_HOST_PORT:-18001}:8001"]
 finance-mcp:   ports: ["${FINANCE_MCP_HOST_PORT:-18002}:8002"]
+# neo4j 两个协议端口各一份: HTTP=Browser(人工看), Bolt=driver RPC(图记忆/知识图谱必需)
 neo4j:         ports: ["${NEO4J_HTTP_HOST_PORT:-17474}:7474", "${NEO4J_BOLT_HOST_PORT:-7687}:7687"]
+# 其余服务保持 1:1 原值: postgres 5432 / ES 9200 / Redis 6379 / Mongo 27017 /
+# mineru 8888 / tei-rerank 8080(${TEI_PORT}) / hr-agent 9001 / finance-agent 9002
 ```
 
 - 原因：Windows `winnat`/Hyper-V 开机把 7254-7353、7354-7453、7454-7553、7554-7653、7956-8055 写进 TCP 端口排除段，段内端口即使无人监听也无法 bind；Docker 报 `ports are not available: ... bind: An attempt was made to access a socket in a way forbidden by its access permissions`，容器卡 `Created`（neo4j 为 `Exited(255)`）且**没有任何应用日志**——极易被误判为代码或镜像故障。
-- `7687` 恰好不在排除段内，保持原值。容器内监听端口与 compose 网络内的服务名地址一律不变。
-- 改这些默认值时必须同步：`/.env`、`docker/.env` 的 `HR_MCP_URL`/`FINANCE_MCP_URL`、`app/config.py` 对应默认值、`web-ui/vite.config.js` 代理目标、`scripts/dev.ps1`、`scripts/test_sse_resume.py`、`scripts/demo_reimburse.py` 的 `MXI_BASE`。
+- 排除段内容**每次开机都会变**，绝不能假设某端口“一直能用”，也不要因此去改 compose 里的默认值。本机后续实测新增 `7630-7729`，已把 `7687` 括进去，neo4j 直接 `Exited(255)`；现用 `docker/.env` 的 `NEO4J_BOLT_HOST_PORT=17687` 抬起（默认值仍为 7687 不动）。判断口径：起不来先跑 `netsh int ipv4 show excludedportrange protocol=tcp`。
+- 容器内监听端口与 compose 网络内的服务名地址（如 `bolt://neo4j:7687`）**永远不变**，`NEO4J_URI` 在 `docker/.env` 里是红线键不得改成宿主端口。
+- 改这些默认值时必须同步：`/.env`、`docker/.env` 的 `HR_MCP_URL`/`FINANCE_MCP_URL`、`app/config.py` 对应默认值、`web-ui/vite.config.js` 代理目标、`scripts/dev.ps1`、`scripts/test_sse_resume.py`、`scripts/demo_reimburse.py` 的 `MXI_BASE`；改 `NEO4J_BOLT_HOST_PORT` 则同步 `/.env` 的 `NEO4J_URI` 与 `app/config.py` 的 `neo4j_uri` 默认值（两者都是宿主轨）。
 - 排查“compose 里某几个服务起不来、其余正常”：先跑 `netsh int ipv4 show excludedportrange protocol=tcp`。
 - 换机后若 `18xxx`/`17xxx` 也落进新机排除段：**用同名环境变量再挪一次**（`$env:ASSISTANT_HOST_PORT=20000; docker compose -f docker/docker-compose.yml up -d assistant`），**不要改 compose 里的默认值**（改了会连坐第 4 条的同步清单）。
 

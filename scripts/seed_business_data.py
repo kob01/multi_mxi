@@ -23,15 +23,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import delete, func, select
 
 from app.db.models import (
+    ContractReview,
     DepartmentBudget,
     Employee,
     HRTicket,
     LeaveRecord,
+    PurchaseRequest,
     Reimbursement,
+    Supplier,
 )
 from app.db.session import get_session_factory, init_schema
 
-BUSINESS_TABLES = (Employee, HRTicket, LeaveRecord, Reimbursement, DepartmentBudget)
+BUSINESS_TABLES = (
+    Employee, HRTicket, LeaveRecord, Reimbursement, DepartmentBudget,
+    Supplier, PurchaseRequest, ContractReview,
+)
 
 
 def _ts(dt: datetime) -> datetime:
@@ -118,6 +124,29 @@ BUDGETS = [
     ("财务部", 2026, 90000.0, 12000.0),
 ]
 
+SUPPLIERS = [
+    # supplier_code, name, category, bank_account, qualification, risk_status
+    ("SUP001", "云极信息科技有限公司", "IT设备", "6228480012340001", "一般纳税人", "正常"),
+    ("SUP002", "恒盛办公用品有限公司", "办公用品", "6228480012340002", "一般纳税人", "正常"),
+    ("SUP003", "明德管理咨询公司", "咨询服务", "6228480012340003", "一般纳税人", "关注"),
+    ("SUP004", "华创市场推广有限公司", "市场推广", "6228480012340004", "小规模", "正常"),
+    ("SUP005", "迅达劳务服务有限公司", "其他", "6228480012340005", "个体", "黑名单"),
+]
+
+PURCHASE_ORDERS = [
+    # order_no, emp_id, department, title, category, amount, supplier_name, quotes_count, status, current_node, precheck, created_at
+    ("PO3000", "E10001", "研发部", "测试机采购", "IT设备", 12000.0, "云极信息科技有限公司", 3, "APPROVED", "采购审批", "初审通过", datetime(2026, 3, 10, 10, 0)),
+    ("PO3001", "E10003", "市场部", "展会物料制作", "市场推广", 48000.0, "华创市场推广有限公司", 2, "RETURNED", "退回补充", "比价不足: 48000 元需 >=3 份, 实际 2 份", datetime(2026, 4, 18, 14, 30)),
+    ("PO3002", "E10008", "研发部", "云服务器扩容", "IT设备", 8000.0, "云极信息科技有限公司", 3, "PENDING", "采购审批", "初审通过", datetime(2026, 5, 22, 9, 15)),
+    ("PO3003", "E10004", "人事部", "校招差旅服务", "其他", 6000.0, "迅达劳务服务有限公司", 3, "RETURNED", "退回补充", "黑名单供应商: 禁止采购", datetime(2026, 6, 5, 16, 0)),
+]
+
+CONTRACTS = [
+    # contract_no, title, party_a, party_b, category, amount, status, risk_level, opinion, created_at
+    ("CT8000", "云极信息测试机采购合同", "马小 i 科技有限公司", "云极信息科技有限公司", "采购", 12000.0, "APPROVED", "低", "条款齐备, 建议签署", datetime(2026, 3, 12, 10, 0)),
+    ("CT8001", "明德管理咨询框架协议", "马小 i 科技有限公司", "明德管理咨询公司", "框架协议", 60000.0, "RISK", "高", "缺少违约责任与管辖条款, 且对手方风险状态为关注, 建议退回补充", datetime(2026, 5, 20, 15, 30)),
+]
+
 
 async def seed(force: bool) -> None:
     await init_schema()
@@ -151,10 +180,26 @@ async def seed(force: bool) -> None:
         for row in BUDGETS:
             session.add(DepartmentBudget(department=row[0], year=row[1],
                                          annual_budget=row[2], used_amount=row[3]))
-        total = len(EMPLOYEES) + len(TICKETS) + len(LEAVES) + len(REIMBURSEMENTS) + len(BUDGETS)
+        for row in SUPPLIERS:
+            session.add(Supplier(supplier_code=row[0], name=row[1], category=row[2],
+                                 bank_account=row[3], qualification=row[4], risk_status=row[5]))
+        for row in PURCHASE_ORDERS:
+            session.add(PurchaseRequest(order_no=row[0], emp_id=row[1], department=row[2],
+                                        title=row[3], category=row[4], amount=row[5],
+                                        supplier_name=row[6], quotes_count=row[7], status=row[8],
+                                        current_node=row[9], precheck_result=row[10],
+                                        budget_year=2026, created_at=_ts(row[11]), updated_at=_ts(row[11])))
+        for row in CONTRACTS:
+            session.add(ContractReview(contract_no=row[0], title=row[1], party_a=row[2],
+                                       party_b=row[3], category=row[4], amount=row[5],
+                                       status=row[6], risk_level=row[7], opinion=row[8],
+                                       created_at=_ts(row[9]), updated_at=_ts(row[9])))
+        total = (len(EMPLOYEES) + len(TICKETS) + len(LEAVES) + len(REIMBURSEMENTS) + len(BUDGETS)
+                 + len(SUPPLIERS) + len(PURCHASE_ORDERS) + len(CONTRACTS))
         await session.commit()
     print(f"[done] 共导入 {total} 行 mock 数据 (员工{len(EMPLOYEES)}/工单{len(TICKETS)}/"
-          f"请假{len(LEAVES)}/报销{len(REIMBURSEMENTS)}/预算{len(BUDGETS)})")
+          f"请假{len(LEAVES)}/报销{len(REIMBURSEMENTS)}/预算{len(BUDGETS)}/"
+          f"供应商{len(SUPPLIERS)}/采购{len(PURCHASE_ORDERS)}/合同{len(CONTRACTS)})")
 
 
 if __name__ == "__main__":

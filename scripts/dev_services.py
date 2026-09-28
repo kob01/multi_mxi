@@ -8,7 +8,8 @@
 
 为什么需要这个脚本: 本项目除了 Ollama 以外的依赖在 compose 里都有对应服务
 (postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp /
-finance-mcp / hr-agent / finance-agent), 宿主只跑网关与 vite dev。麻烦之处在于这些层
+finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent /
+contract-agent), 宿主只跑网关与 vite dev。麻烦之处在于这些层
 连不上时**全是静默降级**: Redis 退回内存 dict、checkpoint 退回 InMemorySaver、TEI 超时
 退回 RRF 融合序、Neo4j 关图记忆、Mongo 父块退回子块文本。看功能表现分不清"代码坏了"和
 "配置指到了容器内服务名"。本脚本把每个降级点变成显式的一行结论, 并顺带拦住两类配置事故:
@@ -47,8 +48,12 @@ DEV_SERVICES = [
     "mineru",
     "hr-mcp",
     "finance-mcp",
+    "analytics-mcp",
+    "procurement-mcp",
     "hr-agent",
     "finance-agent",
+    "analyst-agent",
+    "contract-agent",
 ]
 
 # 允许出现在 .env / docker/.env 里的密钥字段: 出现非空值即视为写错了位置。
@@ -71,8 +76,12 @@ CONTAINER_HOSTS = (
     "mineru",
     "hr-mcp",
     "finance-mcp",
+    "analytics-mcp",
+    "procurement-mcp",
     "hr-agent",
     "finance-agent",
+    "analyst-agent",
+    "contract-agent",
     "host.docker.internal",
 )
 
@@ -331,8 +340,12 @@ def _config_track_checks() -> list[Check]:
         "TEI_RERANK_URL": s.tei_rerank_url,
         "HR_MCP_URL": s.hr_mcp_url,
         "FINANCE_MCP_URL": s.finance_mcp_url,
+        "ANALYTICS_MCP_URL": s.analytics_mcp_url,
+        "PROCUREMENT_MCP_URL": s.procurement_mcp_url,
         "HR_AGENT_URL": s.hr_agent_url,
         "FINANCE_AGENT_URL": s.finance_agent_url,
+        "ANALYST_AGENT_URL": s.analyst_agent_url,
+        "CONTRACT_AGENT_URL": s.contract_agent_url,
         "OLLAMA_BASE_URL": s.ollama_base_url,
         "MINERU_BASE_URL": s.mineru_base_url,
         "PG_HOST": s.pg_host,
@@ -427,8 +440,12 @@ async def _build_checks(with_gateway: bool) -> list[Check]:
         Check("mineru", s.mineru_base_url, lambda: _probe_mineru(s.mineru_base_url), required=False, fix="docker compose -f docker/docker-compose.yml --profile mineru up -d mineru"),
         Check("hr-mcp", s.hr_mcp_url, lambda: _probe_mcp("hr-mcp", s.hr_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d hr-mcp"),
         Check("finance-mcp", s.finance_mcp_url, lambda: _probe_mcp("finance-mcp", s.finance_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d finance-mcp"),
+        Check("analytics-mcp", s.analytics_mcp_url, lambda: _probe_mcp("analytics-mcp", s.analytics_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d analytics-mcp"),
+        Check("procurement-mcp", s.procurement_mcp_url, lambda: _probe_mcp("procurement-mcp", s.procurement_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d procurement-mcp"),
         Check("hr-agent", s.hr_agent_url, lambda: _probe_agent("hr-agent", s.hr_agent_url), fix="docker compose -f docker/docker-compose.yml up -d hr-agent"),
         Check("finance-agent", s.finance_agent_url, lambda: _probe_agent("finance-agent", s.finance_agent_url), fix="docker compose -f docker/docker-compose.yml up -d finance-agent"),
+        Check("analyst-agent", s.analyst_agent_url, lambda: _probe_agent("analyst-agent", s.analyst_agent_url), fix="docker compose -f docker/docker-compose.yml up -d analyst-agent"),
+        Check("contract-agent", s.contract_agent_url, lambda: _probe_agent("contract-agent", s.contract_agent_url), fix="docker compose -f docker/docker-compose.yml up -d contract-agent"),
     ]
     if with_gateway:
         checks.append(

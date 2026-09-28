@@ -7,6 +7,7 @@
     GET  /api/sessions             某用户的会话列表
     GET  /api/sessions/{id}/messages  一个会话的完整历史(刷新后回填)
     DELETE /api/sessions/{id}      删除会话及其记录
+    GET  /api/files/reports/{name} 回取 Analyst_Agent 生成的图表(SVG)/报告(Markdown)
 """
 
 from __future__ import annotations
@@ -15,13 +16,15 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.assistant.graph import get_orchestrator
 from app.assistant.stream import get_stream_hub, sse_frame
 from app.chat_store import get_chat_store
+from app.config import get_settings
 from app.schemas import ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -108,3 +111,23 @@ async def delete_session(session_id: str) -> dict[str, str]:
 async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok"}
+
+
+@router.get("/files/reports/{name}")
+async def get_report_file(name: str) -> FileResponse:
+    """回取分析产物(图表 SVG / 报告 Markdown), 供前端内嵌展示。
+
+    安全: 文件名走 app.analytics.store 的白名单正则校验(挡掉一切路径穿越),
+    且只在 report_dir 目录内解析后的绝对路径才回文件; 不做目录列表。
+    """
+    from app.analytics.store import is_safe_name
+
+    if not is_safe_name(name):
+        raise HTTPException(status_code=400, detail="invalid artifact name")
+    directory = Path(get_settings().report_dir).resolve()
+    path = (directory / name).resolve()
+    # resolve 后再确认仍在 report_dir 内: 双保险挡符号链接/相对路径穿越。
+    if path.parent != directory or not path.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    media = "image/svg+xml" if path.suffix == ".svg" else "text/markdown; charset=utf-8"
+    return FileResponse(path, media_type=media)

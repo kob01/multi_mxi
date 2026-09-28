@@ -23,6 +23,8 @@ class MCPClientPool:
             {
                 "hr": {"url": settings.hr_mcp_url, "transport": "streamable_http"},
                 "finance": {"url": settings.finance_mcp_url, "transport": "streamable_http"},
+                "analytics": {"url": settings.analytics_mcp_url, "transport": "streamable_http"},
+                "procurement": {"url": settings.procurement_mcp_url, "transport": "streamable_http"},
             }
         )
         self._tools: list[BaseTool] | None = None

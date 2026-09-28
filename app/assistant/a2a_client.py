@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 AGENT_URLS = {
     "finance": lambda: get_settings().finance_agent_url,
     "hr": lambda: get_settings().hr_agent_url,
+    # domain 键与 tool 侧保持同名(analytics/procurement), 委派时拼成
+    # analytics_agent / procurement_agent, 与 AGENT_WHITELIST 中的名称一致。
+    "analytics": lambda: get_settings().analyst_agent_url,
+    "procurement": lambda: get_settings().contract_agent_url,
 }
 
 

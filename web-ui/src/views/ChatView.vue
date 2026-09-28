@@ -3,6 +3,7 @@ import { ref, reactive, computed, watch, onMounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import { BubbleList, XSender } from 'vue-element-plus-x'
+import MarkdownView from '../components/MarkdownView.vue'
 import { useEmployee } from '../composables/useEmployee'
 
 const { current } = useEmployee()
@@ -142,7 +143,7 @@ function pushWelcome() {
     variant: 'filled',
     shape: 'corner',
     content:
-      '你好，我是企业智能助手马小i。可以问我制度政策（如"年假有几天"），也可以直接说"我要报销""帮我开在职证明"。',
+      '你好，我是企业智能助手马小i。可以问我制度政策（如"年假有几天"），也可以直接说"我要报销""帮我开在职证明"；管理角色还能让我"生成本周经营周报""帮我审一下这份合同"。',
     headerTag: { text: '马小i', type: 'info' },
   })
 }
@@ -426,6 +427,11 @@ const currentSessionId = computed(() => sessionId.value)
               {{ item.headerTag.text }}
             </el-tag>
           </template>
+          <!-- 正文: AI 回答按 Markdown 渲染(表格/代码块/加粗等), 用户消息保持纯文本 -->
+          <template #content="{ item }">
+            <MarkdownView v-if="item.role !== 'user'" :content="item.content || ''" />
+            <div v-else class="user-text">{{ item.content }}</div>
+          </template>
           <template #footer="{ item }">
             <div v-if="item.thinking" class="thinking">
               <div class="thinking-head" @click="item.thinkingOpen = !item.thinkingOpen">
@@ -558,6 +564,12 @@ const currentSessionId = computed(() => sessionId.value)
 .bubble-list {
   flex: 1;
   min-height: 0;
+}
+
+.user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.7;
 }
 
 .thinking {

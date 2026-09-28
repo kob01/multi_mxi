@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance 业务表 + pgvector 知识块 + 个人记忆/用户画像 + 会话记录."""
+"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance/Procurement 业务表 + pgvector 知识块 + 个人记忆/用户画像 + 会话记录 + 报表产物."""
 
 from __future__ import annotations
 
@@ -181,6 +181,95 @@ class DepartmentBudget(Base):
     year: Mapped[int] = mapped_column(Integer)
     annual_budget: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     used_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+
+
+# ---------------------------------------------------------------------------
+# Procurement 业务表 (proc_ 前缀): 供应商 / 采购申请单 / 合同初审
+# ---------------------------------------------------------------------------
+class Supplier(Base):
+    """供应商主数据 (供采购单关联与合同初审的资质/黑名单校验)."""
+
+    __tablename__ = "proc_suppliers"
+
+    supplier_code: Mapped[str] = mapped_column(String(32), primary_key=True)  # SUP001+
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    category: Mapped[str] = mapped_column(String(64), default="")      # IT设备/办公用品/咨询服务/市场推广...
+    bank_account: Mapped[str] = mapped_column(String(64), default="")   # 收款账号 (合同付款条款一致性核对)
+    qualification: Mapped[str] = mapped_column(String(32), default="")  # 一般纳税人/小规模/个体
+    risk_status: Mapped[str] = mapped_column(String(16), default="正常")  # 正常/关注/黑名单
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+class PurchaseRequest(Base):
+    """采购申请单: 由 Contract_Agent 创建, 初审结论落 precheck_result + flags.
+
+    与报销单的差别在于"事前": 报销是费用已发生后核销, 采购是付款前的申请与
+    合规初审(比价/供应商资质/预算余额), 因此初审结论要留在单据上供人工复核。
+    """
+
+    __tablename__ = "proc_orders"
+
+    order_no: Mapped[str] = mapped_column(String(32), primary_key=True)  # PO3000+
+    emp_id: Mapped[str] = mapped_column(String(32), index=True)          # 申请人
+    department: Mapped[str] = mapped_column(String(64), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    category: Mapped[str] = mapped_column(String(64), default="")        # 同报销类别口径, 便于跨域统计
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    supplier_name: Mapped[str] = mapped_column(String(128), default="")
+    quotes_count: Mapped[int] = mapped_column(Integer, default=1)        # 比价份数(合规门槛 >=3)
+    budget_year: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    # DRAFT/PRECHECK/PENDING/APPROVED/REJECTED/PAID
+    status: Mapped[str] = mapped_column(String(16), default="PRECHECK", index=True)
+    current_node: Mapped[str] = mapped_column(String(64), default="合规初审")
+    # 初审结论摘要(人类可读); 结构化风险项落 flags JSON, 仅承载展示与复核信息
+    precheck_result: Mapped[str] = mapped_column(Text, default="")
+    flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+class ContractReview(Base):
+    """合同台账 + 初审结论: 规则清单(确定性) + LLM 条款抽取共同构成结论.
+
+    初审是"初审"不是"审批": 本表只产出风险清单与建议, 最终放行仍由法务/财务
+    人工决定, 因此结论必须整份留痕(review_json)以便复盘与追责。
+    """
+
+    __tablename__ = "proc_contracts"
+
+    contract_no: Mapped[str] = mapped_column(String(32), primary_key=True)  # CT8000+
+    title: Mapped[str] = mapped_column(String(255), default="")
+    party_a: Mapped[str] = mapped_column(String(128), default="")   # 本企业主体
+    party_b: Mapped[str] = mapped_column(String(128), index=True)   # 对手方(供应商名)
+    category: Mapped[str] = mapped_column(String(64), default="")   # 采购/服务/框架协议/劳动/保密
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    sign_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    doc_key: Mapped[str] = mapped_column(String(32), default="")    # 关联已入库文档(可空)
+    content: Mapped[str] = mapped_column(Text, default="")          # 送审全文(初审的输入)
+    # DRAFT/PRECHECKED/APPROVED/RISK/REJECTED
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", index=True)
+    risk_level: Mapped[str] = mapped_column(String(16), default="")  # 低/中/高
+    findings: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 命中的规则项
+    review_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # LLM 抽取的条款/缺失项
+    reviewer: Mapped[str] = mapped_column(String(64), default="")
+    opinion: Mapped[str] = mapped_column(Text, default="")          # 初审意见(可直接回给用户)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -461,4 +550,31 @@ class ChatMessage(Base):
     docs_meta: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 参考来源
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 报表产物台账 (Analyst_Agent 生成的图表/周报/月报)
+# ---------------------------------------------------------------------------
+class ReportArtifact(Base):
+    """一份分析产物的台账: 文件落盘 + 数据库行两侧并存.
+
+    为什么不只存文件: 图表/报告是需要被"再找到"的资产(上周那份报告在哪),
+    只靠目录命名无法按人/按主题回查; 为什么不只存库: SVG/Markdown 需要直接
+    用 URL 打开。行只记定位与归属(谁在什么参数下生成的), 正文以磁盘为准。
+    """
+
+    __tablename__ = "report_artifacts"
+    __table_args__ = (
+        Index("ix_report_artifacts_user_created", "created_by", "created_at"),
+    )
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)  # 文件名(svg/md)
+    kind: Mapped[str] = mapped_column(String(16), default="chart")     # chart/report
+    title: Mapped[str] = mapped_column(String(255), default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="")    # 生成者工号
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)     # 生成参数(SQL/维度/周期)
+    bytes_size: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )

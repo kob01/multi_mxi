@@ -6,7 +6,8 @@ if the database is unavailable the gateway still serves chat with degraded
 metadata while the document-management APIs report errors.
 
 Run:
-    uvicorn app.main:app --host 0.0.0.0 --port 8000
+    容器内(compose 已映射到宿主 18000): uvicorn app.main:app --host 0.0.0.0 --port 8000
+    宿主机直跑(开发拓扑见 README; 用宿主发布端口, 8000 常落 winnat 排除段): uvicorn app.main:app --port 18000
 """
 
 from __future__ import annotations
@@ -58,8 +59,9 @@ def _log_dependency_endpoints() -> None:
     s = get_settings()
     logger.info(
         "依赖对接地址[宿主轨看 .env, 容器轨看 compose]: pg=%s:%s/%s es=%s redis=%s neo4j=%s "
-        "mongo=%s tei=%s ollama=%s mineru=%s hr_mcp=%s finance_mcp=%s hr_agent=%s finance_agent=%s "
-        "audit=%s",
+        "mongo=%s tei=%s ollama=%s mineru=%s hr_mcp=%s finance_mcp=%s analytics_mcp=%s "
+        "procurement_mcp=%s hr_agent=%s finance_agent=%s analyst_agent=%s contract_agent=%s "
+        "report_dir=%s audit=%s",
         s.pg_host,
         s.pg_port,
         s.pg_database,
@@ -72,8 +74,13 @@ def _log_dependency_endpoints() -> None:
         s.mineru_base_url,
         s.hr_mcp_url,
         s.finance_mcp_url,
+        s.analytics_mcp_url,
+        s.procurement_mcp_url,
         s.hr_agent_url,
         s.finance_agent_url,
+        s.analyst_agent_url,
+        s.contract_agent_url,
+        s.report_dir,
         s.audit_log_path,
     )
 

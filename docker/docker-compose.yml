@@ -19,8 +19,12 @@ x-build: &build
 #   in a way forbidden by its access permissions
 # 容器卡在 Created/Exited(255)。若换机后 18xxx/17xxx 也被排除, 用同名环境变量再挪一次即可:
 #   $env:ASSISTANT_HOST_PORT=20000; docker compose -f docker/docker-compose.yml up -d assistant
-# 实测本机(2026-09)排除段为 7254-7353 / 7354-7453 / 7454-7553 / 7554-7653 / 7956-8055,
-# 故 7474 与 8000/8001/8002 全部不可 bind; 7687 恰好不在段内, 保持原值不动。
+# 排除段内容每次开机都会变, 不要假设某个端口"一直能用", 也不要据此改下面的默认值;
+# 起不来先跑 netsh 对照。本机历史两次实测:
+#   早先: 7254-7353 / 7354-7453 / 7454-7553 / 7554-7653 / 7956-8055  -> 7474 与 8000-8002 不可 bind
+#   后来: 7137-7236 / 7237-7336 / 7530-7629 / 7630-7729              -> 新增覆盖 7687
+# 故 HTTP 控制台走 17474, 应用类服务前移到 18xxx, bolt 由 docker/.env 的
+# NEO4J_BOLT_HOST_PORT=17687 抬起(容器内监听仍是 7687)。
 #
 # ---------- 容器侧配置注入约定 (改动前必读 CONFIG_RULES.md 第 5 条) ----------
 # app/config.py 的 env_file 只读宿主侧 .env / .env.local, 不再读 docker/.env, 所以容器配置
@@ -143,6 +147,104 @@ services:
     volumes:
       - ../logs:/data/logs
     depends_on: [finance-mcp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  # analytics-mcp: 数据洞察 Text2SQL/图表/报告。write_weekly_report 会调一次 LLM 写结论段,
+  # 故需 deepseek_api_key secret; 纯只读不写业务表。产物落 /data/reports(共用 ../data 卷)。
+  analytics-mcp:
+    build: *build
+    command: python -m app.mcp_servers.analytics_server
+    ports: ["${ANALYTICS_MCP_HOST_PORT:-18005}:8005"]
+    env_file: [.env]
+    environment:
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      REPORT_DIR: /data/reports
+    secrets: [pg_password, deepseek_api_key]
+    volumes:
+      - ../data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  # procurement-mcp: 采购单/合同初审。纯规则引擎 + 只读库, 不调 LLM(条款抽取在
+  # Contract_Agent 的 ReAct 循环里做), 故无需 deepseek secret。
+  procurement-mcp:
+    build: *build
+    command: python -m app.mcp_servers.procurement_server
+    ports: ["${PROCUREMENT_MCP_HOST_PORT:-18006}:8006"]
+    env_file: [.env]
+    environment:
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+    secrets: [pg_password]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [mxi]
+
+  analyst-agent:
+    build: *build
+    command: python -m app.agents.analyst_agent.server
+    ports: ["9005:9005"]
+    env_file: [.env]
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
+      ANALYTICS_MCP_URL: http://analytics-mcp:8005/mcp
+      ANALYST_AGENT_URL: http://analyst-agent:9005
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+    secrets: [deepseek_api_key, pg_password]
+    volumes:
+      - ../logs:/data/logs
+    depends_on: [analytics-mcp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  contract-agent:
+    build: *build
+    command: python -m app.agents.contract_agent.server
+    ports: ["9006:9006"]
+    env_file: [.env]
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
+      PROCUREMENT_MCP_URL: http://procurement-mcp:8006/mcp
+      CONTRACT_AGENT_URL: http://contract-agent:9006
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      PG_HOST: ${PG_HOST:-postgres}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+    secrets: [deepseek_api_key, pg_password]
+    volumes:
+      - ../logs:/data/logs
+    depends_on: [procurement-mcp]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
@@ -283,9 +385,16 @@ services:
       KNOWLEDGE_DIR: /data/knowledge
       HR_MCP_URL: http://hr-mcp:8001/mcp
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
+      ANALYTICS_MCP_URL: http://analytics-mcp:8005/mcp
+      PROCUREMENT_MCP_URL: http://procurement-mcp:8006/mcp
       HR_AGENT_URL: http://hr-agent:9001
       FINANCE_AGENT_URL: http://finance-agent:9002
+      ANALYST_AGENT_URL: http://analyst-agent:9005
+      CONTRACT_AGENT_URL: http://contract-agent:9006
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      # 分析产物目录: 与 analytics-mcp 写入同一 /data/reports(共用 ../data 卷),
+      # 网关才能凭 /api/files/reports/{name} 回取到智能体生成的图表/报告。
+      REPORT_DIR: /data/reports
       # 统一存储层: 元数据与 pgvector 知识块同一个库
       PG_HOST: ${PG_HOST:-postgres}
       PG_PORT: ${PG_PORT:-5432}
@@ -320,6 +429,10 @@ services:
       hr-agent:
         condition: service_started
       finance-agent:
+        condition: service_started
+      analyst-agent:
+        condition: service_started
+      contract-agent:
         condition: service_started
       elasticsearch:
         condition: service_started

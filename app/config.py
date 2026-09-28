@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     rag_top_k: int = 8
     rerank_top_n: int = 4
     # Rerank 走 TEI 容器的真 cross-encoder (/rerank), 不再借道 Ollama /api/embed。
-    # 容器内必须用服务名 tei-rerank; 宿主机直跑用 http://localhost:8080 (见 CONFIG_RULES)。
+    # 容器内必须用服务名 tei-rerank; 宿主轨默认 http://localhost:8080
+    # (见 CONFIG_RULES.md 第 5 条 → config-env-tracks §2)。
     tei_rerank_url: str = "http://localhost:8080"
     # 总超时 3s / 建连 0.5s: TEI 半死不能拖垮整条对话链路(超时报错即降级 RRF)。
     rerank_timeout: float = 3.0
@@ -143,6 +144,9 @@ class Settings(BaseSettings):
     # Document upload & metadata
     upload_dir: str = "./data/uploads"
     upload_max_mb: int = 50
+    # 分析产物(图表 SVG / 周期报告 Markdown)的落盘目录; 容器侧指向持久卷 /data/reports
+    # (与 UPLOAD_DIR 同源, 否则写在容器工作目录重启即丢)。
+    report_dir: str = "./data/reports"
     # MinerU OCR 服务 (mineru-api, 用于图片解析; 需先启动 mineru-api 服务)
     mineru_base_url: str = "http://localhost:8888"
     mineru_backend: str = "pipeline"
@@ -178,7 +182,9 @@ class Settings(BaseSettings):
     long_term_memory_enabled: bool = False
     # Graph 通道(Neo4j)总开关: 单节点内网部署, 对齐 ES 的"无认证"先例。
     graph_memory_enabled: bool = True
-    neo4j_uri: str = "bolt://localhost:7687"
+    # 代码默认值属宿主轨; bolt 原 7687 已落进本机 winnat 排除段(7630-7729),
+    # 跟 compose 的 NEO4J_BOLT_HOST_PORT 一起抬到 17687 (容器内监听仍为 7687)。
+    neo4j_uri: str = "bolt://localhost:17687"
     # Neo4j 侧 NEO4J_AUTH=none 时这两项留空即可; 若启用鉴权则填对应账号。
     neo4j_user: str = ""
     neo4j_password: str = Field(default="", repr=False)
@@ -232,10 +238,16 @@ class Settings(BaseSettings):
     # 容器内由 compose 注入 http://<svc>:8001/mcp 等服务名地址覆盖本默认值。
     hr_mcp_url: str = "http://localhost:18001/mcp"
     finance_mcp_url: str = "http://localhost:18002/mcp"
+    # 数据洞察与采购合同两个新域: 宿主端口同样走 18xxx 约定(容器内监听 8005/8006)。
+    analytics_mcp_url: str = "http://localhost:18005/mcp"
+    procurement_mcp_url: str = "http://localhost:18006/mcp"
 
     # A2A agents
+    # 9001/9002 不在历史排除段内, 故容器与宿主同端口; 新增两个专业智能体沿用该约定。
     hr_agent_url: str = "http://localhost:9001"
     finance_agent_url: str = "http://localhost:9002"
+    analyst_agent_url: str = "http://localhost:9005"
+    contract_agent_url: str = "http://localhost:9006"
 
     # Security
     audit_log_path: str = "./logs/audit.jsonl"

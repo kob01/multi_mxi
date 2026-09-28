@@ -37,13 +37,21 @@ from app.schemas import IntentResult, IntentType
 logger = logging.getLogger(__name__)
 
 # 领域关键词: 供规则层判定业务域(target)与终端关键词兜底复用。
+# 顺序即优先级(字典保持插入序): 先具体业务对象(finance/hr), 再报表/采购这类
+# 可能与其他域重叠的域; analytics 排在 procurement 前, 使"采购报表"归数据分析。
 _AGENT_KEYWORDS = {
     "finance": ("报销", "费用", "发票", "借款", "付款", "预算"),
     "hr": ("入职", "离职", "在职证明", "证明", "考勤", "请假", "年假申请", "工单"),
+    "analytics": ("统计", "报表", "周报", "月报", "数据分析", "趋势", "占比", "汇总",
+                  "图表", "经营", "看板", "洞察", "排名", "分布"),
+    "procurement": ("采购", "合同", "供应商", "比价", "招标", "框架协议", "下单", "进货"),
 }
-_TOOL_PATTERNS = re.compile(r"(FIN\d+|HR\d+|余额|进度查询|查询单号)")
+_TOOL_PATTERNS = re.compile(r"(FIN\d+|HR\d+|PO\d+|CT\d+|余额|进度查询|查询单号)")
 _FIN_CODE = re.compile(r"FIN\d+")
 _HR_CODE = re.compile(r"HR\d+")
+# 采购单 PO#### / 合同 CT#### 单号: 命中即 tool_call 且归 procurement 域。
+_PO_CODE = re.compile(r"PO\d+")
+_CT_CODE = re.compile(r"CT\d+")
 # 出现以下相对时间词即视为"依赖当前时间"的问题, 需先取平台时间再作答。
 # 仅用于 resolve_time 节点决定是否预取时钟, 不参与意图分类。
 _TIME_CONTEXT_PATTERNS = re.compile(
@@ -59,7 +67,12 @@ _RULES: list[tuple[re.Pattern, IntentType]] = [
     (re.compile(r"(我要|帮我|申请|开始|发起|办理).{0,4}(报销|费用核销)"), IntentType.AGENT_DELEGATE),
     (re.compile(r"(开|办|申请).{0,4}(在职证明|收入证明|离职证明|证明)"), IntentType.AGENT_DELEGATE),
     (re.compile(r"(申请|我要|办理).{0,4}(离职|入职|转正)"), IntentType.AGENT_DELEGATE),
-    (re.compile(r"FIN\d+|HR\d+"), IntentType.TOOL_CALL),
+    # 数据分析: "生成/出/做一份周报/月报/报表" 这类成文成图诉求委派 Analyst_Agent。
+    (re.compile(r"(生成|出|做|来|写|整).{0,6}(周报|月报|报表|分析报告|经营报告|图表)"), IntentType.AGENT_DELEGATE),
+    # 采购/合同: 送审合同、发起采购委派 Contract_Agent(多步办理 + 初审)。
+    (re.compile(r"(审|审查|初审|送审|合规|把关).{0,4}(合同|采购)"), IntentType.AGENT_DELEGATE),
+    (re.compile(r"(申请|我要|发起|办理|提).{0,4}(采购|下单|进货)"), IntentType.AGENT_DELEGATE),
+    (re.compile(r"FIN\d+|HR\d+|PO\d+|CT\d+"), IntentType.TOOL_CALL),
     (re.compile(r"(查询|查|看下|帮我查).{0,6}(单号|订单号|进度|到哪一步|余额|额度|预算|到账)"), IntentType.TOOL_CALL),
     (re.compile(r"签到|打卡"), IntentType.TOOL_CALL),
 ]
@@ -86,6 +99,22 @@ _SEEDS: dict[tuple[IntentType, str | None], list[str]] = {
     (IntentType.AGENT_DELEGATE, "hr"): [
         "帮我开在职证明", "我要申请离职", "办理入职手续", "开一份收入证明", "申请转正",
     ],
+    (IntentType.TOOL_CALL, "analytics"): [
+        "统计各部门本季度报销金额", "研发部今年报销趋势", "各类费用占比是多少",
+        "看一下经营看板数据", "市场部月度费用汇总图表",
+    ],
+    (IntentType.AGENT_DELEGATE, "analytics"): [
+        "生成本周经营周报", "帮我做一份月度分析报告", "出一份费用趋势图",
+        "写个季度数据分析报告", "做个部门预算对比图表",
+    ],
+    (IntentType.TOOL_CALL, "procurement"): [
+        "查一下 PO3000 采购单", "CT8000 合同初审到哪了", "我的采购单进度",
+        "查在册供应商名单",
+    ],
+    (IntentType.AGENT_DELEGATE, "procurement"): [
+        "我要发起一笔采购", "帮我审一下这份合同", "申请采购十台电脑",
+        "这份采购合同合规吗", "提一个供应商准入",
+    ],
     (IntentType.CHITCHAT, None): [
         "你好", "在吗", "谢谢", "再见", "你是谁", "今天天气怎么样", "辛苦了",
     ],
@@ -98,11 +127,13 @@ def needs_current_time(message: str) -> bool:
 
 
 def _detect_target(message: str) -> str | None:
-    """Resolve business domain (finance/hr) from codes then keywords."""
+    """Resolve business domain from codes first, then keywords."""
     if _FIN_CODE.search(message):
         return "finance"
     if _HR_CODE.search(message):
         return "hr"
+    if _PO_CODE.search(message) or _CT_CODE.search(message):
+        return "procurement"
     for domain, kws in _AGENT_KEYWORDS.items():
         if any(k in message for k in kws):
             return domain
@@ -212,7 +243,7 @@ class IntentRecognizer:
         data = json.loads(str(content))
         intent = IntentType(data.get("intent", "knowledge_qa"))
         target = data.get("target")
-        if target not in ("finance", "hr"):
+        if target not in ("finance", "hr", "analytics", "procurement"):
             target = None
         return IntentResult(
             intent=intent,

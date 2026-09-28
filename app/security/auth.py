@@ -7,21 +7,24 @@ from typing import Any
 from app.schemas import Role
 
 # Which MCP tool namespaces each role may invoke.
+# analytics/procurement 是新增的两个业务域(数据洞察 / 采购合同初审)。
 MCP_WHITELIST: dict[Role, set[str]] = {
-    Role.EMPLOYEE: {"hr", "finance"},
-    Role.MANAGER: {"hr", "finance"},
-    Role.HR: {"hr", "finance"},
-    Role.FINANCE: {"hr", "finance"},
-    Role.ADMIN: {"hr", "finance"},
+    Role.EMPLOYEE: {"hr", "finance", "procurement"},
+    Role.MANAGER: {"hr", "finance", "analytics", "procurement"},
+    Role.HR: {"hr", "finance", "analytics", "procurement"},
+    Role.FINANCE: {"hr", "finance", "analytics", "procurement"},
+    Role.ADMIN: {"hr", "finance", "analytics", "procurement"},
 }
 
 # Which A2A agents each role may delegate to.
+# analytics_agent(Analyst_Agent) 跨域查询全员经营数据, 属敏感能力, 不对普通员工开放;
+# procurement_agent(Contract_Agent) 支持员工自提采购单/送审合同, 对其开放。
 AGENT_WHITELIST: dict[Role, set[str]] = {
-    Role.EMPLOYEE: {"finance_agent", "hr_agent"},
-    Role.MANAGER: {"finance_agent", "hr_agent"},
-    Role.HR: {"hr_agent", "finance_agent"},
-    Role.FINANCE: {"finance_agent", "hr_agent"},
-    Role.ADMIN: {"finance_agent", "hr_agent"},
+    Role.EMPLOYEE: {"finance_agent", "hr_agent", "procurement_agent"},
+    Role.MANAGER: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
+    Role.HR: {"hr_agent", "finance_agent", "analytics_agent", "procurement_agent"},
+    Role.FINANCE: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
+    Role.ADMIN: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
 }
 
 # Fine-grained tool-level restrictions: sensitive tools are limited by role.
@@ -71,10 +74,51 @@ FINANCE_TOOL_WHITELIST: dict[Role, set[str] | None] = {
     Role.ADMIN: None,
 }
 
+# ---------------------------------------------------------------------------
+# 数据洞察域(analytics): run_sql 可跨 HR/Finance/Procurement 查全员数据, 属敏感工具,
+# 与 execute_sql 同级 —— 仅管理角色可见; 普通员工对本域默认拒绝(无任何工具)。
+# ---------------------------------------------------------------------------
+ANALYTICS_TOOL_WHITELIST: dict[Role, set[str] | None] = {
+    Role.EMPLOYEE: set(),  # 跨域经营数据对普通员工完全隐藏
+    Role.MANAGER: None,    # 经理及以上: analytics 域全量可见
+    Role.HR: None,
+    Role.FINANCE: None,
+    Role.ADMIN: None,
+}
+
+# ---------------------------------------------------------------------------
+# 采购合同域(procurement): 员工可自助下单/送审/查自己单据, 但 execute_sql
+# (跨全员采购/合同统计)仅对管理角色开放。None 表示全量可见。
+# ---------------------------------------------------------------------------
+_PROCUREMENT_BASE_TOOLS = {
+    "create_purchase_order",
+    "precheck_purchase_order",
+    "query_purchase_order",
+    "list_purchase_orders",
+    "check_purchase_compliance",
+    "list_suppliers",
+    "query_supplier",
+    "check_contract_clauses",
+    "submit_contract_review",
+    "query_contract",
+    "list_contracts",
+    "get_contract_text",
+    "save_contract_opinion",
+}
+PROCUREMENT_TOOL_WHITELIST: dict[Role, set[str] | None] = {
+    Role.EMPLOYEE: _PROCUREMENT_BASE_TOOLS,
+    Role.MANAGER: _PROCUREMENT_BASE_TOOLS | {"execute_sql"},
+    Role.HR: None,      # HR/财务专员/管理员: 采购域全量可见
+    Role.FINANCE: None,
+    Role.ADMIN: None,
+}
+
 # server_name -> 角色×工具白名单矩阵
 _DOMAIN_TOOL_WHITELISTS: dict[str, dict[Role, set[str] | None]] = {
     "finance": FINANCE_TOOL_WHITELIST,
     "hr": HR_TOOL_WHITELIST,
+    "analytics": ANALYTICS_TOOL_WHITELIST,
+    "procurement": PROCUREMENT_TOOL_WHITELIST,
 }
 
 
