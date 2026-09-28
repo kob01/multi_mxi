@@ -150,7 +150,8 @@ def render_chart(
         values: 单系列数值, 与 categories 对齐。
 
     Returns:
-        {name, url, kind, chart_type, categories_count} ; 失败返回 {error}。
+        {name, url, png_url?, chart_type, categories_count} ; 失败返回 {error}。
+        SVG url 用于展示; 需要把图嵌进 Word/PPT/PDF 时取 png_url(位图才能进 office)。
     """
     payload = charts.render(chart_type, title, categories or [], series, values)
     if "error" in payload:
@@ -168,12 +169,27 @@ def render_chart(
     )
     if "error" in written:
         return written
+    # 同步产一份 PNG(仅位图能进 docx/pptx/pdf): Pillow 不可用或出错只丢 png_url, 不影响 SVG 主图。
+    png_ref: dict[str, Any] = {}
+    try:
+        png_payload = charts.render_png(chart_type, title, categories or [], series, values)
+        if "png" in png_payload:
+            png_name = store.stamp("chart", ".png", title)
+            png_written = store.write_bytes(
+                png_name, png_payload["png"], title=title,
+                params={"chart_type": payload["chart_type"]},
+            )
+            if "url" in png_written:
+                png_ref = {"png_name": png_written["name"], "png_url": png_written["url"]}
+    except Exception as exc:  # noqa: BLE001 - PNG 是加分项
+        logger.debug("chart png emission skipped: %s", exc)
     return {
         **written,
         "chart_type": payload["chart_type"],
         "categories_count": payload["categories_count"],
         "dropped_points": payload["dropped_points"],
         "markdown": f"![{title}]({written['url']})",
+        **png_ref,
     }
 
 

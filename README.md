@@ -38,10 +38,20 @@ Protocol:FastMCP server,streamable-http transport(服务自身监听 `:8001/mcp`
 宿主机直连走后者, 容器间走服务名+原端口)。
 
 > 四个专业智能体与四个 MCP 域一一对应: `HR_Agent`(:9001)/`Finance_Agent`(:9002) 各走
-> hr/finance 域; 新增 `Analyst_Agent`(:9005) 走 analytics 域(跨 HR/财务/采购的 Text2SQL
-> 只读洞察 + SVG 图表 + 周期报告), `Contract_Agent`(:9006) 走 procurement 域(采购申请单
-> 合规初审 + 合同条款初审, 规则引擎保底 + 模型补充语义风险)。分析产物落 `data/reports`,
-> 由网关 `/api/files/reports/{name}` 静态回取。
+> hr/finance 域; `Analyst_Agent`(:9005) 走 analytics 域(跨 HR/财务/采购的 Text2SQL
+> 只读洞察 + SVG/PNG 图表 + 周期报告), `Contract_Agent`(:9006) 走 procurement 域(采购申请单
+> 合规初审 + 合同条款初审, 规则引擎保底 + 模型补充语义风险)。
+> 分析产物(图表/报告)落 `data/reports`, 由网关 `/api/files/reports/{name}` 静态回取。
+>
+> 另有一组**进程内工具能力域**(`app/tools/`, 无容器/端口): `web`(联网检索 `search_web` +
+> 网页抓取 `fetch_url`, SSRF 护栏见 `app/security/url_guard.py`)与 `docgen`(把结构化文字 +
+> 图片直接生成为可下载的 Word/Excel/PPT/PDF/Markdown 文件, `generate_docx/xlsx/pptx/pdf/md/image`
+> 回 `/api/files/{token}/{file}` 下载链接; 图片支持本地文件与图片 URL)。它们由
+> `tool_execute` 按 `CAPABILITY_TOOLS` 注册表直接注入 ReAct 循环, 不经 MCP 连接池;
+> 检索默认免密 provider `ddgs`, Tavily/Serper 密钥只住 `docker/secrets/*.txt`。
+>
+> 注: 原"网页创作工坊"(HTML 成品页 + Playwright 渲染沙箱 `docgen-sandbox` + 编辑器)
+> 已整体下线 —— docgen 的目标就是"文字+图片直接产出可下载文档", 不再有网页这条岔路。
 
 ### LangGraph 编排图
 
@@ -53,7 +63,7 @@ build_context ─────────── 汇聚 Business Context: 会话�
   │                        个人级记忆六桶(画像/偏好/习惯/情节/知识/图谱)
   ▼
 resolve_time ──────────── 问题含相对时间时预取平台时钟(东八区),
-  │                        注入后续四类路由 Prompt, 不依赖模型记忆日期
+  │                        注入后续五类路由 Prompt, 不依赖模型记忆日期
   ▼
 rewrite_query ─────────── 多轮指代消解: 把"那它的劣势呢"改写为独立查询
   │                        (首轮/无历史/自包含长问题跳过; 输出清洗+校验,
@@ -65,8 +75,10 @@ classify_intent ───────── deepseek-flash 意图识别(基于�
   ├── knowledge_qa ──► kb_answer ─────── RAG 混合检索(用消解后的问题检索,
   │                       │                生成与检索语义对齐)
   ├── chitchat ──────► chitchat ──────── 直答(携带对话历史 + 消解提示)
-  ├── tool_call ─────► tool_execute ──── MCP ReAct 工具调用(消解后的问题
-  │                       │                驱动, 角色×工具白名单过滤)
+  ├── tool_call ─────► tool_execute ──── MCP ReAct 工具调用(finance/hr/analytics/procurement,
+  │                       │                角色×工具白名单过滤) + 进程内能力域:
+  │                       │                web=联网检索/抓取, docgen=生成 Word/Excel/PPT/PDF/MD/图片
+  │                       │                (纯进程内 tool, 无容器/端口)
   └── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
                           │                作为当前请求, metadata 传身份)
                           ▼
@@ -92,7 +104,7 @@ classify_intent ───────── deepseek-flash 意图识别(基于�
 RRF 只融合排名不判相关性, 全链路**唯一**的相关性阈值落在 rerank 阶段
 (`app/rag/reranker.py` -> `HybridRetriever.retrieve`)：候选正文在 `attach_texts`
 主键回表后就位, 一次性批量送 TEI 容器的 `BAAI/bge-reranker-v2-m3` 序列分类头打分,
-输出 sigmoid 后的 **0~1 相关性**; 低于 `RETRIEVAL_SCORE_THRESHOLD`(默认 0.4) 的噪声
+输出 sigmoid 后的 **0\~1 相关性**; 低于 `RETRIEVAL_SCORE_THRESHOLD`(默认 0.4) 的噪声
 不进 Context Builder, 裁到空集即"未检索到相关文档", 由上层 judge 改写重检或明确拒答。
 
 - 稠密/稀疏两通道与 RRF 均**不设阈值**(分数不可比, 只负责召回); TEI 不可用/超时
@@ -128,7 +140,7 @@ RAG:  Query → Embedding
   `visibility / owner_id / dept_id / allowed_roles` 四个标量列,同库的
   `documents` 表为事实来源(`app/security/acl.py`);入库(`ingest`)与权限变更
   (`PUT /api/docs/{doc}/acl`)时两张表同步刷新(`update_acl_by_doc` 两条 UPDATE 同事务)。
-  **ACL 永远以 PG/ES 标量列做前置裁剪, MongoDB 只按 `_id` 取文本, 不承载权限语义**;
+  **ACL 永远以 PG/ES 标量列做前置裁剪, MongoDB 只按** **`_id`** **取文本, 不承载权限语义**;
   正文与 `extra`(JSONB) 只放展示字段, 权限字段禁止入 JSONB。
 - **可见性策略**:`public`(全员) / `dept`(指定部门) / `role`(指定角色)
   / `private`(仅上传者);管理员角色全量可见。
@@ -180,11 +192,25 @@ mxi/
 │   │   ├── hr_server.py          #   HR 工单系统(:8001/mcp)
 │   │   ├── finance_server.py     #   财务报销系统(:8002/mcp)
 │   │   ├── analytics_server.py   #   数据洞察(:8005/mcp, Text2SQL/图表/周报)
-│   │   └── procurement_server.py #   采购与合同初审(:8006/mcp)
+│   │   ├── procurement_server.py #   采购与合同初审(:8006/mcp)
 │   ├── analytics/                # ★ 数据洞察支撑(零依赖, 不引 matplotlib)
-│   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie)
+│   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie) + Pillow PNG(供 office 嵌图)
 │   │   ├── reports.py            #   固定口径指标 SQL + Markdown 报告组装
 │   │   └── store.py              #   产物落 data/reports + 台账 + 相对 URL 寻址
+│   ├── docgen/                   # ★ 文档生成(文字+图片 -> 可下载 office/PDF/MD 文件)
+│   │   ├── genstore.py           #   生成物令牌/gen/<token>/ 落盘/保留期清扫 + spec 解析
+│   │   ├── images.py             #   图片解析层: 本地文件/URL(过 SSRF) -> 归一化 PNG
+│   │   ├── docx_builder.py       #   python-docx 构建器(文字/表格/嵌图, 同步)
+│   │   ├── xlsx_builder.py       #   openpyxl 构建器
+│   │   ├── pptx_builder.py       #   python-pptx 构建器
+│   │   ├── pdf_builder.py        #   reportlab 构建器(内置 CID 中文字体 STSong-Light)
+│   │   └── md_builder.py         #   Markdown 构建器(零依赖)
+│   ├── tools/                    # ★ 进程内工具能力域(纯 tool 形态, 无容器/端口)
+│   │   ├── web.py                #   search_web(ddgs/tavily/serper, 失败降级) + fetch_url
+│   │   ├── docgen.py             #   generate_docx/xlsx/pptx/pdf/md/image(回下载链接)
+│   │   └── _http.py              #   共享 httpx 连接池(follow_redirects=False 逐跳校验)
+│   ├── files/                    # ★ 生成物下载路由 /api/files/{token}/{file_name}
+│   │   └── router.py             #   令牌形状/穿越断言/MIME 白名单四层防护
 │   ├── procurement/              # ★ 采购/合同确定性规则引擎
 │   │   └── rules.py              #   必备条款/高风险表述/金额分级/预算余额
 │   ├── agents/                   # ★ A2A 专业智能体
@@ -194,6 +220,7 @@ mxi/
 │   │   └── contract_agent/       #   采购合同 agent_card/executor/server(:9006)
 │   └── security/                 # ★ 安全治理
 │       ├── auth.py               #   角色→工具/Agent 白名单
+│       ├── url_guard.py          #   SSRF 护栏(字面名拒/白名单/解析即校验 is_global)
 │       ├── acl.py                #   文档级 ACL(Principal→谓词/SQL/ES filter)
 │       ├── audit.py              #   全链路审计 JSONL(trace_id 串联)
 │       └── masking.py            #   身份证/银行卡/手机号/金额脱敏
@@ -206,6 +233,8 @@ mxi/
 │   ├── migrate_doc_stores.py     # 存量迁移与校验: 正文入 Mongo + 父子拆双表
 │   ├── bench_doc_stores.py       # 父子双表规模基准(只写独立评测库)
 │   ├── test_sse_resume.py        # SSE 断点续流端到端用例(可走 vite 代理 MXI_BASE)
+│   ├── smoke_tools.py            # web/docgen 能力域离线冒烟(SSRF 面/构建器/路由回归)
+│   ├── test_tools_flow.py        # web/docgen 能力域整栈验证(检索/生成下载/回归)
 │   └── demo_reimburse.py         # 端到端 demo:我要报销
 ├── web-ui/                       # Vue3 前端源码(vite + element-plus)
 │   └── vite.config.js            # dev 代理目标读 .env 的 ASSISTANT_PORT; build 输出 ../web/dist
@@ -243,7 +272,7 @@ uvx --from "huggingface_hub<1" hf download BAAI/bge-reranker-v2-m3 `
   --local-dir data/tei_models/BAAI/bge-reranker-v2-m3
 ```
 
-权重落 `data/tei_models/BAAI/bge-reranker-v2-m3/`(已 gitignore, 单文件 fp32 ~2.2GB, 勿用
+权重落 `data/tei_models/BAAI/bge-reranker-v2-m3/`(已 gitignore, 单文件 fp32 \~2.2GB, 勿用
 `--exclude` 形式: hub 2.x CLI 会把它当文件名);compose 的 `tei-rerank` 服务以只读卷加载它。
 无 NVIDIA GPU 时把 `docker/.env` 的 `TEI_IMAGE` 改成 `...:cpu-1.9` 即可。
 
@@ -280,21 +309,21 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.mig
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.ingest_knowledge --dir /data/knowledge
 # 重刷业务数据(可选)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.seed_business_data --force
-# Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload
+# Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload   创作工坊: http://localhost:18000/docgen
 # Neo4j Browser: http://localhost:17474   (bolt: localhost:17687; 原 7687 已落进本机 winnat 排除段)
 ```
 
 > **宿主发布端口对照(当前实测)**:
 >
-> | 服务                                                                                               | 宿主端口                                                                        | 容器内监听      | 说明                                          |
-> | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------- | --------------------------------------------- |
-> | assistant                                                                                          | `18000`                                                                         | `8000`          | Web 聊天 / API / 文档管理                     |
-> | hr-mcp / finance-mcp                                                                               | `18001` / `18002`                                                               | `8001` / `8002` | MCP 服务                                      |
-> | analytics-mcp / procurement-mcp                                                                    | `18005` / `18006`                                                               | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
-> | neo4j HTTP                                                                                         | `17474`                                                                         | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
-> | neo4j Bolt                                                                                         | `17687`                                                                         | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
-> | tei-rerank                                                                                         | `8080`                                                                          | `8080`          | 重排服务 `/rerank`与`/health`                 |
-> | postgres / ES / Redis / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `6379` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左            | 未抬, 保持原值                                |
+> | 服务                                                                                                                | 宿主端口                                                                                     | 容器内监听           | 说明                             |
+> | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------- | ------------------------------ |
+> | assistant                                                                                                         | `18000`                                                                                  | `8000`          | Web 聊天 / API / 文档管理            |
+> | hr-mcp / finance-mcp                                                                                              | `18001` / `18002`                                                                        | `8001` / `8002` | MCP 服务                         |
+> | analytics-mcp / procurement-mcp                                                                                   | `18005` / `18006`                                                                        | `8005` / `8006` | 数据洞察 / 采购合同 MCP                |
+> | neo4j HTTP                                                                                                        | `17474`                                                                                  | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要) |
+> | neo4j Bolt                                                                                                        | `17687`                                                                                  | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需)    |
+> | tei-rerank                                                                                                        | `8080`                                                                                   | `8080`          | 重排服务 `/rerank`与`/health`       |
+> | postgres / ES / Redis / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `6379` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左              | 未抬, 保持原值                       |
 >
 > 抬端口只动**宿主发布端口**, 容器内监听端口与 compose 网络内的服务名地址(`bolt://neo4j:7687` 等)
 > 一律不变, 所以容器间连通性不受影响; 受影响的是宿主直连 —— 宿主 `.env` 必须写发布端口。
@@ -336,6 +365,7 @@ uv run python -m scripts.dev_services check        # 只看对接结果(幂等, 
 
 # 4. 页面入口(开发期一律走 vite dev, 不依赖 web/dist)
 #   聊天 http://localhost:5173   文档上传 http://localhost:5173/upload
+#   创作工坊 http://localhost:5173/docgen
 #   记忆 http://localhost:5173/memory   知识图谱 http://localhost:5173/graph
 #   API 文档 http://localhost:18000/docs   健康检查 http://localhost:18000/api/health
 
@@ -355,7 +385,7 @@ cd web-ui && pnpm install && pnpm dev                              # 前端 dev,
 
 要点:
 
-- **不起 `assistant` 容器**: 宿主网关要 bind `ASSISTANT_PORT`(默认 18000), 与容器发布端口互斥;
+- **不起** **`assistant`** **容器**: 宿主网关要 bind `ASSISTANT_PORT`(默认 18000), 与容器发布端口互斥;
   整栈验证时才 `dev_services up --with-assistant`(此时宿主网关起不来)。
 - **配置分两轨**: `app/config.py` 只读宿主侧 `.env`/`.env.local`; 容器侧靠 compose 的
   `env_file: [.env]`(= `docker/.env`) + `environment:` 注入。两侧地址不同是**故意的**,
@@ -413,11 +443,11 @@ tracing 默认关闭(`LANGSMITH_TRACING=false`, 代码默认值与容器侧配�
 1. `POST /api/chat` → Assistant 载入会话记忆(短期窗口 + 长期摘要);问题含相对时间时,
    先在进程内取平台当前时间并注入后续 Prompt
 2. `deepseek-flash` 意图识别 → `agent_delegate / finance`
-3. 权限校验(角色白名单)→ A2A Client 拉取 Finance_Agent 的 Agent Card 并 `message/send`
-4. Finance_Agent(LangGraph ReAct + deepseek-flash)追问/补齐要素后,经 MCP 调用
+3. 权限校验(角色白名单)→ A2A Client 拉取 Finance\_Agent 的 Agent Card 并 `message/send`
+4. Finance\_Agent(LangGraph ReAct + deepseek-flash)追问/补齐要素后,经 MCP 调用
    `create_reimbursement` 创建报销单
 5. 单号/审批节点沿 A2A 返回 → Assistant 回复用户;全程写 `logs/audit.jsonl`
-   (同一 trace_id),敏感字段(金额/证件号/手机号)脱敏。
+   (同一 trace\_id),敏感字段(金额/证件号/手机号)脱敏。
 
 K8s 部署:将 `docker/docker-compose.yml` 中 5 个服务各映射为 Deployment+Service
 (compose 可用 `kompose convert` 直接转换),Ollama 建议独立部署为推理服务,

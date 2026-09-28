@@ -9,7 +9,8 @@
 为什么需要这个脚本: 本项目除了 Ollama 以外的依赖在 compose 里都有对应服务
 (postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp /
 finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent /
-contract-agent), 宿主只跑网关与 vite dev。麻烦之处在于这些层
+contract-agent), 宿主只跑网关与
+vite dev。麻烦之处在于这些层
 连不上时**全是静默降级**: Redis 退回内存 dict、checkpoint 退回 InMemorySaver、TEI 超时
 退回 RRF 融合序、Neo4j 关图记忆、Mongo 父块退回子块文本。看功能表现分不清"代码坏了"和
 "配置指到了容器内服务名"。本脚本把每个降级点变成显式的一行结论, 并顺带拦住两类配置事故:
@@ -63,6 +64,9 @@ SECRET_KEYS = (
     "PG_PASSWORD",
     "MONGO_PASSWORD",
     "NEO4J_PASSWORD",
+    # 联网检索 provider 密钥(可选, 默认 ddgs 免密)。
+    "TAVILY_API_KEY",
+    "SERPER_API_KEY",
 )
 
 # compose 网络内的服务名与容器专用主机名: 宿主轨配置里出现即说明串味了。
@@ -88,7 +92,14 @@ CONTAINER_HOSTS = (
 OK, WARN, FAIL, SKIP = "OK", "WARN", "FAIL", "SKIP"
 
 # 连不上不报错、只静默降级的层: 自检把它们单独提示出来, 避免"看起来一切正常"。
-SILENT_DEGRADE_SERVICES = ("redis", "neo4j", "tei-rerank", "mongo", "elasticsearch", "mineru")
+SILENT_DEGRADE_SERVICES = (
+    "redis",
+    "neo4j",
+    "tei-rerank",
+    "mongo",
+    "elasticsearch",
+    "mineru",
+)
 
 
 class Check:

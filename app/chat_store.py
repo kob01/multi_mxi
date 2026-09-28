@@ -52,6 +52,7 @@ class ChatStore:
         target: str = "",
         intent: str = "",
         docs_meta: list[dict[str, Any]] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> int | None:
         """upsert 会话 + 追加 user/assistant 两条消息, 返回助手消息 id。
 
@@ -101,6 +102,7 @@ class ChatStore:
                         target=target or "",
                         intent=intent or "",
                         docs_meta=docs_meta or [],
+                        artifacts=artifacts or [],
                     )
                     session.add(ai_msg)
                     await session.flush()
@@ -156,6 +158,7 @@ class ChatStore:
                     "target": r.target,
                     "intent": r.intent,
                     "docs_meta": r.docs_meta or [],
+                    "artifacts": r.artifacts or [],
                     "created_at": r.created_at.isoformat() if r.created_at else "",
                 }
                 for r in rows

@@ -47,6 +47,16 @@ def _key(server: str, tool_name: str, args: dict, role: str) -> str:
     return f"{CACHE_PREFIX}:tool:{digest}"
 
 
+def _ttl_for(server: str) -> int:
+    """按域解析 TTL(计划 D4): 业务实时数据(余额/进度)用全局短 TTL;
+    联网检索(web)的结果在短窗口内稳定, 用更宽的 ``web_search_cache_ttl``。
+    其余能力域/未登记域一律回退全局值 —— 无法确认可缓存时取保守值。"""
+    settings = get_settings()
+    if server == "web":
+        return max(1, settings.web_search_cache_ttl)
+    return max(1, settings.tool_cache_ttl)
+
+
 async def cached_tool_call(
     server: str,
     tool_name: str,
@@ -74,7 +84,7 @@ async def cached_tool_call(
 
     if redis is not None and result:
         await try_redis(
-            lambda: redis.set(key, result, ex=settings.tool_cache_ttl),
+            lambda: redis.set(key, result, ex=_ttl_for(server)),
             what="tool cache set",
         )
     return result, False

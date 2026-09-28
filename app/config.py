@@ -14,12 +14,16 @@ _SECRET_FILES = {
     "langsmith_api_key": "/run/secrets/langsmith_api_key",
     "deepseek_api_key": "/run/secrets/deepseek_api_key",
     "mongo_password": "/run/secrets/mongo_password",
+    "tavily_api_key": "/run/secrets/tavily_api_key",
+    "serper_api_key": "/run/secrets/serper_api_key",
 }
 _SECRET_HOST_FALLBACK = {
     "pg_password": "docker/secrets/pg_password.txt",
     "langsmith_api_key": "docker/secrets/langsmith_api_key.txt",
     "deepseek_api_key": "docker/secrets/deepseek_api_key.txt",
     "mongo_password": "docker/secrets/mongo_password.txt",
+    "tavily_api_key": "docker/secrets/tavily_api_key.txt",
+    "serper_api_key": "docker/secrets/serper_api_key.txt",
 }
 
 
@@ -144,7 +148,7 @@ class Settings(BaseSettings):
     # Document upload & metadata
     upload_dir: str = "./data/uploads"
     upload_max_mb: int = 50
-    # 分析产物(图表 SVG / 周期报告 Markdown)的落盘目录; 容器侧指向持久卷 /data/reports
+    # 创作产物(图表 SVG / 周期报告 Markdown / 网页 HTML)的落盘目录; 容器侧指向持久卷 /data/reports
     # (与 UPLOAD_DIR 同源, 否则写在容器工作目录重启即丢)。
     report_dir: str = "./data/reports"
     # MinerU OCR 服务 (mineru-api, 用于图片解析; 需先启动 mineru-api 服务)
@@ -249,19 +253,68 @@ class Settings(BaseSettings):
     analyst_agent_url: str = "http://localhost:9005"
     contract_agent_url: str = "http://localhost:9006"
 
+    # ---------- 进程内 web 工具 (app/tools/web.py: 联网检索与抓取) ----------
+    # 检索 provider: ddgs 免密默认; tavily/serper 需密钥(见 docker/secrets/)。provider
+    # 不可用或无密钥时自动回退 ddgs; 全部失败返回 {error, results: []} 而不是抛出。
+    web_search_provider: str = "ddgs"  # ddgs | tavily | serper
+    web_search_max_results: int = 5
+    web_search_timeout: float = 10.0
+    # 检索结果比业务实时数据稳定, Tool Cache TTL 可放宽(默认 30s 是给余额/进度类工具的)。
+    web_search_cache_ttl: int = 300
+    # 检索出口代理(可选, 仅作用于 search_web 的 ddgs/tavily/serper, 不作用于 fetch_url)。
+    # ddgs 抓的是 Google/DuckDuckGo/Brave/Yahoo 等端点, 在大陆网络直连不可达(全部超时),
+    # 需要一个能翻出去的 HTTP(S) 代理。留空 = 直连(不受限网络/开发机默认)。容器内填宿主
+    # 代理地址, Docker Desktop 用 http://host.docker.internal:<port>(需代理开启 Allow LAN)。
+    # 刻意不代理 fetch_url: 其 SSRF 护栏按容器直连视角解析 DNS, 走代理会让出口与校验视角
+    # 不一致而削弱护栏, 故抓取保持直连(单条结果抓不到按其契约降级, 不影响检索)。
+    web_search_proxy: str = ""
+    # ddgs 尝试的引擎顺序(逗号分隔): 逐个独立尝试, 单引擎超时/空结果自动换下一个。ddgs 的 "auto"
+    # 会含极慢的 google/bing 与常空结果的 wikipedia/grokipedia/startpage, 走代理时易拖垒整体;
+    # duckduckgo/yahoo/brave 三者全球可达且快(典型首个 1.5~3s 命中)。置 "auto" 可恢复 ddgs 全量兜底。
+    web_search_ddgs_backends: str = "duckduckgo,yahoo,brave"
+    # 检索密钥(可选): 默认 ddgs 免密, 两者都留空即可; 密钥只住 docker/secrets/*.txt。
+    tavily_api_key: str = Field(default="", repr=False)
+    serper_api_key: str = Field(default="", repr=False)
+    # 抓取护栏: 逗号分隔的域名白名单(空 = 不启用白名单, 仅靠 SSRF 拒内网);
+    # 超时/体积/正文字符上限/重定向上限见下。所有抓取都过 url_guard, 私网/元数据地址一律拒。
+    web_fetch_allowlist: str = ""
+    web_fetch_timeout: float = 15.0
+    web_fetch_max_bytes: int = 2_000_000
+    web_fetch_max_chars: int = 8000
+    web_fetch_max_redirects: int = 3
+
+    # ---------- 进程内 docgen 工具 (app/tools/docgen.py: Word/Excel/PPT/PDF/MD/图片 生成) ----------
+    # 单个生成物体积上限(失控 spec 的刹车), 产物落 upload_dir/gen/<token>/;
+    # retention 到期由生成时顺带清扫(opportunistic), 不依赖定时任务。
+    docgen_max_bytes: int = 20_000_000
+    docgen_retention_hours: int = 24
+    # 下载链接前缀: 空则工具返回相对路径 /api/files/<token>/<file>(同源 SPA 内可直接点);
+    # 需要跨域分发(如把链接发给外网同事)时才配置绝对地址。
+    public_base_url: str = ""
+    # 文档内嵌图片(spec.images)治理: 单张原图字节上限 + 归一化后最长边像素。
+    # 过大图既撑爆生成物体积也让下载变慢; 统一转 PNG 后各 builder 只读本地文件, 网络/SSRF
+    # 留在异步解析层(app/docgen/images.py), 不污染纯同步的 builder。
+    docgen_image_max_bytes: int = 8_000_000
+    docgen_image_max_edge: int = 1600
+
     # Security
     audit_log_path: str = "./logs/audit.jsonl"
 
     # LangSmith / LangGraph Studio (仅本地开发环境启用; 生产容器必须关闭)
     # 开启后 trace 会上传到 langsmith_endpoint 指向的服务, 含对话内容,
-    # 受内网合规约束: 默认 false, 只有开发机在 .env 里显式置 true 才启用
+    # 受内网合规约束: 默认 false, 只有开发机在 .env 里显式置 LANGSMITH_TRACING=true 才启用
     # (容器侧由 docker/.env 的 LANGSMITH_TRACING=false 锁死)。
-    langsmith_tracing: str = "false"
+    # 注意: 这是 pydantic 字段"默认值", 优先级低于 .env/环境变量 —— 想开 trace 改 .env,
+    langsmith_tracing: bool = False
     langsmith_api_key: str = Field(default="", repr=False)
     langsmith_project: str = "mxi-assistant"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
-    @field_validator("pg_password", "deepseek_api_key", "langsmith_api_key", "mongo_password", mode="after")
+    @field_validator(
+        "pg_password", "deepseek_api_key", "langsmith_api_key", "mongo_password",
+        "tavily_api_key", "serper_api_key",
+        mode="after",
+    )
     @classmethod
     def _read_from_secret_file(cls, value: str, info) -> str:
         """环境变量/.env 未提供时, 回退读取 compose secret 文件。

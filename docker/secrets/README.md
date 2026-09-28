@@ -15,8 +15,16 @@
 | `pg_password.txt` | PostgreSQL 口令（compose 的 postgres 初始化 + 应用连接） | postgres / assistant / *-mcp / *-agent |
 | `deepseek_api_key.txt` | DeepSeek 在线 API Key | assistant / *-agent |
 | `langsmith_api_key.txt` | LangSmith Key（仅开发机启用 tracing 时需要） | assistant（容器侧 tracing 恒为 false） |
+| `tavily_api_key.txt` | Tavily 检索 Key（可选：启用 Tavily provider 时才需要；默认 ddgs 免密） | assistant（app/tools/web.py 的 search_web） |
+| `serper_api_key.txt` | Serper(Google) 检索 Key（可选：启用 Serper provider 时才需要） | assistant（同上） |
 
 文件内容 = 单行裸值，无引号、无 `KEY=` 前缀、行尾不要有多余空格（读取时会 `strip()`）。
+
+> 检索密钥（tavily/serper）是**可选**项：默认 provider `ddgs` 免密，不建这两个文件、
+> 也不往 compose 里加 `secrets:` 声明，一切照常。若要启用，除创建文件外还需在
+> `docker/docker-compose.yml` 的 `secrets:` 顶层声明与 `assistant.secrets:` 列表里各加一行
+> （compose 对缺失的 secret 文件会直接报错，所以不能默认挂上）——宿主直跑网关则无需任何改动，
+> `app/config.py` 会回退读本目录。
 
 ## 创建方式（PowerShell）
 

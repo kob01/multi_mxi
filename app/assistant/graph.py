@@ -7,7 +7,7 @@ Routing policy (single-entry multi-agent):
                                             |-> kb_requery -> kb_retrieve (no-result retry)
                                             `-> refuse  (still empty -> fixed reply, no LLM)
         chitchat        -> chitchat
-        tool_call       -> tool_execute   (Assistant -> MCP business tools)
+        tool_call       -> tool_execute   (Assistant -> MCP business tools / 能力域进程内工具)
         agent_delegate  -> agent_delegate (Assistant -> A2A specialist)
     -> [persist_memory] -> END
 
@@ -93,6 +93,7 @@ from app.security.auth import (
     filter_tools_for_role,
 )
 from app.security.masking import mask_text
+from app.tools import CAPABILITY_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,31 @@ _CONTEXT_DEPENDENT = re.compile(
     r"(它|他|她|这个|那个|这些|那些|上面说的|刚才说的|前面说|刚才说|呢$|呢[?？])"
 )
 
+# 能力域(tool_execute 的进程内工具分支, 计划 D2)的域内提示: 追加进 system_context,
+# 把"怎么交付"钉死 —— web 要带来源 URL; docgen 要先检索后成文(禁编造)并把 download_url 输出为 Markdown 链接。
+CAPABILITY_HINTS: dict[str, str] = {
+    "web": (
+        "可用工具说明: search_web 联网检索, fetch_url 抓取指定网页正文。"
+        "时效性/外部事实必须以检索结果为准并在回答中附上来源 url; "
+        "检索失败(返回 degraded/error)时如实说明未能联网核实, 不要编造来源。"
+    ),
+    "docgen": (
+        "可用工具说明: generate_docx/xlsx/pptx/pdf/md/image 按工具说明里的 spec 结构生成可下载文件; "
+        "本域还提供 search_web / fetch_url 用于联网检索。"
+        "【先调研后成文】当文档内容依赖外部事实、近期进展、时效信息或用户未提供的原文"
+        "(如\"调研近几个月 X 的技术发展\"\"最新行业动态\")时, 必须先调用 search_web"
+        "(必要时换词多检、用 fetch_url 展开重点来源)取得真实资料, 正文与结论一律以检索结果为准并在"
+        "文末列出来源 URL; 严禁在未检索时凭模型记忆编造事实/数据/来源——用户要的是调研, 不是看似"
+        "完整的虚构报告。仅当用户已把原文/数据交给你、或纯排版转存时才可直接成文无需检索。"
+        "要把图表/照片放进文档时, 在 spec 里用 images: [{\"src\": 本地文件名或图片URL}] 引用; "
+        "分析图表要进 office 文档时取 render_chart 返回的 png_url(位图才能进 docx/pptx/pdf)。"
+        "【交付链接】必须先真实调用 generate_* 并拿到返回的 download_url, 才能声称\"已生成\"; "
+        "把 download_url 原样输出为 Markdown 链接, 形如 [《文件标题》](download_url), 不要改写/截断/编造地址, "
+        "也不要输出裸路径纯文本(前端不会把裸 /api/ 路径渲染成可点链接)。"
+        "spec 校验失败时按 error 提示修正后最多重试一次。"
+    ),
+}
+
 
 def _platform_clock_text() -> str:
     """Format the platform clock as a prompt-ready string (UTC+8)."""
@@ -136,6 +162,7 @@ class AssistantState(TypedDict):
     thinking: bool  # 本轮是否开启深度思考(生成节点逐 token 流式 + 透出思考)
     message_id: int | None  # 会话记录落库后的助手消息 id(persist_memory 回填)
     thinking_text: str  # 本轮生成的完整思考内容(供历史记录落库)
+    artifacts: list[dict[str, Any]]  # 结构化交付物(name/url/title); office 下载走 answer 链接, 此字段预留
     history: str
     memory_ctx: str  # 长期记忆(Vector + Graph 通道)拼接结果, 与 history 分开审计
     current_time: str
@@ -639,25 +666,45 @@ class AssistantOrchestrator:
         }
 
     async def tool_execute(self, state: AssistantState) -> dict[str, Any]:
-        """Run a small ReAct loop over the target domain's MCP tools."""
+        """Run a small ReAct loop over the target domain's tools.
+
+        两类工具源(计划 D2): ``target in CAPABILITY_TOOLS`` 的**能力域**(web 联网检索/
+        docgen 文件生成)直接取进程内工具集 —— 跳过 MCP 连接池与 ``check_mcp_permission``
+        (那是 MCP 专用, 会对未知 server 默认拒); 其余 target 维持原有 MCP 分派路径不变。
+        两路在此之后共用同一套: 权限 Mask -> 注入 lookup_employee_by_name -> Tool Cache
+        包装 -> ReAct 循环, 热路径其余不动。
+        """
         intent = state["intent"]
         target = intent.target if intent and intent.target else "hr"
         role = self._role_of(state)
-        try:
-            check_mcp_permission(role, target, "*")
-        except PermissionDenied as exc:
-            # 权限拒绝是合规上最该留痕的事件(与 acl_final_check_dropped 同等对待),
-            # 转答复展示给用户的同时必须落审计, 否则拒绝记录只存在于用户界面。
-            logger.warning("MCP 权限拒绝: role=%s target=%s err=%s", role.value, target, exc)
-            self._audit.log(
-                state.get("trace_id") or "", "assistant", "mcp_permission_denied",
-                {"role": role.value, "target": target, "reason": str(exc)},
-                state.get("session_id"),
-            )
-            return {"answer": f"权限不足:{exc}", "route": "mcp_tool", "target": target}
+        trace_id = state.get("trace_id") or ""
+        session_id = state.get("session_id") or ""
 
-        all_tools = await get_mcp_pool().get_tools(target)
+        capability_tools = CAPABILITY_TOOLS.get(target)
+        domain_hint = ""
+        if capability_tools is not None:
+            # 能力域: 工具在本进程内, 无 MCP 白名单可查(计划 D3: 不建角色×工具矩阵)。
+            self._audit.log(trace_id, "assistant", "capability_dispatch", {"capability": target}, session_id)
+            await self._emit_status(state, "tool", f"正在使用 {target} 能力工具…")
+            all_tools = list(capability_tools)
+            domain_hint = CAPABILITY_HINTS.get(target, "")
+        else:
+            try:
+                check_mcp_permission(role, target, "*")
+            except PermissionDenied as exc:
+                # 权限拒绝是合规上最该留痕的事件(与 acl_final_check_dropped 同等对待),
+                # 转答复展示给用户的同时必须落审计, 否则拒绝记录只存在于用户界面。
+                logger.warning("MCP 权限拒绝: role=%s target=%s err=%s", role.value, target, exc)
+                self._audit.log(
+                    trace_id, "assistant", "mcp_permission_denied",
+                    {"role": role.value, "target": target, "reason": str(exc)},
+                    session_id,
+                )
+                return {"answer": f"权限不足:{exc}", "route": "mcp_tool", "target": target}
+            all_tools = await get_mcp_pool().get_tools(target)
+
         # 权限Mask: 按角色×工具白名单矩阵过滤, 隐藏工具对 LLM 不可见、不可调。
+        # 能力域未建矩阵 -> 透传全部(app/security/auth.py 的既定语义)。
         tools = filter_tools_for_role(role, target, all_tools)
         # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号再调业务工具。
         tools = [*tools, lookup_employee_by_name]
@@ -689,7 +736,14 @@ class AssistantOrchestrator:
             "(工号/姓名), 以消息指定的为准; 仅当查询\"我/本人\"相关数据且未指定他人时, "
             "才默认使用操作者 employee_id。"
         )
-        self._audit.log(state.get("trace_id") or "", "assistant", "mcp_dispatch", {"server": target}, state.get("session_id"))
+        if domain_hint:
+            system_context += f"\n{domain_hint}"
+        dispatch_kind = "capability" if capability_tools is not None else "mcp"
+        self._audit.log(
+            trace_id, "assistant", "mcp_dispatch",
+            {"server": target, "kind": dispatch_kind, "tools": [t.name for t in tools]},
+            session_id,
+        )
         await self._emit_status(state, "tool", f"正在调用 {target} 域业务工具…")
         # 用消解后的独立问题驱动 ReAct: "审批到哪一步了" 已改写为
         # "FIN5000 审批到哪一步了", 工具才能拿到正确的查询对象。
@@ -804,6 +858,7 @@ class AssistantOrchestrator:
             target=state.get("target") or "",
             intent=intent.intent.value if intent else "",
             docs_meta=state.get("docs_meta") or [],
+            artifacts=state.get("artifacts") or [],
         )
         self._audit.log(
             state.get("trace_id") or "", "assistant", "turn_completed",
@@ -1111,6 +1166,7 @@ class AssistantOrchestrator:
                 "thinking": thinking,
                 "message_id": None,
                 "thinking_text": "",
+                "artifacts": [],
                 "history": "",
                 "memory_ctx": "",
                 "current_time": "",
@@ -1145,6 +1201,7 @@ class AssistantOrchestrator:
             target=final.get("target"),
             trace_id=trace_id,
             message_id=final.get("message_id"),
+            artifacts=final.get("artifacts") or [],
             metadata={
                 "confidence": intent.confidence,
                 "reason": intent.reason,

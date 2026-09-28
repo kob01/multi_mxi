@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import html
+import io
 import math
 from typing import Any, Sequence
 
@@ -382,3 +383,178 @@ def render(
         "series_names": [s["name"] for s in ser],
         "dropped_points": dropped,
     }
+
+
+# ---------------------------------------------------------------------------
+# PNG 渲染(与上面同一套数据, 用 Pillow 直接画)
+# ---------------------------------------------------------------------------
+# 为什么还要一份 PNG: Word/PPT/PDF 里嵌不了 SVG(python-docx 需 png 兜底、reportlab
+# 不认 SVG), 而分析图要能进 office 文档就得有位图。刻意不引 matplotlib/cairosvg:
+# 前者太重、后者要系统 cairo —— 这里只需要三类图, Pillow(已是既有依赖)够用。
+# 中文靠探测系统里现成的 CJK 字体(Windows 有微软雅黑/黑体; Linux 常见文泉驿/Noto);
+# 找不到时退回 PIL 默认字体(ASCII 能显示, 中文标签会退化), 但仍**不抛** —— 出图优先。
+
+_PNG_W, _PNG_H = _WIDTH, _HEIGHT
+_FONT_CACHE: dict[int, Any] = {}
+
+
+def _load_font(size: int):
+    """按字号取一个尽量支持 CJK 的字体; 进程内缓存, 找不到就退默认字体。"""
+    from PIL import ImageFont
+
+    hit = _FONT_CACHE.get(size)
+    if hit is not None:
+        return hit
+    candidates = (
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+    )
+    font = None
+    for path in candidates:
+        try:
+            font = ImageFont.truetype(path, size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default()
+        except Exception:  # noqa: BLE001
+            font = None
+    _FONT_CACHE[size] = font
+    return font
+
+
+def _rgb(hex_color: str) -> tuple[int, int, int]:
+    h = (hex_color or "#000000").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except (ValueError, IndexError):
+        return (0, 0, 0)
+
+
+def _truncate(draw: Any, text: str, font: Any, max_px: int) -> str:
+    text = str(text)
+    if max_px <= 0 or not font:
+        return text
+    while text and draw.textlength(text, font=font) > max_px:
+        text = text[:-1]
+    return text
+
+
+def render_png(
+    chart_type: str,
+    title: str,
+    categories: Sequence[Any],
+    series: Sequence[Any] | None = None,
+    values: Sequence[Any] | None = None,
+    background: str = "#FFFFFF",
+) -> dict[str, Any]:
+    """与 :func:`render` 同数据同图型, 但产出 PNG 字节(供 office 内嵌)。
+
+    Returns:
+        ``{png: bytes, chart_type, categories_count}``; 无数据/图型不支持返回 ``{error}``。
+        Pillow 不可用时也返回 ``{error}`` 而不是抛出(调用方据此只出 SVG)。
+    """
+    kind = (chart_type or "bar").strip().lower()
+    if kind not in ("bar", "line", "pie"):
+        return {"error": f"不支持的图表类型: {kind}; 可选 bar/line/pie"}
+    cats, ser, _ = normalize(categories, series, values)
+    if not cats or not ser:
+        return {"error": "图表无数据: 请提供 categories 与 series(或 values)"}
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return {"error": "Pillow 不可用, 无法出 PNG"}
+
+    img = Image.new("RGB", (_PNG_W, _PNG_H), _rgb(background))
+    draw = ImageDraw.Draw(img)
+    f_title, f_axis, f_small = _load_font(16), _load_font(12), _load_font(11)
+    x0, y0 = _MARGIN["left"], _MARGIN["top"]
+    x1, y1 = _WIDTH - _MARGIN["right"], _HEIGHT - _MARGIN["bottom"]
+    draw.text((x0, 12), (title or "图表")[:60], fill=(17, 24, 39), font=f_title)
+
+    aligned = [list(s["data"]) + [0.0] * (len(cats) - len(s["data"])) for s in ser]
+    flat = [v for row in aligned for v in row]
+    lo, hi, step = _nice_ticks(max(flat) if flat else 1.0)
+    hi = hi or 1.0
+    plot_h, plot_w = y1 - y0, x1 - x0
+
+    def y_of(v: float) -> float:
+        return y1 - (v - lo) / (hi - lo or 1) * plot_h
+
+    # y 轴刻度 + 网格
+    val, guard = lo, 0
+    while val <= hi + 1e-9 and guard < 12:
+        y = y_of(val)
+        draw.line([(x0, y), (x1, y)], fill=(231, 235, 240), width=1)
+        draw.text((x0 - 8, y - 6), fmt(val, 1), fill=(107, 114, 128), font=f_small)
+        val += step
+        guard += 1
+    draw.line([(x0, y1), (x1, y1)], fill=(154, 164, 178), width=1)
+
+    n = max(1, len(cats))
+    slot = plot_w / n
+    if kind == "pie":
+        _png_pie(draw, cats, aligned[0], f_axis, f_small)
+    elif kind == "line":
+        for si, data in enumerate(aligned):
+            color = _rgb(_PALETTE[si % len(_PALETTE)])
+            pts = [(x0 + slot * (i + 0.5), y_of(v)) for i, v in enumerate(data)]
+            if len(pts) > 1:
+                draw.line(pts, fill=color, width=3)
+            for px, py in pts:
+                draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=color)
+        _png_cat_labels(draw, cats, slot, x0, y1, f_small)
+    else:
+        group = slot * 0.72
+        bar = group / max(1, len(aligned))
+        for si, data in enumerate(aligned):
+            color = _rgb(_PALETTE[si % len(_PALETTE)])
+            for ci, v in enumerate(data):
+                bx = x0 + slot * ci + (slot - group) / 2 + bar * si
+                top = y_of(v)
+                draw.rectangle([bx, top, bx + bar - 2, y1], fill=color)
+                if len(aligned) == 1:
+                    draw.text((bx + bar / 2 - 8, top - 14), fmt(v, 1), fill=(55, 65, 81), font=f_small)
+        _png_cat_labels(draw, cats, slot, x0, y1, f_small)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return {"png": buf.getvalue(), "chart_type": kind, "categories_count": len(cats)}
+
+
+def _png_cat_labels(draw: Any, cats: list[str], slot: float, x0: float, y1: float, font: Any) -> None:
+    for i, cat in enumerate(cats):
+        cx = x0 + slot * (i + 0.5)
+        label = _truncate(draw, str(cat), font, max(12, slot - 6))
+        draw.text((cx - draw.textlength(label, font=font) / 2, y1 + 8), label, fill=(75, 85, 99), font=font)
+
+
+def _png_pie(draw: Any, cats: list[str], data: list[float], font: Any, small: Any) -> None:
+    total = sum(max(0.0, v) for v in data) or 1.0
+    cx, cy, r = _MARGIN["left"] + 150, _HEIGHT / 2 + 6, 128
+    start = 0.0
+    pairs = list(zip(cats, [max(0.0, v) for v in data]))
+    for i, (cat, v) in enumerate(pairs):
+        extent = v / total * 360.0
+        color = _rgb(_PALETTE[i % len(_PALETTE)])
+        if len(pairs) == 1:
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+        else:
+            draw.pieslice([cx - r, cy - r, cx + r, cy + r], start, start + extent, fill=color, outline=(255, 255, 255))
+        start += extent
+    ly = cy - r
+    lx = cx + r + 24
+    for i, (cat, v) in enumerate(pairs):
+        color = _rgb(_PALETTE[i % len(_PALETTE)])
+        draw.rectangle([lx, ly, lx + 11, ly + 11], fill=color)
+        draw.text((lx + 16, ly - 2), f"{_truncate(draw, str(cat), small, 120)} · {fmt(v, 1)}", fill=(75, 85, 99), font=small)
+        ly += 20

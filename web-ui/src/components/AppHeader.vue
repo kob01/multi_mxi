@@ -89,6 +89,11 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
   .emp-switch :deep(.el-select) {
     width: 160px !important;
   }
+
+  /* 窄屏下先舍掉最后的"我的记忆", 靠 URL 直达 */
+  .nav :deep(.el-menu-item[index='memory']) {
+    display: none;
+  }
 }
 
 @media (max-width: 900px) {

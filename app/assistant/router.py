@@ -7,7 +7,7 @@
     GET  /api/sessions             某用户的会话列表
     GET  /api/sessions/{id}/messages  一个会话的完整历史(刷新后回填)
     DELETE /api/sessions/{id}      删除会话及其记录
-    GET  /api/files/reports/{name} 回取 Analyst_Agent 生成的图表(SVG)/报告(Markdown)
+    GET  /api/files/reports/{name} 回取产物文件（图表 SVG / 报告 Markdown / 成品页 HTML）
 """
 
 from __future__ import annotations
@@ -115,10 +115,14 @@ async def health() -> dict[str, str]:
 
 @router.get("/files/reports/{name}")
 async def get_report_file(name: str) -> FileResponse:
-    """回取分析产物(图表 SVG / 报告 Markdown), 供前端内嵌展示。
+    """回取分析产物(图表 SVG / 报告 Markdown), 成品页(HTML)也走同一入口。
 
     安全: 文件名走 app.analytics.store 的白名单正则校验(挡掉一切路径穿越),
     且只在 report_dir 目录内解析后的绝对路径才回文件; 不做目录列表。
+
+    HTML 额外带 CSP sandbox 头: 成品页与业务系统同源, 不加这道头时一段恶意脚本就能
+    读本域 cookie/localStorage 并调内网 API。sandbox 指令不带 allow-same-origin, 等于把
+    文档当不透明源处理 —— 脚本照跑(图表这类动态页仍需工作), 但拿不到本域身份。
     """
     from app.analytics.store import is_safe_name
 
@@ -130,4 +134,11 @@ async def get_report_file(name: str) -> FileResponse:
     if path.parent != directory or not path.is_file():
         raise HTTPException(status_code=404, detail="artifact not found")
     media = "image/svg+xml" if path.suffix == ".svg" else "text/markdown; charset=utf-8"
-    return FileResponse(path, media_type=media)
+    headers: dict[str, str] | None = None
+    if path.suffix.lower() == ".html":
+        media = "text/html; charset=utf-8"
+        headers = {
+            "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-modals",
+            "X-Content-Type-Options": "nosniff",
+        }
+    return FileResponse(path, media_type=media, headers=headers)

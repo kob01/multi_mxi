@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.assistant.router import router as assistant_router
 from app.docs.router import router as docs_router
+from app.files.router import router as files_router
 from app.memory.router import router as memory_router
 from app.kg.router import router as kg_router
 from app.config import get_settings
@@ -60,8 +61,8 @@ def _log_dependency_endpoints() -> None:
     logger.info(
         "依赖对接地址[宿主轨看 .env, 容器轨看 compose]: pg=%s:%s/%s es=%s redis=%s neo4j=%s "
         "mongo=%s tei=%s ollama=%s mineru=%s hr_mcp=%s finance_mcp=%s analytics_mcp=%s "
-        "procurement_mcp=%s hr_agent=%s finance_agent=%s analyst_agent=%s contract_agent=%s "
-        "report_dir=%s audit=%s",
+        "procurement_mcp=%s hr_agent=%s finance_agent=%s analyst_agent=%s "
+        "contract_agent=%s public_base=%s report_dir=%s audit=%s",
         s.pg_host,
         s.pg_port,
         s.pg_database,
@@ -80,6 +81,7 @@ def _log_dependency_endpoints() -> None:
         s.finance_agent_url,
         s.analyst_agent_url,
         s.contract_agent_url,
+        s.public_base_url or "(相对路径)",
         s.report_dir,
         s.audit_log_path,
     )
@@ -152,8 +154,11 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             logger.error("文档知识图谱 schema 初始化失败, 图谱功能降级: %s", exc)
     yield
+    from app.tools._http import close_web_client
+
     await orchestrator.shutdown()
     await close_reranker_client()
+    await close_web_client()
     await close_redis()
     await close_driver()
     from app.bodies.client import close_mongo
@@ -171,7 +176,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # 文档生成物下载路由(计划 E3): 必须注册在 assistant_router 之后 —— 那里面有
+    # /api/files/reports/{name}(图表/报告产物), 先到先得; 下载路由自身的 32 位 hex 令牌
+    # 校验是双保险, 即使顺序被调整 "reports" 也永远匹配不进令牌位。
     app.include_router(assistant_router)
+    app.include_router(files_router)
     app.include_router(docs_router)
     app.include_router(memory_router)
     app.include_router(kg_router)

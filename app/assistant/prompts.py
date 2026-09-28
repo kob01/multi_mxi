@@ -3,7 +3,10 @@
 INTENT_PROMPT = """你是企业助手的意图分类器。结合对话历史,把用户的最新一句话分到以下四类之一:
 
 - knowledge_qa: 知识库中已有文档可以回答的问题,包括制度/政策/流程/FAQ等(例如"年假有几天""差旅费标准");只要问题可能在知识库资料中有对应内容,即归此类。
-- tool_call: 明确且信息完整的简单操作(例如"查询 FIN5000 报销单""查我的年假余额""查一下研发部的预算""查 PO3000 采购单"),可由单个工具直接完成。
+- tool_call: 明确且信息完整的简单操作,可由单个工具直接完成,分四类 target:
+  · finance/hr: 业务单据与人事办理(例如"查询 FIN5000 报销单""查我的年假余额""查一下研发部的预算");
+  · web: 时效性/外部事实需要**联网检索**(例如"搜一下今天的行业新闻""最新的大模型发布进展""现在美元汇率多少""今天天气怎么样");
+  · docgen: 生成**可下载的文件**(例如"把这份数据做成 Excel 表格""生成一份季度总结的 Word 文档""导出一份 PDF 报告""做一份汇报 PPT""导成 Markdown");
 - agent_delegate: 需要专业系统多步办理的复杂业务(例如"我要报销""帮我开在职证明""申请离职""发起一笔采购""审一下这份合同""生成本周经营周报"),委派给专业智能体。
 - chitchat: 闲聊、问候。
 
@@ -14,7 +17,10 @@ INTENT_PROMPT = """你是企业助手的意图分类器。结合对话历史,把
 - hr: 入离职/证明/考勤/请假/工单等人事办理与查询。
 - analytics: 跨域数据统计、趋势/占比分析、周报月报、图表与经营看板(偏"看数据/出报告")。
 - procurement: 采购申请单、供应商、合同初审与合规把关(偏"办理采购/审合同")。
-注意区分 analytics 与 procurement: "统计采购金额/出报表" 是 analytics, "发起采购/审合同" 是 procurement。
+- web: 联网检索与网页抓取(时效/外部事实)。
+- docgen: 生成 Word/Excel/PPT/PDF/Markdown 等可下载文件。
+注意区分: "统计采购金额/出报表" 是 analytics; "发起采购/审合同" 是 procurement;
+"把这份数据导出成 Excel/Word/PDF/Markdown" 是 tool_call+docgen(可下载文件); "搜一下/最新/新闻/汇率" 是 tool_call+web(联网); 生成周报(文本报告)仍是 analytics, 不因"生成"两字就归 docgen。
 
 说明: "用户最新输入"可能已把指代消解为独立问题(如"它的余额"→"XX 的余额"),
 请直接按其字面含义分类; 对话历史仅作辅助参考。
@@ -25,8 +31,8 @@ INTENT_PROMPT = """你是企业助手的意图分类器。结合对话历史,把
 用户最新输入: {message}
 
 严格输出 JSON,不要输出其他内容:
-{{"intent": "...", "target": "finance|hr|analytics|procurement|null", "confidence": 0.0-1.0, "reason": "一句话理由"}}
-其中 target 仅当 intent 为 agent_delegate 或 tool_call 时给出业务域(finance/hr/analytics/procurement),否则为 null。"""
+{{"intent": "...", "target": "finance|hr|analytics|procurement|web|docgen|null", "confidence": 0.0-1.0, "reason": "一句话理由"}}
+其中 target 仅当 intent 为 tool_call(finance/hr/web/docgen) 或 agent_delegate(finance/hr/analytics/procurement) 时给出, 否则为 null。"""
 
 QUERY_REWRITE_PROMPT = """你是查询改写器。根据对话历史,把用户的最新问题改写为一个独立、完整、可直接用于检索/意图判断的查询。
 规则:

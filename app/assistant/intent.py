@@ -45,6 +45,10 @@ _AGENT_KEYWORDS = {
     "analytics": ("统计", "报表", "周报", "月报", "数据分析", "趋势", "占比", "汇总",
                   "图表", "经营", "看板", "洞察", "排名", "分布"),
     "procurement": ("采购", "合同", "供应商", "比价", "招标", "框架协议", "下单", "进货"),
+    # 能力域(计划 D5): web=联网检索, docgen=文件生成(office/PDF/MD)。两者都映射
+    # tool_call(见 _fallback), 放在最后是刻意的: 显式格式词/联网动词由 _RULES 先拦。
+    "web": ("最新", "近期", "最近", "新闻", "网上", "联网", "热搜", "实时", "股价", "汇率", "天气"),
+    "docgen": ("word", "docx", "excel", "xlsx", "ppt", "pptx", "pdf", "文档", "表格", "幻灯片", "导出", "markdown", "md"),
 }
 _TOOL_PATTERNS = re.compile(r"(FIN\d+|HR\d+|PO\d+|CT\d+|余额|进度查询|查询单号)")
 _FIN_CODE = re.compile(r"FIN\d+")
@@ -52,18 +56,28 @@ _HR_CODE = re.compile(r"HR\d+")
 # 采购单 PO#### / 合同 CT#### 单号: 命中即 tool_call 且归 procurement 域。
 _PO_CODE = re.compile(r"PO\d+")
 _CT_CODE = re.compile(r"CT\d+")
+# 文件生成(可下载的 office/PDF/MD 文件)的规则: 必须带明确格式词/导出动词 —— 否则
+# "生成周报"(analytics)也会被抢过来。规则层与 _detect_target 共用这一个正则, 避免两处漂移。
+_FILE_GEN_RE = re.compile(
+    r"(导出|输出|生成|做成|做|写|整)[^。！？]{0,8}(word|docx|excel|xlsx|ppt|pptx|pdf|幻灯片|文档|表格|markdown|\bmd\b)", re.I
+)
 # 出现以下相对时间词即视为"依赖当前时间"的问题, 需先取平台时间再作答。
 # 仅用于 resolve_time 节点决定是否预取时钟, 不参与意图分类。
 _TIME_CONTEXT_PATTERNS = re.compile(
     r"(今天|明天|昨天|后天|前天|现在|当前|目前|此刻|几号|几点|星期|周几|礼拜|"
     r"今年|去年|明年|本月|这个月|上个月|下个月|本季度|上季度|下季度|本年度|"
-    r"月初|月底|年初|年末|截止|截至|还有几天|剩余几天|时效|过期|到期)"
+    r"月初|月底|年初|年末|截止|截至|还有几天|剩余几天|时效|过期|到期|"
+    r"最新|最近|近期)"
 )
 
 # ---------------------------------------------------------------- 第一层: 规则
 # 高频固定指令 -> 直接判定意图。列表按优先级有序匹配, 新增指令只需追加。
 # 委派类(需专业系统多步办理)排在查询类前面, 避免"我要报销"被判为 tool_call。
 _RULES: list[tuple[re.Pattern, IntentType]] = [
+    # 文件生成(office/PDF/MD): 交付物是可下载文件, 规则与 _detect_target 共用 _FILE_GEN_RE。
+    (_FILE_GEN_RE, IntentType.TOOL_CALL),
+    # 联网检索(计划 D5): 规则只兜显式联网动词; "最新/新闻/天气"这类靠语义层+关键词兜底。
+    (re.compile(r"(联网|上网|网上搜|搜索一下|搜一下|帮我搜|查一下网上|百度一下)"), IntentType.TOOL_CALL),
     (re.compile(r"(我要|帮我|申请|开始|发起|办理).{0,4}(报销|费用核销)"), IntentType.AGENT_DELEGATE),
     (re.compile(r"(开|办|申请).{0,4}(在职证明|收入证明|离职证明|证明)"), IntentType.AGENT_DELEGATE),
     (re.compile(r"(申请|我要|办理).{0,4}(离职|入职|转正)"), IntentType.AGENT_DELEGATE),
@@ -115,8 +129,17 @@ _SEEDS: dict[tuple[IntentType, str | None], list[str]] = {
         "我要发起一笔采购", "帮我审一下这份合同", "申请采购十台电脑",
         "这份采购合同合规吗", "提一个供应商准入",
     ],
+    # 能力域(计划 D5): 交付物是"带来源的联网检索结果"与"可下载的文件"。
+    (IntentType.TOOL_CALL, "web"): [
+        "搜一下今天的科技新闻", "最新的人工智能进展有哪些", "现在美元兑人民币汇率是多少",
+        "最近一周的行业动向", "查一下网上这家公司的背景资料",
+    ],
+    (IntentType.TOOL_CALL, "docgen"): [
+        "把这份数据做成 Excel 表格", "生成一份季度总结的 Word 文档", "帮我导出一份 PDF 报告",
+        "做一份项目汇报 PPT", "把报销明细导出成表格文件",
+    ],
     (IntentType.CHITCHAT, None): [
-        "你好", "在吗", "谢谢", "再见", "你是谁", "今天天气怎么样", "辛苦了",
+        "你好", "在吗", "谢谢", "再见", "你是谁", "辛苦了",
     ],
 }
 
@@ -134,6 +157,10 @@ def _detect_target(message: str) -> str | None:
         return "hr"
     if _PO_CODE.search(message) or _CT_CODE.search(message):
         return "procurement"
+    # 文件生成(可下载的 word/excel/ppt/pdf/md)优先于业务关键词: "把报销明细导出成 excel"
+    # 的交付物是文件, 不该被"报销"抢成 finance 域。
+    if _FILE_GEN_RE.search(message):
+        return "docgen"
     for domain, kws in _AGENT_KEYWORDS.items():
         if any(k in message for k in kws):
             return domain
@@ -243,7 +270,7 @@ class IntentRecognizer:
         data = json.loads(str(content))
         intent = IntentType(data.get("intent", "knowledge_qa"))
         target = data.get("target")
-        if target not in ("finance", "hr", "analytics", "procurement"):
+        if target not in ("finance", "hr", "analytics", "procurement", "web", "docgen"):
             target = None
         return IntentResult(
             intent=intent,
@@ -280,6 +307,10 @@ class IntentRecognizer:
         """Keyword-based routing when the model fails."""
         for target, kws in _AGENT_KEYWORDS.items():
             if any(k in message for k in kws):
+                if target in ("web", "docgen"):
+                    # 能力域没有对应的专业智能体可委派, 只能是 tool_call。
+                    return IntentResult(intent=IntentType.TOOL_CALL, target=target, confidence=0.55,
+                                        reason=f"keyword:{target}", layer="fallback")
                 if _TOOL_PATTERNS.search(message):
                     return IntentResult(intent=IntentType.TOOL_CALL, target=target, confidence=0.55, reason="keyword:tool", layer="fallback")
                 return IntentResult(intent=IntentType.AGENT_DELEGATE, target=target, confidence=0.55, reason="keyword:agent", layer="fallback")

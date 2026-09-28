@@ -109,6 +109,9 @@ SECRET_KEYS = (
     "PG_PASSWORD",
     "MONGO_PASSWORD",
     "NEO4J_PASSWORD",
+    # 联网检索 provider 密钥(可选, 默认 ddgs 免密): 启用 Tavily/Serper 时同样只住 secrets。
+    "TAVILY_API_KEY",
+    "SERPER_API_KEY",
 )
 
 # 产物扫描规则: 名称 -> (正则, 是否高置信)。

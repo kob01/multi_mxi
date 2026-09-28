@@ -51,3 +51,11 @@ redis>=5.0
 langgraph-checkpoint-redis>=0.0.5
 # Long Memory 的 Graph 通道 (实体/关系/多跳), 与 Vector 通道(pgvector)并列
 neo4j>=5.0
+
+# 进程内工具能力 (app/tools): 联网检索/抓取 + 文档生成
+# ddgs 免密默认检索 provider; bs4 抽取网页正文(stdlib html.parser, 不引 lxml);
+# Tavily/Serper 走 httpx REST 直连不加 SDK, 密钥只住 docker/secrets/*.txt。
+ddgs>=9.0
+beautifulsoup4>=4.12
+# PDF 中文走内置 CID 字体 STSong-Light, 不打包 TTF; docx/xlsx/pptx 已由上面三包覆盖
+reportlab>=4.1

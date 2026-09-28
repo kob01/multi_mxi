@@ -30,6 +30,6 @@ COPY web ./web
 COPY scripts ./scripts
 COPY data/knowledge ./data/knowledge
 
-EXPOSE 8000 8001 8002 8005 8006 9001 9002 9005 9006
+EXPOSE 8000 8001 8002 8005 8006 8007 9001 9002 9005 9006 9007
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

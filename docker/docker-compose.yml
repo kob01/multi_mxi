@@ -249,6 +249,9 @@ services:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
 
+  # docgen-mcp: 已下线 —— 网页创作工坊(HTML 成品页 + Playwright 沙箱 + 编辑器)整体移除。
+  # docgen 现在是进程内工具(app/tools/docgen.py): 文字+图片 -> 可下载 office/PDF/MD 文件。
+
   # Elasticsearch: RAG 稀疏检索通道 (BM25; jieba 预分词, 无需 IK 插件)。
   # 单节点内网部署, 无认证; 数据落在 es_data 卷。
   elasticsearch:

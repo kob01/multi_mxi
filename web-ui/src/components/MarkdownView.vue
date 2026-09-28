@@ -11,7 +11,44 @@ const props = defineProps({
   content: { type: String, default: '' },
 })
 
-// 净化后加工: 给代码块挂深色样式类并追加复制按钮(v-html 场景下只能在这里动 DOM)
+// 站内下载/产物路径(相对 `/api/files/...`)不带 scheme, marked 不会自动链接, 会被渲染成
+// 不可点的裸文本(用户反馈"给了接口路径点不动")。这里兜底把正文里出现的 /api/... 包成
+// 可点 <a>: 后端 FileResponse 带 Content-Disposition: attachment, 同源点击直接触发下载。
+const API_PATH_RE = /\/api\/[A-Za-z0-9._/-]+/g
+
+function autolinkApiPaths(root) {
+  const skip = new Set(['A', 'CODE', 'PRE'])
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.includes('/api/')) return NodeFilter.FILTER_REJECT
+      const p = node.parentElement
+      if (p && (skip.has(p.tagName) || skip.has(p.parentElement?.tagName || ''))) return NodeFilter.FILTER_REJECT
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  const targets = []
+  while (walker.nextNode()) targets.push(walker.currentNode)
+  for (const textNode of targets) {
+    const text = textNode.nodeValue
+    const frag = document.createDocumentFragment()
+    let last = 0
+    API_PATH_RE.lastIndex = 0
+    let m
+    while ((m = API_PATH_RE.exec(text))) {
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)))
+      const a = document.createElement('a')
+      a.href = m[0]
+      a.textContent = m[0]
+      frag.appendChild(a)
+      last = m.index + m[0].length
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
+    textNode.parentNode.replaceChild(frag, textNode)
+  }
+}
+
+// 净化后加工: 给代码块挂深色样式类并追加复制按钮; 并把裸 /api/ 下载路径自动链接化
+// (v-html 场景下只能在这里动 DOM)
 function postProcess(root) {
   for (const pre of Array.from(root.querySelectorAll('pre'))) {
     pre.classList.add('md-pre')
@@ -21,6 +58,7 @@ function postProcess(root) {
     btn.textContent = '复制'
     pre.appendChild(btn)
   }
+  autolinkApiPaths(root)
 }
 
 const html = computed(() => {

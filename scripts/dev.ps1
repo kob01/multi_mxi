@@ -6,7 +6,8 @@
     拓扑约定(详见 README「本地开发」与 CONFIG_RULES.md 第 5 条):
       - 宿主机只跑两个前台进程: uvicorn(网关, 热重载) 与 vite dev(前端页面)。
       - 其余依赖全部对接 docker compose: postgres / elasticsearch / redis / neo4j /
-        mongo / tei-rerank / mineru / hr-mcp / finance-mcp / hr-agent / finance-agent。
+        mongo / tei-rerank / mineru / hr-mcp / finance-mcp / analytics-mcp /
+        procurement-mcp / hr-agent / finance-agent / analyst-agent / contract-agent。
       - 唯一非 docker 依赖是宿主机的 Ollama(:11434)。
 
     为什么不直接跑 `docker compose up -d`: assistant 也在里面的话, 宿主网关与它抢同一个

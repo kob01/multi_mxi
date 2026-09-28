@@ -29,7 +29,7 @@ class IntentType(str, Enum):
     """Top-level intent categories produced by the intent recognizer."""
 
     KNOWLEDGE_QA = "knowledge_qa"      # simple query -> RAG answer
-    TOOL_CALL = "tool_call"            # complex operation -> MCP tool
+    TOOL_CALL = "tool_call"            # complex operation -> MCP tool / 能力域进程内工具
     AGENT_DELEGATE = "agent_delegate"  # professional task -> A2A agent
     CHITCHAT = "chitchat"              # small talk -> direct LLM answer
 
@@ -76,6 +76,8 @@ class ChatResponse(BaseModel):
     # 会话记录落库后的助手消息 id(供前端历史对齐; DB 降级时为 None)
     message_id: Optional[int] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # 结构化交付物(名称/URL/标题); office 文档下载目前走 answer 里的链接, 此字段预留给前端快捷按钮
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class KnowledgeChunk(BaseModel):

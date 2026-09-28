@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 # 内网统一东八区(与 graph.py 的时钟口径一致): 产物文件名里的日期要给中国人看。
 _CST = timezone(timedelta(hours=8))
 
-# 允许的文件扩展名 -> 落盘编码。白名单而不是通配: 产物只有这两类文本文件。
-_EXT_KIND = {".svg": "chart", ".md": "report", ".csv": "table"}
+# 允许的文件扩展名 -> 台账 kind。白名单而不是通配: 产物只有这几类。
+# (.png 是分析图表给 office 文档内嵌用的位图; SVG 已不再服务于网页工坊。)
+_EXT_KIND = {".svg": "chart", ".md": "report", ".csv": "table", ".png": "chart"}
 
 # 文件名硬约束: 只允许本模块生成的字符集, 挡掉 ../ 与绝对路径等一切穿越写法。
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -106,6 +107,36 @@ def write_text(name: str, content: str, *, created_by: str = "", title: str = ""
         "url": artifact_url(name),
         "kind": _EXT_KIND[suffix],
         "bytes": path.stat().st_size,
+    }
+    if not ledger_ok:
+        payload["ledger"] = False
+    return payload
+
+
+def write_bytes(
+    name: str, data: bytes, *, created_by: str = "", title: str = "", params: dict | None = None
+) -> dict[str, Any]:
+    """写一份二进制产物(如图表 PNG)并登记台账; 与 :func:`write_text` 同构。
+
+    同一套命名/白名单/穿越校验: 只允许可知扩展名、只落 report_dir; 台账写失败不挡产物。
+    """
+    if not is_safe_name(name):
+        return {"error": f"非法产物文件名: {name}"}
+    suffix = Path(name).suffix.lower()
+    if suffix not in _EXT_KIND:
+        return {"error": f"不支持的产物类型: {suffix or '(无扩展名)'}"}
+    try:
+        path = reports_dir() / name
+        path.write_bytes(data)
+    except OSError as exc:
+        logger.warning("write artifact %s failed: %s", name, exc)
+        return {"error": f"产物写入失败: {exc.__class__.__name__}"}
+    ledger_ok = _register_ledger(
+        name=name, kind=_EXT_KIND[suffix], title=title or name,
+        created_by=created_by, params=params, size=path.stat().st_size,
+    )
+    payload: dict[str, Any] = {
+        "name": name, "url": artifact_url(name), "kind": _EXT_KIND[suffix], "bytes": path.stat().st_size,
     }
     if not ledger_ok:
         payload["ledger"] = False

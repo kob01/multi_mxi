@@ -548,6 +548,9 @@ class ChatMessage(Base):
     target: Mapped[str] = mapped_column(String(64), default="")
     intent: Mapped[str] = mapped_column(String(32), default="")
     docs_meta: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 参考来源
+    # docgen 路由的创作产物 [{name, url, title}]; 与 docs_meta 分开是因为两者前端用途不同
+    # (一个是引用条, 一个是"查看文档/去加工"按钮), 合在一起会让渲染逻辑靠 type 猜测。
+    artifacts: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )

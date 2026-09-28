@@ -98,6 +98,10 @@ _BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
         "source": "VARCHAR(32) NOT NULL DEFAULT 'turn'",
         "occurred_at": "TIMESTAMPTZ",
     },
+    "chat_messages": {
+        # docgen 创作产物 [{name,url,title}]: 可空 —— 历史轮次本来就没有产物。
+        "artifacts": "JSON",
+    },
 }
 
 # 已存在表的新增索引同理: create_all 跳过已存在的表, 表上的新索引也不会建。

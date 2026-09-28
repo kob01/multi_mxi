@@ -143,7 +143,7 @@ function pushWelcome() {
     variant: 'filled',
     shape: 'corner',
     content:
-      '你好，我是企业智能助手马小i。可以问我制度政策（如"年假有几天"），也可以直接说"我要报销""帮我开在职证明"；管理角色还能让我"生成本周经营周报""帮我审一下这份合同"。',
+      '你好，我是企业智能助手马小i。可以问我制度政策（如"年假有几天"），也可以直接说"我要报销""帮我开在职证明"；管理角色还能让我"生成本周经营周报""帮我审一下这份合同"。说"把这份数据导出成 Word/Excel/PDF"，我会生成可下载的文件。',
     headerTag: { text: '马小i', type: 'info' },
   })
 }
@@ -296,7 +296,11 @@ function historyToMessage(m) {
         thinkingOpen: false,
         headerTag: { text: '马小i', type: 'info' },
       }
-  if (m.role !== 'user') applyRouteTag(base, { route: m.route, target: m.target, metadata: { docs: m.docs_meta || [] } })
+  if (m.role !== 'user') {
+    applyRouteTag(base, {
+      route: m.route, target: m.target, metadata: { docs: m.docs_meta || [] }, artifacts: m.artifacts || [],
+    })
+  }
   return base
 }
 
@@ -379,7 +383,11 @@ async function handleSubmit() {
   const text = (senderRef.value?.getModelValue()?.text || '').trim()
   if (!text) return
   senderRef.value?.clear()
+  await sendText(text)
+}
 
+// 正文发送(对话页与"从工坊带一需求回来"共用同一条链路)
+async function sendText(text) {
   pushMessage({ role: 'user', placement: 'end', variant: 'outlined', shape: 'corner', content: text })
   sending.value = true
   const msg = makeAiPending()
