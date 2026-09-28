@@ -136,9 +136,17 @@ async function onRootClick(e) {
   line-height: 1.4;
 }
 
-.md-body :deep(h1) { font-size: 1.25em; }
-.md-body :deep(h2) { font-size: 1.15em; }
-.md-body :deep(h3) { font-size: 1.05em; }
+.md-body :deep(h1) {
+  font-size: 1.25em;
+}
+
+.md-body :deep(h2) {
+  font-size: 1.15em;
+}
+
+.md-body :deep(h3) {
+  font-size: 1.05em;
+}
 
 /* 表格: 有边框 + 表头底色, 宽度超出时横向滚动 */
 .md-body :deep(table) {

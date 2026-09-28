@@ -10,13 +10,13 @@
 
 ## 需要创建的文件
 
-| 文件 | 用途 | 读取方 |
-| --- | --- | --- |
-| `pg_password.txt` | PostgreSQL 口令（compose 的 postgres 初始化 + 应用连接） | postgres / assistant / *-mcp / *-agent |
-| `deepseek_api_key.txt` | DeepSeek 在线 API Key | assistant / *-agent |
-| `langsmith_api_key.txt` | LangSmith Key（仅开发机启用 tracing 时需要） | assistant（容器侧 tracing 恒为 false） |
-| `tavily_api_key.txt` | Tavily 检索 Key（可选：启用 Tavily provider 时才需要；默认 ddgs 免密） | assistant（app/tools/web.py 的 search_web） |
-| `serper_api_key.txt` | Serper(Google) 检索 Key（可选：启用 Serper provider 时才需要） | assistant（同上） |
+| 文件                    | 用途                                                                   | 读取方                                      |
+| ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
+| `pg_password.txt`       | PostgreSQL 口令（compose 的 postgres 初始化 + 应用连接）               | postgres / assistant / _-mcp / _-agent      |
+| `deepseek_api_key.txt`  | DeepSeek 在线 API Key                                                  | assistant / \*-agent                        |
+| `langsmith_api_key.txt` | LangSmith Key（仅开发机启用 tracing 时需要）                           | assistant（容器侧 tracing 恒为 false）      |
+| `tavily_api_key.txt`    | Tavily 检索 Key（可选：启用 Tavily provider 时才需要；默认 ddgs 免密） | assistant（app/tools/web.py 的 search_web） |
+| `serper_api_key.txt`    | Serper(Google) 检索 Key（可选：启用 Serper provider 时才需要）         | assistant（同上）                           |
 
 文件内容 = 单行裸值，无引号、无 `KEY=` 前缀、行尾不要有多余空格（读取时会 `strip()`）。
 

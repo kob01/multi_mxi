@@ -315,15 +315,15 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 
 > **宿主发布端口对照(当前实测)**:
 >
-> | 服务                                                                                                                | 宿主端口                                                                                     | 容器内监听           | 说明                             |
-> | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------- | ------------------------------ |
-> | assistant                                                                                                         | `18000`                                                                                  | `8000`          | Web 聊天 / API / 文档管理            |
-> | hr-mcp / finance-mcp                                                                                              | `18001` / `18002`                                                                        | `8001` / `8002` | MCP 服务                         |
-> | analytics-mcp / procurement-mcp                                                                                   | `18005` / `18006`                                                                        | `8005` / `8006` | 数据洞察 / 采购合同 MCP                |
-> | neo4j HTTP                                                                                                        | `17474`                                                                                  | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要) |
-> | neo4j Bolt                                                                                                        | `17687`                                                                                  | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需)    |
-> | tei-rerank                                                                                                        | `8080`                                                                                   | `8080`          | 重排服务 `/rerank`与`/health`       |
-> | postgres / ES / Redis / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `6379` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左              | 未抬, 保持原值                       |
+> | 服务                                                                                               | 宿主端口                                                                        | 容器内监听      | 说明                                          |
+> | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------- | --------------------------------------------- |
+> | assistant                                                                                          | `18000`                                                                         | `8000`          | Web 聊天 / API / 文档管理                     |
+> | hr-mcp / finance-mcp                                                                               | `18001` / `18002`                                                               | `8001` / `8002` | MCP 服务                                      |
+> | analytics-mcp / procurement-mcp                                                                    | `18005` / `18006`                                                               | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
+> | neo4j HTTP                                                                                         | `17474`                                                                         | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
+> | neo4j Bolt                                                                                         | `17687`                                                                         | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
+> | tei-rerank                                                                                         | `8080`                                                                          | `8080`          | 重排服务 `/rerank`与`/health`                 |
+> | postgres / ES / Redis / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `6379` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左            | 未抬, 保持原值                                |
 >
 > 抬端口只动**宿主发布端口**, 容器内监听端口与 compose 网络内的服务名地址(`bolt://neo4j:7687` 等)
 > 一律不变, 所以容器间连通性不受影响; 受影响的是宿主直连 —— 宿主 `.env` 必须写发布端口。
@@ -443,11 +443,11 @@ tracing 默认关闭(`LANGSMITH_TRACING=false`, 代码默认值与容器侧配�
 1. `POST /api/chat` → Assistant 载入会话记忆(短期窗口 + 长期摘要);问题含相对时间时,
    先在进程内取平台当前时间并注入后续 Prompt
 2. `deepseek-flash` 意图识别 → `agent_delegate / finance`
-3. 权限校验(角色白名单)→ A2A Client 拉取 Finance\_Agent 的 Agent Card 并 `message/send`
-4. Finance\_Agent(LangGraph ReAct + deepseek-flash)追问/补齐要素后,经 MCP 调用
+3. 权限校验(角色白名单)→ A2A Client 拉取 Finance_Agent 的 Agent Card 并 `message/send`
+4. Finance_Agent(LangGraph ReAct + deepseek-flash)追问/补齐要素后,经 MCP 调用
    `create_reimbursement` 创建报销单
 5. 单号/审批节点沿 A2A 返回 → Assistant 回复用户;全程写 `logs/audit.jsonl`
-   (同一 trace\_id),敏感字段(金额/证件号/手机号)脱敏。
+   (同一 trace_id),敏感字段(金额/证件号/手机号)脱敏。
 
 K8s 部署:将 `docker/docker-compose.yml` 中 5 个服务各映射为 Deployment+Service
 (compose 可用 `kompose convert` 直接转换),Ollama 建议独立部署为推理服务,
