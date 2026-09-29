@@ -22,6 +22,7 @@ confident, sink to the next one". Every result is tagged with ``layer`` so the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -193,6 +194,10 @@ class IntentRecognizer:
         # (intent, target) -> list of normalized seed vectors (built lazily once).
         self._seed_index: dict[tuple[IntentType, str | None], list[list[float]]] | None = None
         self._embedding_ok = settings.intent_embedding_enabled
+        # 种子向量只建一次, 但首建必须单飞: 没有锁时冷启动的第一批并发(或网关重启
+        # 后的前 N 个请求)会各自发一次"全部种子文本"的 embedding 批量请求 —— 十几组
+        # 种子×六条话术就是十几遍重复的同一批计算, 直接把 Ollama 压到报错。
+        self._seeds_lock: asyncio.Lock | None = None
 
     # ---------------- 第一层: 规则快筛 ----------------
 
@@ -213,18 +218,24 @@ class IntentRecognizer:
     # ---------------- 第二层: bge-m3 语义分类 ----------------
 
     async def _ensure_seeds(self) -> None:
-        """Build + cache normalized seed vectors once (best-effort)."""
+        """Build + cache normalized seed vectors once (best-effort, single-flight)."""
         if self._seed_index is not None or not self._embedding_ok:
             return
-        labels = list(_SEEDS.keys())
-        flat = [text for key in labels for text in _SEEDS[key]]
-        label_of = [key for key in labels for _ in _SEEDS[key]]
-        vectors = await self._embedder.embed(flat)
-        index: dict[tuple[IntentType, str | None], list[list[float]]] = {}
-        for key, vec in zip(label_of, vectors):
-            index.setdefault(key, []).append(_l2_normalize(vec))
-        self._seed_index = index
-        logger.info("intent seed index built: %d groups, %d vectors", len(index), len(flat))
+        if self._seeds_lock is None:
+            self._seeds_lock = asyncio.Lock()
+        async with self._seeds_lock:
+            # 双检: 等锁期间另一个请求已经把种子嵌好了
+            if self._seed_index is not None or not self._embedding_ok:
+                return
+            labels = list(_SEEDS.keys())
+            flat = [text for key in labels for text in _SEEDS[key]]
+            label_of = [key for key in labels for _ in _SEEDS[key]]
+            vectors = await self._embedder.embed(flat)
+            index: dict[tuple[IntentType, str | None], list[list[float]]] = {}
+            for key, vec in zip(label_of, vectors):
+                index.setdefault(key, []).append(_l2_normalize(vec))
+            self._seed_index = index
+            logger.info("intent seed index built: %d groups, %d vectors", len(index), len(flat))
 
     def _semantic_classify_sync(self, query_vec: list[float]) -> IntentResult | None:
         """Score all intent groups against a query vector and apply the accept rule."""

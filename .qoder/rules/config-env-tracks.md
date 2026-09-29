@@ -38,8 +38,10 @@ glob:
 | `TEI_RERANK_URL`  | `http://tei-rerank:8080`                |
 | `REDIS_URL`       | `redis://redis:6379/0`                  |
 | `NEO4J_URI`       | `bolt://neo4j:7687`                     |
+| `LANGFUSE_BASE_URL` | `http://langfuse-web:3000`（compose 锁死，**不写 docker/.env**） |
 
 - 容器里的 `localhost` 指向容器自身，未映射端口时必定连接失败；Mongo 侧表现为写正文时 `ServerSelectionTimeoutError`。
+- `LANGFUSE_BASE_URL` 指向本 compose 内 `profile=langfuse` 的自建可观测栈（默认不启动）；该栈不起时 trace 上报会失败但**不影响对话**（`app/tracing.py` 逐层 try/except）。它与 `LANGFUSE_ENABLED` 不同：地址是红线，开关可调。
 - `OLLAMA_BASE_URL` 是唯一例外：Ollama 不在 compose 内、只跑在宿主机，所以走 `host.docker.internal` 而不是服务名。
 - 宿主机本地开发才用 `localhost`，且写在宿主 `.env` 里，不是这份。
 - 元数据/向量层已是 PostgreSQL，不要指回任何 MySQL 地址（旧的 `47.116.208.170:3306` 云主机已下线）。
@@ -79,6 +81,10 @@ neo4j:         ports: ["${NEO4J_HTTP_HOST_PORT:-17474}:7474", "${NEO4J_BOLT_HOST
 - `Settings` 里的口令/API Key 字段必须带 `Field(repr=False)`，否则 `repr(settings)` 会把密码写进启动日志与异常栈。
 - 宿主机直跑依赖 `config.py` 的 `_SECRET_HOST_FALLBACK` 回退读 `docker/secrets/*.txt`；新增密钥字段要同步补 `_SECRET_FILES` 与 `_SECRET_HOST_FALLBACK` 两张表，不要改成硬编码或写进 dotenv。
 - 容器侧 `LANGSMITH_TRACING` 恒为 `false`（代码默认值也是 `false`），避免对话内容上传云端。
+- Langfuse 不同：它是 `profile=langfuse` 的**自建**栈，trace 不出容器网络，所以容器侧
+  允许 `LANGFUSE_ENABLED=true`（仍默认关）。但项目密钥 `LANGFUSE_API_KEY`（单文件两行
+  sk/pk）依旧只住 `docker/secrets/langfuse_api_key.txt`，dotenv 里留空；不用时该 secret
+  文件可以是**空文件**（compose 要求它存在，空值等同未配置 → 自动降级为不上报）。
 
 ### 三道拦截链（改任一环都要回归）
 
@@ -86,15 +92,27 @@ neo4j:         ports: ["${NEO4J_HTTP_HOST_PORT:-17474}:7474", "${NEO4J_BOLT_HOST
 2. **打包侧**：`uv run python -m scripts.package`（只跑前置校验用 `--check-only`）先做**源侧审计**——本机 `.env`/`docker/.env` 出现明文密钥即中止打包；再做**产物扫描**——正则命中且不在白名单则**删除该文件并中止**。复制阶段黑名单含 `.env`、`.env.local`、`docker/.env`、`data/.env`、`docker/secrets/*.txt`（该目录只有 `SECRETS_KEEP` 列出的 `README.md` 能进包）。
 3. **镜像侧**：`.dockerignore` 保证密钥连 build context 都不进——`docker build` 会把整个 context 传给 daemon，命中文件即使没被 `COPY` 进镜像也已离开本机权限边界；生产镜像里的密钥只能来自运行时 `/run/secrets`。
 
-## 6. 开发拓扑
+## 6. 开发拓扑（容器 = 唯一验证环境，2026-09 起）
 
 ```powershell
-./scripts/dev.ps1                              # 起 compose 依赖 + 自检 + 拉起网关(:18000) 与 vite dev(:5173)
-./scripts/dev.ps1 -Build                       # 改过 mcp_servers/agents 后重建镜像
-uv run python -m scripts.dev_services check    # 只看对接结果
+./scripts/dev.ps1                              # 起 docker 全栈(含 assistant 容器网关) + 自检 + vite dev(:5173)
+./scripts/dev.ps1 -Build                       # 改过 app/ 任何后端代码后必须重建镜像
+uv run python -m scripts.dev_services check --gateway   # 只看对接结果(含探容器网关 /api/health)
+uv run python -m scripts.dev_services env-check         # 容器轨防覆盖专项(无需 docker 在跑)
 ```
 
-compose 里已存在的服务（postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp / hr-agent / finance-agent）不得在宿主机重复起一份；宿主机只跑网关 + vite dev + Ollama。`dev_services up` 默认不起 assistant：宿主网关要 bind `ASSISTANT_PORT`（18000），与容器发布端口互斥。改过 `app/mcp_servers/`、`app/agents/` 后 docker 侧跑的是镜像快照，需 `-Build` 重建；不重建则请求被旧镜像接走，表现为“改了代码不生效”。
+compose 里的全部服务（**assistant** / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent / contract-agent）都只在容器内跑；宿主机只跑 vite dev + Ollama。**宿主直跑网关做验证已禁止**（展开正文见 `container-first-verification.md`），旧约定“宿主网关 bind ASSISTANT_PORT、assistant 不进 dev 主轨”已作废：`DEV_SERVICES` 默认含 assistant，不得为让端口而 `compose stop assistant`。改过 `app/` 后 docker 侧跑的是镜像快照，不重建则请求被旧镜像接走，表现为“改了代码不生效”。
+
+## 7. 容器轨防覆盖：红线键在 compose 里是字面量
+
+历史上 `environment:` 写成 `ES_URL: ${ES_URL:-http://elasticsearch:9200}` 时，docker/.env 这个插值源、部署 shell 里残留的同名 export、直接 `docker compose up` 前的环境变量，都能悄悄改掉容器地址，后果仍是静默降级。现已收敛为：
+
+- **红线键（地址/卷路径/tracing/容器内监听端口）在 compose `environment:` 里只允许字面量**：`ES_URL`、`TEI_RERANK_URL`、`MONGO_URL`、`OLLAMA_BASE_URL`、`DEEPSEEK_BASE_URL`、`UPLOAD_DIR`、`KNOWLEDGE_DIR`、`REPORT_DIR`、`AUDIT_LOG_PATH`、`ASSISTANT_PORT`、`PG_HOST`、`PG_SSLMODE`、各 `*_MCP_URL`/`*_AGENT_URL`、`LANGSMITH_TRACING`、`LANGFUSE_BASE_URL` 等（完整名单以
+   `dev_services.py::COMPOSE_REDLINE_KEYS` 为准）。改这些键 = 改 compose 本身，
+   dotenv 覆盖不动它们。
+- **跨部署真可调的键仍允许 `${VAR:-服务名默认}` 插值**：`PG_PORT/PG_USER/PG_DATABASE`、`REDIS_URL`、`NEO4J_URI`、`ES_INDEX`、`DOC_KG_ENABLED`、`MINERU_*`、`EMBEDDING_DIM`、`LLM_MODEL/INTENT_MODEL`、各 `*_IMAGE`/`*_HOST_PORT`（这些默认值都是容器视角，被覆盖不会引入宿主串味）。
+- **三道守护**：① `dev_services env-check` 扫 compose 源，红线键行含 `${` 或键从 compose 消失即 FAIL；② docker/.env 地址键出现 `localhost` 也 FAIL；③ 双轨同名业务参数漂移与 docker/.env ↔ `.env.example` 缺键各出一条 WARN（新增只落单侧的调参键 = 容器退代码默认值，两侧结论不可互相复现）。
+- 真实环境变量仍优先于代码默认值（对不在 env_file 里的宿主脚本依然生效），所以**宿主跑脚本前不要 export 同名地址变量**，结论存疑时先跑 env-check + check。
 
 ## 自检
 
@@ -107,9 +125,9 @@ uv run python -m scripts.dev_services check
 按症状定向：
 
 - **Ollama 连接类报错 / embedding 超时无日志** → 先核对 §2 的 `OLLAMA_BASE_URL` 是否被改成 `localhost` 或被删。
-- **某层静默降级（rerank/记忆/BM25 无候选且无异常）** → §1。
+- **某层静默降级（rerank/记忆/BM25 无候选且无异常）** → §1；若容器内地址被人从 dotenv 改飘了 → §7 跑 `env-check`。
 - **写正文报 `ServerSelectionTimeoutError`** → §2 的 `MONGO_URL`。
 - **部分服务起不来、无应用日志** → §4 跑 `netsh` 查排除段。
-- **改了不生效** → §6 重建镜像。
+- **改了不生效** → §6 重建镜像（含 assistant 自身，不再靠宿主热重载）。
 
 `NORMALIZER_VERSION` 的升降规则见 `.qoder/rules/doc-normalizer-version.md`；A2A 地址覆盖见 `.qoder/rules/a2a-endpoint.md`。

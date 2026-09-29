@@ -12,7 +12,9 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -87,14 +89,45 @@ def _log_dependency_endpoints() -> None:
     )
 
 
+def _configure_thread_pools() -> None:
+    """抬两个默认线程池的上限(不抬就是百人并发下最先生效的全局串行点)。
+
+    为什么必要: 本项目把大量同步活卸载到线程 —— ``asyncio.to_thread`` 走事件循环的
+    默认 executor(上限 ``min(32, cpu+4)``, 四核机器就是 8 个), Starlette 的同步接口与
+    ``FileResponse`` 走 anyio limiter(默认 40)。docgen builder/文档解析/PIL/同步 DB 工具
+    共抢前者, 下载路由共抢后者; 任一池满了, 后来者只能排队而事件循环依旧看似健康。
+
+    上限来自 ``THREAD_POOL_TOKENS``, 与 PG 连接池/下游服务上限同量级取一个保守值;
+    两个池都只在启动设一次(运行中改会影响已在跑的任务), 所以放在 lifespan 开头。
+    """
+    tokens = max(16, int(get_settings().thread_pool_tokens))
+    loop = asyncio.get_running_loop()
+    # asyncio.to_thread: 默认 executor 只能在第一次使用前替换(本函数在 lifespan 最开头
+    # 跑, 此时默认池尚未被创建; 已创建的池不去 shutdown, 免得丢掉已在跑的卸载任务)
+    if getattr(loop, "_default_executor", None) is None:
+        loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=tokens, thread_name_prefix="mxi-blocking")
+        )
+    try:
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = tokens
+    except Exception as exc:  # noqa: BLE001 - 抬不动也只是回到默认值, 不阻断启动
+        logger.warning("anyio 线程池上限设置失败(保持默认 40): %s", exc)
+    logger.info("线程池上限: asyncio/anyio 各 %d", tokens)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Init PostgreSQL schema at startup (getpass password prompt happens here)."""
-    from app.tracing import init_tracing
+    from app.tracing import init_langfuse, init_tracing
 
+    _configure_thread_pools()
     _log_dependency_endpoints()
     if init_tracing():
         logger.info("LangSmith tracing active for this gateway process")
+    if init_langfuse():
+        logger.info("Langfuse tracing active for this gateway process")
     try:
         from app.db.session import init_schema
 
@@ -123,6 +156,11 @@ async def lifespan(app: FastAPI):
     from app.assistant.graph import get_orchestrator
     from app.cache.redis_client import close_redis
     from app.memory.graph_store import close_driver
+    from app.security.audit import get_audit_logger
+
+    # 写线程在启动时就拉起来(而不是第一条审计到达时): 否则启动初期那些关键
+    # 留痕会落在一个刚创建的线程上, 并且难区分"没日志"与"日志在内存里"。
+    get_audit_logger()
 
     orchestrator = get_orchestrator()
     try:
@@ -155,15 +193,32 @@ async def lifespan(app: FastAPI):
             logger.error("文档知识图谱 schema 初始化失败, 图谱功能降级: %s", exc)
     yield
     from app.tools._http import close_web_client
+    from app.tracing import shutdown_langfuse
 
     await orchestrator.shutdown()
     await close_reranker_client()
     await close_web_client()
+    # 新增的几个进程级共享连接池必须在关停路径上放掉, 否则它们和 checkpointer
+    # 同命运: 进程退出时留一堆未关闭连接(容器重入时表现为满端口 TIME_WAIT)。
+    from app.assistant.a2a_client import close_a2a_pool
+    from app.docs.parsers import close_mineru_client
+    from app.rag.bm25 import close_es_client
+    from app.rag.embeddings import close_embedder_client
+    from app.security.audit import shutdown_audit
+
+    await close_a2a_pool()
+    await close_es_client()
+    await close_embedder_client()
+    await close_mineru_client()
     await close_redis()
     await close_driver()
     from app.bodies.client import close_mongo
 
     await close_mongo()
+    # 审计落盘改成后台批量写了, 关停不刷就会把最后一批留痕丢在内存里(合规问题)。
+    shutdown_audit()
+    # Langfuse 上报是批量异步队列: 关停前 flush, 否则最后几轮对话的 trace 丢在内存里。
+    shutdown_langfuse()
 
 
 def create_app() -> FastAPI:

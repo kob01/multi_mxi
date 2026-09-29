@@ -1,9 +1,9 @@
-"""进程内 web/docgen 工具整栈验证(需网关已运行, 计划"测试与验收"第 3/5/8 项的线上部分)。
+"""进程内 web/docgen 工具整栈验证(需**容器网关**已运行, 计划"测试与验收"第 3/5/8 项的线上部分)。
 
 跑法::
 
-    uv run uvicorn app.main:app --port 18000 --reload   # 或容器化网关
-    uv run python -m scripts.test_tools_flow
+    ./scripts/dev.ps1 -Build        # 网关只允许跑在容器里(见 .qoder/rules/container-first-verification.md)
+    uv run python -m scripts.test_tools_flow   # 本脚本是宿主侧 HTTP 客户端, 打的是容器
 
 覆盖:
   1. "搜索/最新"类问题 -> tool_call/web -> search_web(有网出结果; 无网必须显式降级而非报错);

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from pathlib import Path
@@ -112,7 +113,11 @@ def _normalize_to_png(raw: bytes, dest: Path) -> tuple[bool, str]:
 
 
 async def _fetch_url_bytes(url: str) -> tuple[bytes | None, str]:
-    """按 SSRF 护栏抓取一张图: 逐跳校验 + content-type/体积限制。失败回 (None, note)。"""
+    """按 SSRF 护栏抓取一张图: 逐跳校验 + content-type/体积限制。失败回 (None, note)。
+
+    体积限制必须在流式读取里做: 先 ``client.get()`` 会把整张图(任意大小)先读进
+    内存再看字节数, 一个百 MB 的"图片"就是一个内存尖峰 —— 多人同时生成就集火。
+    """
     import httpx
 
     from app.security.url_guard import UrlBlocked, resolve_and_validate
@@ -125,22 +130,25 @@ async def _fetch_url_bytes(url: str) -> tuple[bytes | None, str]:
     try:
         for _hop in range(settings.web_fetch_max_redirects + 1):
             await resolve_and_validate(current)
-            resp = await client.get(current)
-            if resp.is_redirect:
-                location = resp.headers.get("location", "")
-                if not location:
-                    return None, f"重定向缺少目标地址(HTTP {resp.status_code})"
-                current = str(resp.next_request.url) if resp.next_request else location
-                continue
-            resp.raise_for_status()
-            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-            if ctype and not ctype.startswith(_IMAGE_CT_PREFIX):
-                return None, f"链接不是图片(content-type={ctype})"
-            body = resp.content
-            if len(body) > limit:
-                return None, f"图片超过上限 {limit // 1024}KB"
+            async with client.stream("GET", current) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        return None, f"重定向缺少目标地址(HTTP {resp.status_code})"
+                    current = str(resp.next_request.url) if resp.next_request else location
+                    continue
+                resp.raise_for_status()
+                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if ctype and not ctype.startswith(_IMAGE_CT_PREFIX):
+                    return None, f"链接不是图片(content-type={ctype})"
+                body: bytearray = bytearray()
+                async for piece in resp.aiter_bytes():
+                    body.extend(piece)
+                    # 越界即断流: 不给大文件把内存顶到的机会(而不是读完了再判)。
+                    if len(body) > limit:
+                        return None, f"图片超过上限 {limit // 1024}KB"
             await resolve_and_validate(str(resp.url) or current)  # 落地后对 final URL 复核
-            return body, ""
+            return bytes(body), ""
         return None, f"重定向次数超过上限({settings.web_fetch_max_redirects})"
     except UrlBlocked as exc:
         return None, f"图片链接被安全护栏拒绝: {exc.reason}"
@@ -213,13 +221,15 @@ async def resolve_images(spec_images: Any, dest_dir: Path) -> tuple[list[dict[st
                 warnings.append(f"本地图片超过上限: {src[:80]}")
                 continue
             try:
-                raw = local.read_bytes()
+                raw = await asyncio.to_thread(local.read_bytes)
             except OSError as exc:
                 warnings.append(f"本地图片读取失败: {exc.__class__.__name__}")
                 continue
 
         out = dest_dir / f"img_{idx + 1}.png"
-        ok, note = _normalize_to_png(raw, out)
+        # PIL 解码/降采样/写 PNG 是纯 CPU(一张大图可到百毫秒级), 必须卸载出事件
+        # 循环: 否则共进程所有人的流式回复都在这张图上被卡住。
+        ok, note = await asyncio.to_thread(_normalize_to_png, raw, out)
         if not ok:
             warnings.append(f"图片归一化失败({src[:60]}): {note}")
             continue

@@ -89,14 +89,20 @@ async def clear_memory_bucket(bucket: str, user_id: str, operator: str = "") -> 
 
 @router.post("/reflect")
 async def reflect_memories(user_id: str, operator: str = "") -> dict:
-    """手动触发一次情节蒸馏(前端"整理记忆"按钮); force 跳过门槛判定。"""
+    """手动整理记忆(前端"整理记忆"按钮): 情节蒸馏 + 偏好/习惯语义归并。
+
+    force 跳过蒸馏门槛; 归并专门清理"同一件事不同说法"累积出的重复偏好行。
+    """
     _require_self(user_id, operator)
     if not db_available():
         raise HTTPException(status_code=502, detail="数据库不可用, 无法整理记忆")
     trace_id = new_trace_id()
-    added = await get_personal_agent().reflect(user_id, force=True)
+    result = await get_personal_agent().tidy(user_id)
     get_audit_logger().log(
         trace_id, "memory", "memory_reflected",
-        {"user_id": user_id, "operator": operator or user_id, "knowledge_added": added},
+        {
+            "user_id": user_id, "operator": operator or user_id,
+            "knowledge_added": result["knowledge_added"], "merged": result["merged"],
+        },
     )
-    return {"status": "ok", "knowledge_added": added}
+    return {"status": "ok", **result}

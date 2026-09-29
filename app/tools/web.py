@@ -8,9 +8,9 @@
 两条工具都遵守同一个契约: **永不抛未捕获异常**。任何失败都返回 ``{error, ...}``
 载荷交给 ReAct 循环自行降级 —— 一次抓取失败不该让整轮对话失败。
 
-缓存: ``search_web`` 命中只读前缀白名单(``search_``), 被 ``wrap_tools_for_cache``
-自动包 Redis(TTL 按 server 取 ``web_search_cache_ttl``); ``fetch_url`` 与写操作
-同理不缓存(网页正文波动大, 缓存有害无益)。
+缓存: 只有 ``search_web`` 命中只读前缀白名单(``search_``), 被 ``wrap_tools_for_cache``
+自动包 Redis(TTL 按 server 取 ``web_search_cache_ttl``); ``fetch_url`` 不在只读前缀名单里
+(前缀是 ``fetch_``, 不匹配), 因此同样不被包装 —— 网页正文波动大, 缓存有害无益。
 """
 
 from __future__ import annotations
@@ -260,33 +260,42 @@ async def fetch_url(url: str, max_chars: int = 0) -> dict[str, Any]:
     try:
         for _hop in range(settings.web_fetch_max_redirects + 1):
             await resolve_and_validate(current)  # 每一跳都重新过 SSRF 护栏(含重定向目标)
-            resp = await client.get(current)
-            if resp.is_redirect:
-                location = resp.headers.get("location", "")
-                if not location:
-                    return {"error": f"重定向缺少目标地址(HTTP {resp.status_code})", "url": url}
-                current = str(resp.next_request.url) if resp.next_request else location
-                continue
-            resp.raise_for_status()
-            final_url = str(resp.url)
-            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-            if ctype and ctype not in _ALLOWED_CONTENT_TYPES:
-                return {"error": f"不支持的内容类型: {ctype}(仅文本类网页)", "url": url, "final_url": final_url}
-            # 流式限量: 超过 web_fetch_max_bytes 立即断, 不给恶意大文件烧内存的机会。
-            chunks: list[bytes] = []
-            received = 0
-            truncated = False
-            async for piece in resp.aiter_bytes():
-                chunks.append(piece)
-                received += len(piece)
-                if received >= settings.web_fetch_max_bytes:
-                    truncated = True
-                    break
+            # 先拿头再决定要不要读体: 重定向与二进制类型都在读之前就能掉转头。
+            # (用 client.stream 而不是 client.get: 后者会把整个响应体先读进内存,
+            #  一个几百 MB 的页面就能把网关顶爆 —— 限量必须在读到一半时能断。)
+            async with client.stream("GET", current) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        return {"error": f"重定向缺少目标地址(HTTP {resp.status_code})", "url": url}
+                    current = str(resp.next_request.url) if resp.next_request else location
+                    continue
+                resp.raise_for_status()
+                final_url = str(resp.url)
+                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if ctype and ctype not in _ALLOWED_CONTENT_TYPES:
+                    return {
+                        "error": f"不支持的内容类型: {ctype}(仅文本类网页)",
+                        "url": url,
+                        "final_url": final_url,
+                    }
+                # 流式限量: 超过 web_fetch_max_bytes 立即断, 不给恶意大文件烧内存的机会。
+                chunks: list[bytes] = []
+                received = 0
+                truncated = False
+                async for piece in resp.aiter_bytes():
+                    chunks.append(piece)
+                    received += len(piece)
+                    if received >= settings.web_fetch_max_bytes:
+                        truncated = True
+                        break
             raw = b"".join(chunks)
             charset = resp.charset_encoding or "utf-8"
             html = raw.decode(charset, errors="replace")
-            title, text = _extract_text(html)
-            text = _collapse_blank(text)
+            # 抽正文是纯 CPU(一个大 HTML 上解析可以到百毫秒级), 必须卸载出事件循环:
+            # 否则一张 2MB 页面就能把共进程所有人的流式回复卡住。
+            title, text = await asyncio.to_thread(_extract_text, html)
+            text = await asyncio.to_thread(_collapse_blank, text)
             if len(text) > limit:
                 text = text[:limit].rstrip() + "…"
                 truncated = True

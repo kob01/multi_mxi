@@ -2,7 +2,9 @@
 
 Reads the database password from the PG_PASSWORD environment variable (or the
 .env file loaded by pydantic-settings), ensures the pgvector extension exists,
-then creates the metadata + knowledge_chunks tables if missing.
+then creates every metadata table in ``Base.metadata`` if missing (业务表 +
+父子双表 doc_parents/doc_chunks + 记忆表 + 会话记录表; 旧单表 knowledge_chunks
+仍在 metadata 里供迁移脚本读写)。
 
 Usage:
     python -m scripts.init_db
@@ -37,7 +39,8 @@ async def main() -> None:
     await init_schema()
     print(f"[init_db] pgvector extension: {await _vector_version()}")
     print(
-        "[init_db] tables ready (documents / tags / document_tags / knowledge_chunks / hr_* / fin_*)"
+        "[init_db] tables ready (documents / tags / doc_parents / doc_chunks / "
+        "long_term_memories / user_profiles / chat_* / hr_* / fin_*; 旧 knowledge_chunks 仅供迁移)"
     )
 
 

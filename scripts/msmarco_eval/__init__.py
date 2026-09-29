@@ -8,8 +8,9 @@ the ranked lists with standard IR metrics (Recall/Precision/Hit/MRR/nDCG/MAP@k),
 then emitting a JSON + Markdown report.
 
 Isolation: the evaluation provisions a *separate* PostgreSQL database
-(``mxi_msmarco_eval``) and a *separate* Elasticsearch index, so the production
-``knowledge_chunks`` table and ``kb_chunks`` index are never touched.
+(``mxi_msmarco_eval``), a *separate* Elasticsearch index and a *separate*
+Mongo database, so the production ``doc_chunks``/``doc_parents`` tables,
+``kb_chunks`` index and body collections are never touched.
 
 Run with (from the repo root)::
 

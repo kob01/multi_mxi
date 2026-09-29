@@ -1,12 +1,13 @@
-"""生成物的落盘寻址、能力令牌与磁盘治理(Word/Excel/PPT/PDF 走这一套)。
+"""生成物的落盘寻址、能力令牌与磁盘治理(Word/Excel/PPT/PDF/Markdown/图片 走这一套)。
 
-与 ``store.py``(网页成品页, 走 report_artifacts 台账)刻意分开: office 生成物是
-"一次性交付物"——拿链接下载完就完, 不需要被"再找到", 因此不做台账、不做检索,
-只靠不可猜测的能力令牌(uuid4 hex) + 保留期清扫治理生命周期。两套共存但互不混淆:
-- 网页成品: ``report_dir/webdocgen-*.html``, 同源带 CSP 头下发, 台账可查;
+与 ``app/analytics/store.py``(报告台账)刻意分开: office 生成物是"一次性交付物" ——
+拿链接下载完就完, 不需要被"再找到", 因此不做台账、不做检索, 只靠不可猜测的能力令牌(uuid4 hex)
++ 保留期清扫治理生命周期。两套共存但互不混淆:
+- 分析产物: ``report_dir`` 里的图表 SVG/PNG / 周报 MD / CSV, 落 report_artifacts 台账,
+  走 /api/files/reports/{name} 回取("下次还能按人回查");
 - 文件生成: ``upload_dir/gen/<token>/<file>``, `/api/files/{token}/{file}` 下载, 到期即删。
 
-spec 解析也放这里: 四个 builder 的入参都是"JSON 字符串", 解析失败要有统一、可回给
+spec 解析也放这里: 各 builder 的入参都是"JSON 字符串", 解析失败要有统一、可回给
 模型重试的错误文案(计划 E2: 入参结构化 spec, docstring 写清字段)。
 """
 

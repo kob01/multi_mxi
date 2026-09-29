@@ -14,6 +14,7 @@ chunks. Supported types:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import re
@@ -29,6 +30,35 @@ logger = logging.getLogger(__name__)
 SUPPORTED_TEXT_EXT = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx"}
 SUPPORTED_VIDEO_EXT = (".srt", ".vtt", ".transcript.txt")
 SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# MinerU 客户端也进程级复用: 入库一篇扫描 PDF 会发 N 次 OCR(每页一次), 每次都新建
+# 客户端 = N 次握手 + N 个 TIME_WAIT; OCR 又是分钟级慢服务, 并发上限要卡住。
+_mineru_client: httpx.AsyncClient | None = None
+
+
+def _get_mineru_client() -> httpx.AsyncClient:
+    """Lazily build the process-wide MinerU client (bounded pool)."""
+    global _mineru_client
+    if _mineru_client is None or _mineru_client.is_closed:
+        s = get_settings()
+        _mineru_client = httpx.AsyncClient(
+            # 默认不设总超时: 单次 OCR 由调用点传 MINERU_TIMEOUT(分钟级),
+            # 而建连必须快失败(服务没起时不要把入队列挂在 TCP 上)。
+            timeout=httpx.Timeout(float(s.mineru_timeout), connect=10.0),
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        )
+    return _mineru_client
+
+
+async def close_mineru_client() -> None:
+    """释放 OCR 连接池(供 lifespan 关停调用, 与 close_web_client 同风格)。"""
+    global _mineru_client
+    if _mineru_client is not None and not _mineru_client.is_closed:
+        try:
+            await _mineru_client.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("closing mineru client failed: %s", exc)
+    _mineru_client = None
 
 
 @dataclass
@@ -114,6 +144,16 @@ def _page_image_pngs(page) -> list[bytes]:
     return out
 
 
+def _extract_page_payload(page) -> tuple[str, list[bytes]]:
+    """一页 PDF 的 CPU 部分: 取文本层 + 抽内嵌图为 PNG(一并交给线程)。
+
+    pypdf 的 extract_text/images 是纯 CPU 且无 GIL 释放, 整篇循环留在事件循环里
+    会按页数线性卡住共进程的所有对话; OCR 的等待仍然在循环外做(不进这一层)。
+    """
+    text = (page.extract_text() or "").strip()
+    return text, ([] if text else _page_image_pngs(page))
+
+
 async def _parse_pdf(path: Path) -> list[ParsedBlock]:
     """One block per page so chunks keep the real page number.
 
@@ -122,14 +162,14 @@ async def _parse_pdf(path: Path) -> list[ParsedBlock]:
     """
     from pypdf import PdfReader
 
-    reader = PdfReader(str(path))
+    reader = await asyncio.to_thread(PdfReader, str(path))
     blocks: list[ParsedBlock] = []
     ocr_exc: Exception | None = None
     for idx, page in enumerate(reader.pages, 1):
-        text = (page.extract_text() or "").strip()
-        if not text:
+        text, pngs = await asyncio.to_thread(_extract_page_payload, page)
+        if not text and pngs:
             ocr_parts: list[str] = []
-            for n, data in enumerate(_page_image_pngs(page), 1):
+            for n, data in enumerate(pngs, 1):
                 try:
                     ocr_parts.append(await _mineru_parse(f"page{idx}-{n}.png", data))
                 except Exception as exc:  # e.g. MinerU service unavailable
@@ -309,29 +349,33 @@ async def _mineru_parse(filename: str, data: bytes) -> str:
     """OCR one file with the MinerU service (mineru-api POST /file_parse).
 
     Returns the markdown text MinerU produced ("" when it recognised nothing).
+
+    客户端复用进程级共享池(见 _get_mineru_client): OCR 在入库路径上可能一次发
+    几十页, 每页新建客户端会把握手与 TIME_WAIT 乘上页数。
     """
     settings = get_settings()
     files = {"files": (filename, data)}
     form = {"backend": settings.mineru_backend, "return_md": "true", "lang_list": "ch"}
-    async with httpx.AsyncClient(timeout=float(settings.mineru_timeout)) as client:
-        try:
-            resp = await client.post(
-                f"{settings.mineru_base_url.rstrip('/')}/file_parse",
-                files=files,
-                data=form,
-            )
-            resp.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(
-                f"图片解析超时(MinerU backend={settings.mineru_backend}, 阈值 "
-                f"{settings.mineru_timeout}s): 模型加载较慢或图片过大, "
-                f"可在 .env 调大 MINERU_TIMEOUT 后重试"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"图片解析失败(MinerU 服务 {settings.mineru_base_url} 不可用, "
-                f"请确认已启动 mineru-api, 详见 README 的 MinerU 部署说明): {exc}"
-            ) from exc
+    client = _get_mineru_client()
+    try:
+        resp = await client.post(
+            f"{settings.mineru_base_url.rstrip('/')}/file_parse",
+            files=files,
+            data=form,
+            timeout=float(settings.mineru_timeout),
+        )
+        resp.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"图片解析超时(MinerU backend={settings.mineru_backend}, 阈值 "
+            f"{settings.mineru_timeout}s): 模型加载较慢或图片过大, "
+            f"可在 .env 调大 MINERU_TIMEOUT 后重试"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"图片解析失败(MinerU 服务 {settings.mineru_base_url} 不可用, "
+            f"请确认已启动 mineru-api, 详见 README 的 MinerU 部署说明): {exc}"
+        ) from exc
     # mineru-api 3.x 返回 {"results": {"<文件名去后缀>": {"md_content": ...}}},
     # 以 file_names 为准取第一份结果的 markdown。
     payload = resp.json()
@@ -358,27 +402,32 @@ async def _parse_image(path: Path) -> list[ParsedBlock]:
 
 
 async def parse_blocks(path: Path) -> tuple[str, list[ParsedBlock]]:
-    """Parse any supported file into (modality, section blocks)."""
+    """Parse any supported file into (modality, section blocks).
+
+    除 pdf/image 外的解析器都是同步库(python-docx / openpyxl / python-pptx)且很吃
+    CPU: 一个几十页的 pptx 能占住线程几十毫秒到秒级。它们必须走 ``asyncio.to_thread``,
+    否则一个入库请求就能把同一事件循环上所有人的流式回复卡住(入库与对话同进程)。
+    """
     modality = modality_of(path)
     name = path.name.lower()
     if modality == "video_transcript":
-        return modality, _parse_subtitle(path)
+        return modality, await asyncio.to_thread(_parse_subtitle, path)
     if modality == "image":
         return modality, await _parse_image(path)
 
     ext = path.suffix.lower()
     if name.endswith(".transcript.txt"):
-        return "video_transcript", _parse_subtitle(path)
+        return "video_transcript", await asyncio.to_thread(_parse_subtitle, path)
     if ext == ".txt":
-        return modality, _parse_txt(path)
+        return modality, await asyncio.to_thread(_parse_txt, path)
     if ext == ".md":
-        return modality, _parse_md(path)
+        return modality, await asyncio.to_thread(_parse_md, path)
     if ext == ".pdf":
         return modality, await _parse_pdf(path)
     if ext == ".docx":
-        return modality, _parse_docx(path)
+        return modality, await asyncio.to_thread(_parse_docx, path)
     if ext == ".pptx":
-        return modality, _parse_pptx(path)
+        return modality, await asyncio.to_thread(_parse_pptx, path)
     if ext == ".xlsx":
-        return modality, _parse_xlsx(path)
+        return modality, await asyncio.to_thread(_parse_xlsx, path)
     raise ValueError(f"Unsupported file type: {path.name}")

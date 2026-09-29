@@ -35,6 +35,22 @@ const identityItems = computed(() =>
   }))
 )
 
+// 波动类属性的历史值: 后端已按生效时间派生好当前值, 这里只展示被顶掉的旧观测。
+const profileHistory = computed(() =>
+  Object.entries(data.value.profile?.history || {})
+    .map(([key, entries]) => ({
+      key,
+      items: (Array.isArray(entries) ? entries : [entries])
+        .filter(Boolean)
+        .map((entry) => (typeof entry === 'string' ? { text: entry, valid: '', recorded: '' } : {
+          text: entry.value || '',
+          valid: entry.valid_at ? String(entry.valid_at).slice(0, 7) : '',
+          recorded: entry.recorded_at ? String(entry.recorded_at).slice(0, 10) : '',
+        })),
+    }))
+    .filter((item) => item.items.length)
+)
+
 function rowsOf(bucket) {
   return data.value.buckets?.[bucket] || []
 }
@@ -109,7 +125,12 @@ async function reflect() {
     )
     if (!resp.ok) throw new Error(String(resp.status))
     const result = await resp.json()
-    ElMessage.success(result.knowledge_added ? `新增 ${result.knowledge_added} 条经验` : '暂未提炼出新经验')
+    const added = result.knowledge_added || 0
+    const merged = result.merged || 0
+    const parts = []
+    if (added) parts.push(`新增 ${added} 条经验`)
+    if (merged) parts.push(`合并 ${merged} 条重复`)
+    ElMessage.success(parts.length ? parts.join(', ') : '记忆已是最新, 无需整理')
     await load()
   } catch {
     ElMessage.error('整理失败, 请检查服务状态')
@@ -159,7 +180,7 @@ onMounted(load)
       <el-button class="reflect-btn" type="primary" plain :icon="MagicStick" :loading="reflecting" @click="reflect">
         整理近期经历
       </el-button>
-      <p class="side-foot">整理会把近期经历提炼为可复用经验, 不会删除原始记忆。</p>
+      <p class="side-foot">整理会把近期经历提炼为可复用经验, 并合并偏好/习惯里的重复条目(语义相同的只留最完整的一条)。</p>
     </aside>
 
     <section class="memory-main">
@@ -169,7 +190,8 @@ onMounted(load)
           <div class="card-head">
             <div>
               <h3>用户画像</h3>
-              <p>身份、部门、技能等稳定属性, 每轮对话全量注入, 不做语义检索。</p>
+              <p>身份、部门、技能等属性, 每轮对话全量注入, 不做语义检索。会随时间变的值(体重/部门等)
+                按生效时间取当前值, 旧值只当历史保留。</p>
             </div>
             <el-button size="small" type="danger" plain @click="clearBucket('profile')">清空画像</el-button>
           </div>
@@ -182,6 +204,24 @@ onMounted(load)
               {{ item.text }}
             </el-descriptions-item>
           </el-descriptions>
+          <div v-if="profileHistory.length" class="profile-history">
+            <p class="history-tip">以下属性有过往值: 当前值按生效时间取最新, 旧值不会被一句历史陈述顶掉。</p>
+            <el-collapse>
+              <el-collapse-item
+                v-for="entry in profileHistory"
+                :key="entry.key"
+                :title="`${entry.key}：${entry.items.length} 条历史值`"
+              >
+                <ul class="history-list">
+                  <li v-for="(item, index) in entry.items" :key="index">
+                    <span>{{ item.text }}</span>
+                    <span v-if="item.valid" class="history-meta">生效 {{ item.valid }}</span>
+                    <span v-if="item.recorded" class="history-meta">记录于 {{ item.recorded }}</span>
+                  </li>
+                </ul>
+              </el-collapse-item>
+            </el-collapse>
+          </div>
         </div>
       </el-card>
 
@@ -210,6 +250,16 @@ onMounted(load)
               <el-table-column prop="src" label="主体" />
               <el-table-column prop="relation" label="关系" width="110" />
               <el-table-column prop="dst" label="客体" />
+              <el-table-column prop="state" label="状态" width="150">
+                <template #default="{ row }">
+                  <el-tag v-if="row.state === 'expired'" size="small" type="info" effect="plain">
+                    已失效{{ row.invalid_at ? ' · ' + row.invalid_at : '' }}
+                  </el-tag>
+                  <el-tag v-else size="small" type="success" effect="plain">
+                    当前{{ row.valid_at ? ' · ' + row.valid_at : '' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
             </el-table>
           </div>
         </div>
@@ -342,6 +392,31 @@ onMounted(load)
   font-size: 13px;
   line-height: 1.7;
   color: #606266;
+}
+
+.profile-history {
+  margin-top: 14px;
+}
+
+.history-tip {
+  margin: 0 0 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #909399;
+}
+
+.history-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.9;
+  color: #606266;
+}
+
+.history-meta {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #a8abb2;
 }
 
 .graph-body {

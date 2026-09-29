@@ -7,6 +7,20 @@ import DOMPurify from 'dompurify'
 // 与纯文本时代的视觉习惯一致, 避免模型输出的软换行被并成一段。
 marked.setOptions({ gfm: true, breaks: true })
 
+// marked v18 的 GFM 会把"单个 ~"也当删除线定界符, 于是 AI 常写的中文区间
+// (21~25℃ / 3~4 级 / 4~6℃) 被误配成 ~~..~~, 波浪号之间的文字划掉、~ 消失,
+// 显示成 2125℃。这里重写 del tokenizer: 仅识别标准双波浪号 ~~..~~, 单 ~ 交回
+// 默认按普通文本渲染。返回 undefined(非 false)才不会回退到内置单波浪号逻辑。
+marked.use({
+  tokenizer: {
+    del(src) {
+      const m = /^~~(?=\S)([\s\S]*?\S)~~/.exec(src)
+      if (!m) return
+      return { type: 'del', raw: m[0], tokens: this.lexer.inline(m[1]) }
+    },
+  },
+})
+
 const props = defineProps({
   content: { type: String, default: '' },
 })

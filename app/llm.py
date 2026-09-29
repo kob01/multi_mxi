@@ -1,17 +1,23 @@
 """Chat model factory.
 
-Routes to the DeepSeek online API (OpenAI-compatible) for model names
-starting with ``deepseek``, and to local Ollama otherwise. Callers only ask
-for a chat model by name/temperature and never care about the transport.
+Routes by the provider registry (``settings.resolve_llm_provider``): model names
+hitting a registered prefix (``deepseek*`` / ``glm*`` / ...) go to that vendor's
+OpenAI-compatible endpoint, everything else falls back to local Ollama.
+Callers only ask for a chat model by name/temperature and never care about
+the transport. Adding a new online vendor = one registry entry in config
+(``LLM_PROVIDERS_JSON``) + its base_url/secret fields, no code change here.
 
 深度思考 (thinking):
-    DeepSeek 侧经 ``extra_body={"thinking": {...}, "reasoning_effort": ...}``
-    控制; 思考内容在响应消息的 ``reasoning_content`` 字段里, 由
+    在线侧经 ``extra_body`` 控制, 参数形状由各供应商注册条目的
+    ``thinking_template``(enabled/disabled 两形态)提供, {effort} 占位符
+    替换为思考强度; 思考内容在响应消息的 ``reasoning_content`` 字段里, 由
     ``extract_reasoning`` 统一透出(OpenAI 兼容层与 Ollama 字段名不同)。
 """
 
 from __future__ import annotations
 
+import importlib
+import json
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -25,14 +31,38 @@ def is_deepseek(model: str) -> bool:
     return model.lower().startswith("deepseek")
 
 
-def _deepseek_extra_body(thinking: bool, settings) -> dict[str, Any]:
-    """DeepSeek 思考开关的 extra_body (关闭时不传 effort, 避免参数被拒)。"""
-    if not thinking:
-        return {"thinking": {"type": "disabled"}}
-    return {
-        "thinking": {"type": "enabled"},
-        "reasoning_effort": settings.llm_reasoning_effort,
+def _load_model_class(dotted: str):
+    """按 "包:类名" 延迟加载 langchain 集成类(避免启动期硬依赖全部包)。"""
+    pkg, _, cls = dotted.partition(":")
+    if not cls:
+        pkg, _, cls = "langchain_openai", "ChatOpenAI"
+    return getattr(importlib.import_module(pkg), cls)
+
+
+def _render_extra_body(thinking: bool, template: str, effort: str) -> dict[str, Any]:
+    """由注册表的 thinking_template 渲染思考开关 extra_body。
+
+    模板是 {"enabled": {...}, "disabled": {...}} 两形态的 JSON, 形态内的
+    {effort} 占位符替换为思考强度; 置空/非法/缺对应形态时不传 extra_body
+    (降级为服务端默认行为, 不报错), 模板写错不致于打断整条对话链路。
+    """
+    if not template:
+        return {}
+    try:
+        forms = json.loads(template)
+    except ValueError:
+        return {}
+    if not isinstance(forms, dict):
+        return {}
+    body = forms.get("enabled" if thinking else "disabled")
+    if not isinstance(body, dict):
+        return {}
+    rendered = {
+        k: (v.replace("{effort}", effort) if isinstance(v, str) else v)
+        for k, v in body.items()
     }
+    # effort 未配置(置空)时不传空串参数, 避免被供应商拒参
+    return {k: v for k, v in rendered.items() if v != ""}
 
 
 def get_chat_model(
@@ -52,30 +82,44 @@ def get_chat_model(
     name = model or settings.llm_model
     want_thinking = settings.llm_thinking_enabled if thinking is None else thinking
 
-    if is_deepseek(name):
-        # 用官方 DeepSeek 集成而非通用 ChatOpenAI: langchain-openai v1 不提取
-        # 非标准字段 reasoning_content(思考内容), ChatDeepSeek 会透传到
-        # additional_kwargs, 流式 chunk 为逐段增量。
-        from langchain_deepseek import ChatDeepSeek
-
-        if not settings.deepseek_api_key:
+    provider = settings.resolve_llm_provider(name)
+    if provider is not None:
+        prefix, cfg = provider
+        base_url = getattr(settings, cfg.get("base_url_field", ""), "") if cfg.get("base_url_field") else ""
+        api_key = getattr(settings, cfg.get("api_key_field", ""), "") if cfg.get("api_key_field") else ""
+        if not base_url or not api_key:
             raise RuntimeError(
-                "缺少 DeepSeek API 密钥"
+                f"缺少在线 LLM 供应商配置(前缀 {prefix!r}): "
+                f"base_url/密钥需经 settings 字段({cfg.get('base_url_field')}/"
+                f"{cfg.get('api_key_field')})提供, 密钥只住 docker/secrets/"
             )
+        # deepseek 分支用官方集成 ChatDeepSeek 而非通用 ChatOpenAI:
+        # langchain-openai v1 不提取非标准字段 reasoning_content(思考内容),
+        # ChatDeepSeek 会透传到 additional_kwargs, 流式 chunk 为逐段增量。
+        model_cls = _load_model_class(cfg.get("model_class", "langchain_deepseek:ChatDeepSeek"))
         kwargs: dict = {
             "model": name,
-            "base_url": settings.deepseek_base_url,
-            "api_key": settings.deepseek_api_key,
+            "base_url": base_url,
+            "api_key": api_key,
             "temperature": temperature,
+            # 墙钟上限 + 有界重试(两者都必须显式给, 理由见 Settings.llm_request_timeout):
+            # 没有 timeout 时一个挂住的供应商会永久占住一个并发闸门与一路 HTTP 连接,
+            # 而默认重试次数乘上人数就是配额翻倍(429 时只会把故障放大)。
+            "timeout": settings.llm_request_timeout,
+            "max_retries": max(0, int(settings.llm_max_retries)),
         }
         if json_mode:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
             # 意图分类等结构化短任务关闭思考模式, 降低时延 (deepseek-flash 默认开启)
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            kwargs["extra_body"] = _render_extra_body(False, cfg.get("thinking_template", ""), "")
         else:
             # 非 json 通道显式声明思考开关(开/关), 不依赖服务端默认值
-            kwargs["extra_body"] = _deepseek_extra_body(want_thinking, settings)
-        return ChatDeepSeek(**kwargs)
+            kwargs["extra_body"] = _render_extra_body(
+                want_thinking, cfg.get("thinking_template", ""), settings.llm_reasoning_effort
+            )
+        if not kwargs["extra_body"]:
+            kwargs.pop("extra_body")
+        return model_cls(**kwargs)
 
     from langchain_ollama import ChatOllama
 

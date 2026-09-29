@@ -36,11 +36,15 @@ class AclRequest(BaseModel):
 
 @router.post("/upload")
 async def upload_doc(file: UploadFile = File(...), uploader: str = Form("anonymous")) -> dict:
-    """Phase 1: save + parse + duplicate check + LLM tag suggestion."""
+    """Phase 1: save + parse + duplicate check + LLM tag suggestion.
+
+    上传走流式落盘(:func:`service.stage_upload`), 不再一次把整个文件读进内存:
+    多人同时传几十 MB 时, ``await file.read()`` 会同时握住所有体(内存尖峰直
+    接 OOM), 而流式版本内存恒等于一个分块。
+    """
     trace_id = new_trace_id()
-    data = await file.read()
     try:
-        doc_key, path, ext = service.save_upload(file.filename or "unnamed", data)
+        doc_key, path, ext = await service.stage_upload(file.filename or "unnamed", file)
         _, blocks = await parse_blocks(path)
     except service.UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

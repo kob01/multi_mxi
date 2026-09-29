@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 from collections.abc import Sequence
@@ -60,8 +62,8 @@ def _safe_filename(filename: str) -> str:
     return name
 
 
-def save_upload(filename: str, data: bytes) -> tuple[str, Path, str]:
-    """Validate and persist an uploaded file. Returns (doc_key, path, ext)."""
+def _validate_name(filename: str) -> tuple[str, str]:
+    """只校名字(扩展名白名单): 暂存与定稿共用一道, 不依赖已落盘的字节。"""
     name = _safe_filename(filename)
     ext = Path(name).suffix.lower()
     if name.lower().endswith(".transcript.txt"):
@@ -70,6 +72,58 @@ def save_upload(filename: str, data: bytes) -> tuple[str, Path, str]:
         name.lower().endswith(e) for e in (".srt", ".vtt")
     ):
         raise UploadError(f"不支持的文件类型: {ext}")
+    return name, ext
+
+
+async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
+    """流式落盘一份上传: 边读边写, 超过上限立刻断并清临时文件。
+
+    为什么不能 ``await file.read()`` 一次读完再校大小(旧写法): 那是先把最多
+    ``upload_max_mb`` 全读进内存。50MB × 几十人同时上传 = 几 GB 峰值, 在容器内存
+    上限下直接 OOM; 而且那笔内存本可以完全不花(进磁盘就行)。
+    先落 ``.uploading`` 再改名: 大小/类型校失败时不会留下半个正式文件。
+    """
+    name, ext = _validate_name(filename)
+    max_bytes = get_settings().upload_max_mb * 1024 * 1024
+    stem = name[: -len(ext)] if name.lower().endswith(ext) else Path(name).stem
+    doc_key = compute_doc_id(stem, ext)
+    dest_dir = await asyncio.to_thread(_upload_dir)
+    target_dir = dest_dir / doc_key
+    final = target_dir / name
+    staging = target_dir / (name + ".uploading")
+    received = 0
+    try:
+        await asyncio.to_thread(target_dir.mkdir, parents=True, exist_ok=True)
+        with staging.open("wb") as f:
+            while True:
+                piece = await upload.read(1024 * 1024)
+                if not piece:
+                    break
+                received += len(piece)
+                if received > max_bytes:
+                    raise UploadError(f"文件超过大小限制({get_settings().upload_max_mb}MB)")
+                # 每一块都交给线程写: 循环里的 ``f.write`` 会把磁盘 IO 压在事件循环上,
+                # 几十 MB 文件就是几十次阻塞(全厂人的流式回复跟着卡)。
+                await asyncio.to_thread(f.write, piece)
+    except BaseException:
+        # 失败/取消都先清掉临时体, 再把原异常照旧冒出(路由层的错误语义不变)
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    await asyncio.to_thread(os.replace, staging, final)
+    return doc_key, final, ext
+
+
+def save_upload(filename: str, data: bytes) -> tuple[str, Path, str]:
+    """Validate and persist an uploaded file. Returns (doc_key, path, ext).
+
+    保留同步入参接口(脚本/测试在用); HTTP 上传路径请走 :func:`stage_upload`
+    的流式版本, 不要把整个文件先读到内存。大小校验两道都留: 调用方传的内存
+    缓冲区也得有上限, 否则这接口自己就是一个无界内存入口。
+    """
+    name, ext = _validate_name(filename)
     max_bytes = get_settings().upload_max_mb * 1024 * 1024
     if len(data) > max_bytes:
         raise UploadError(f"文件超过大小限制({get_settings().upload_max_mb}MB)")
@@ -147,6 +201,16 @@ def normalize_acl(
     return acl
 
 
+def _normalize_and_structure(raw: str, blocks: Sequence[Any]) -> tuple[str, Any]:
+    """入库链路里的两块纯 CPU: 文本归一化 + 父块结构(一并交给线程)。
+
+    两者必须同线程跳: ``build_structure`` 的 offset 是基于 ``normalize_text`` 的结果算的,
+    拆成两次线程调用只会多一次无意义的上下文切换(归一化结果还要再穿一次线)。
+    """
+    normalized = normalize_text(raw)
+    return normalized, build_structure(blocks, normalized)
+
+
 async def _set_doc_status(doc_key: str, status: str) -> None:
     """Best-effort 更新 documents.status(入库失败时标 failed, 供检索门禁生效)。"""
     try:
@@ -189,8 +253,8 @@ async def ingest_confirmed(
     raw = "\n\n".join(b.text for b in blocks)
     if not raw.strip():
         raise UploadError("文档解析后无有效内容")
-    normalized = normalize_text(raw)
-    structure = build_structure(blocks, normalized)
+    # 归一化与结构切块都是整篇文本上的纯 Python(百万字文档上是秒级 CPU), 同样离事件循环
+    normalized, structure = await asyncio.to_thread(_normalize_and_structure, raw, blocks)
     title = path.stem
 
     factory = get_session_factory()
@@ -289,8 +353,9 @@ async def ingest_confirmed(
 
     if get_settings().doc_kg_enabled:
         try:
-            import asyncio
-
+            # 不能再写 ``import asyncio``: 模块顶层已导入, 函数内重复导入会把 asyncio
+            # 变成本函数的局部量, 使前面那几处 ``await asyncio.to_thread(...)`` 直接
+            # UnboundLocalError(入库接口 500, 且只在走到这里时才爆)。
             from app.kg.service import build_for_doc
 
             task = asyncio.create_task(build_for_doc(doc_key))
@@ -408,12 +473,12 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
     # 位置(<项目>/data/uploads/<doc_key>)不一致, rmtree 会因路径不存在而静默失败,
     # 表现为"文档已删但源文件还在"。doc_key 跨环境稳定, 故用它重算路径最可靠。
     upload_doc_dir = _upload_dir() / doc_key
-    shutil.rmtree(upload_doc_dir, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, upload_doc_dir, ignore_errors=True)
     # 兼容历史数据: file_path 若指向规范目录之外(如迁移前残留), 也补删一次。
     if file_path:
         legacy_dir = Path(file_path).parent
         if legacy_dir != upload_doc_dir:
-            shutil.rmtree(legacy_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, legacy_dir, ignore_errors=True)
     if upload_doc_dir.exists():
         logger.warning(
             "upload dir still present after delete (占用/权限?): %s", upload_doc_dir

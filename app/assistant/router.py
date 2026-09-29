@@ -7,7 +7,7 @@
     GET  /api/sessions             某用户的会话列表
     GET  /api/sessions/{id}/messages  一个会话的完整历史(刷新后回填)
     DELETE /api/sessions/{id}      删除会话及其记录
-    GET  /api/files/reports/{name} 回取产物文件（图表 SVG / 报告 Markdown / 成品页 HTML）
+    GET  /api/files/reports/{name} 回取分析产物文件（图表 SVG/PNG / 报告 Markdown / 数据 CSV）
 """
 
 from __future__ import annotations
@@ -19,12 +19,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.assistant.graph import get_orchestrator
-from app.assistant.stream import get_stream_hub, sse_frame
+from app.assistant.stream import RunOverloaded, get_stream_hub, sse_frame
 from app.chat_store import get_chat_store
 from app.config import get_settings
+from app.db.session import db_available
 from app.schemas import ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
     """Unified chat endpoint: every user message enters here."""
     try:
         return await get_orchestrator().handle(req)
+    except RunOverloaded as exc:
+        # 过载不是服务故障: 给 503 + Retry-After, 让前端/代理自己退避重试
+        raise _overloaded(exc) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -71,8 +75,20 @@ async def chat(req: ChatRequest) -> ChatResponse:
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     """Start one streaming turn; events are replayable after disconnect."""
-    run_id = await get_orchestrator().handle_stream(req)
+    try:
+        run_id = await get_orchestrator().handle_stream(req)
+    except RunOverloaded as exc:
+        raise _overloaded(exc) from exc
     return _stream_response(run_id, from_id=0)
+
+
+def _overloaded(exc: RunOverloaded) -> HTTPException:
+    """并发闸门拒绝 -> 503(带 Retry-After, 避免前端无退避地死重试放大雪崩)。"""
+    return HTTPException(
+        status_code=503,
+        detail=str(exc),
+        headers={"Retry-After": "5"},
+    )
 
 
 @router.get("/chat/stream/{run_id}")
@@ -113,16 +129,43 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/health/ready")
+async def readiness() -> JSONResponse:
+    """就绪探针: 只回答"本进程能不能接新对话", 不报健康分。
+
+    与 /api/health(存活探针)分开: 一个进程可以活着但已过载/未初始化完,
+    运维侧需要的是"把新流量从负载器上摘下来"而不是"重启它"。
+    依赖级降级(ES/TEI/Redis 不可用)不算不就绪 —— 那些路径本就有降级行为。
+    """
+    hub = get_stream_hub()
+    limit = max(1, get_settings().stream_max_concurrent_runs)
+    orchestrator = get_orchestrator()
+    checks = {
+        "inflight_runs": hub.inflight,
+        "run_limit": limit,
+        "graph_ready": orchestrator._graph is not None,  # noqa: SLF001
+        "db_ready": db_available(),
+    }
+    ready = checks["graph_ready"] and hub.inflight < limit
+    return JSONResponse(
+        {"status": "ready" if ready else "busy", **checks},
+        status_code=200 if ready else 503,
+    )
+
+
 @router.get("/files/reports/{name}")
 async def get_report_file(name: str) -> FileResponse:
-    """回取分析产物(图表 SVG / 报告 Markdown), 成品页(HTML)也走同一入口。
+    """回取分析产物(图表 SVG/PNG / 报告 Markdown / 表格 CSV)。
 
     安全: 文件名走 app.analytics.store 的白名单正则校验(挡掉一切路径穿越),
     且只在 report_dir 目录内解析后的绝对路径才回文件; 不做目录列表。
+    扩展名不在 ``analytics.store._EXT_KIND`` 里的文件根本进不了台账/下载
+    (原网页创作工坊下线的 HTML 已不在该白名单内, 不可回取)。
 
-    HTML 额外带 CSP sandbox 头: 成品页与业务系统同源, 不加这道头时一段恶意脚本就能
-    读本域 cookie/localStorage 并调内网 API。sandbox 指令不带 allow-same-origin, 等于把
-    文档当不透明源处理 —— 脚本照跑(图表这类动态页仍需工作), 但拿不到本域身份。
+    下面对 HTML 的 CSP sandbox 分支是那道产物还在时的护栏, 现处于休眠状态:
+    保留是为了"若将来又开静态页入口, 不会忘了同源隔离" —— 新接入可下发 HTML 的
+    产物时必须带上那段 sandbox(成品页与业务系统同源, 不加这道头一段恶意脚本就能
+    读本域 cookie/localStorage 并调内网 API; sandbox 不带 allow-same-origin)。
     """
     from app.analytics.store import is_safe_name
 

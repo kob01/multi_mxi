@@ -1,8 +1,11 @@
-"""Retrieval Cache: 缓存"同一查询 + 同一权限主体 -> 同一批召回子块"。
+"""Retrieval Cache: 缓存"同一查询 + 同一权限主体 -> 同一批已正文就位的召回子块"。
 
-key 必须包含 ACL 签名(user_id + department + role)——命中缓存时会直接跳过
-``build_sql_filter`` / ``is_allowed`` 两道权限裁剪, 若 key 不含身份签名, 甲用户
-有权看到的私有文档命中后会被原样复用给无权看到的乙用户, 这是越权泄露。
+key 必须包含 ACL 签名(user_id + department + role): 命中时整条检索链路被跳过
+(embedding + 两通道召回 + RRF + 回表 + rerank 及其阈值), 等于跳过两道**前置**权限裁剪
+(向量 SQL 谓词 / ES bool filter), 故只有同一 principal 能重放到自己那一份结果; 若 key
+不含身份签名, 甲用户有权看到的私有文档命中后会被原样复用给无权看到的乙用户, 这是越权
+泄露。进 Context Builder 前那道最终授权(``acl.is_allowed``)在调用点照常执行、不受命中
+影响 —— 纵深防御始终在位。
 
 必须在文档重新入库时 ``invalidate_all()``: 缓存里存的是 ``chunk_id`` 列表,
 单文档重入库会先删后建(``delete_by_doc``), 旧 ``chunk_id`` 可能已不存在或指向

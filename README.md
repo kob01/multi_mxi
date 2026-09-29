@@ -9,7 +9,7 @@ MCP 工具调用、A2A 专业智能体委派。
 ```
                 ┌──────────────────────── Web / API ─────────────────────────┐
                 │                      Assistant (统一入口)                   │
-                │  FastAPI + LangGraph 编排: 意图识别(deepseek-flash) → 分层路由 │
+                │  FastAPI + LangGraph 编排: 消解/拆分 → 意图三层漏斗 → 分层路由    │
                 └───┬───────────────┬───────────────────┬────────────────────┘
                     │               │                   │
             a. 简单查询      b. 复杂操作(MCP)      c. 专业任务(A2A)
@@ -46,7 +46,8 @@ Protocol:FastMCP server,streamable-http transport(服务自身监听 `:8001/mcp`
 > 另有一组**进程内工具能力域**(`app/tools/`, 无容器/端口): `web`(联网检索 `search_web` +
 > 网页抓取 `fetch_url`, SSRF 护栏见 `app/security/url_guard.py`)与 `docgen`(把结构化文字 +
 > 图片直接生成为可下载的 Word/Excel/PPT/PDF/Markdown 文件, `generate_docx/xlsx/pptx/pdf/md/image`
-> 回 `/api/files/{token}/{file}` 下载链接; 图片支持本地文件与图片 URL)。它们由
+> 回 `/api/files/{token}/{file}` 下载链接; 图片支持本地文件与图片 URL)。docgen 域还**并入了
+> `search_web`/`fetch_url`** —— 否则"调研 X 再导出 PDF"只能靠模型记忆编内容。它们由
 > `tool_execute` 按 `CAPABILITY_TOOLS` 注册表直接注入 ReAct 循环, 不经 MCP 连接池;
 > 检索默认免密 provider `ddgs`, Tavily/Serper 密钥只住 `docker/secrets/*.txt`。
 >
@@ -60,7 +61,9 @@ START
   │
   ▼
 build_context ─────────── 汇聚 Business Context: 会话记忆(短期窗口 + 摘要),
-  │                        个人级记忆六桶(画像/偏好/习惯/情节/知识/图谱)
+  │                        个人级记忆六桶(画像/偏好/习惯/情节/知识/图谱;
+  │                        五桶中画像走 user_profiles 一人一条, 其余四个走
+  │                        long_term_memories 的 kind 列, 图谱在 Neo4j)
   ▼
 resolve_time ──────────── 问题含相对时间时预取平台时钟(东八区),
   │                        注入后续五类路由 Prompt, 不依赖模型记忆日期
@@ -69,18 +72,26 @@ rewrite_query ─────────── 多轮指代消解: 把"那它�
   │                        (首轮/无历史/自包含长问题跳过; 输出清洗+校验,
   │                        LLM 失败或结果不可信时回退原话)
   ▼
-classify_intent ───────── deepseek-flash 意图识别(基于消解后的独立问题,
-  │                        关键词兜底)
+plan_tasks ────────────── 复合问法拆分(可选分支): 只拆问题不出意图,
+  │                        拆出的子问题逐条走下面的意图漏斗; 短于阈值或无
+  │                        并列标记直接跳过(MULTI_TASK_ENABLED=false 即整体回退单意图)
+  ▼
+classify_intent ───────── 三层漏斗(规则快筛 → bge-m3 语义 → deepseek 兜底,
+  │                        终端关键词保底; 多任务轮逐条子问题各跑一次)
   │
-  ├── knowledge_qa ──► kb_answer ─────── RAG 混合检索(用消解后的问题检索,
-  │                       │                生成与检索语义对齐)
+  ├── knowledge_qa ──► kb_retrieve ──► judge ──┬─ 有相关块 ──► kb_generate
+  │                     ▲                └─ 空集且预算内 ─► kb_requery(换写法重检)
+  │                     └────────────────┘ 重检后仍空 ──► kb_generate(明确拒答)
   ├── chitchat ──────► chitchat ──────── 直答(携带对话历史 + 消解提示)
   ├── tool_call ─────► tool_execute ──── MCP ReAct 工具调用(finance/hr/analytics/procurement,
   │                       │                角色×工具白名单过滤) + 进程内能力域:
   │                       │                web=联网检索/抓取, docgen=生成 Word/Excel/PPT/PDF/MD/图片
   │                       │                (纯进程内 tool, 无容器/端口)
-  └── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
-                          │                作为当前请求, metadata 传身份)
+  ├── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
+  │                       │                作为当前请求, metadata 传身份)
+  └── (多个子任务) ──► multi_execute ─── 只读子任务(knowledge_qa / web / docgen)并发,
+                          │                业务域 tool_call 与 agent_delegate 串行尾随
+                        merge_results ── 程序化拼成"一节一件事"的 Markdown(不再过 LLM)
                           ▼
                     persist_memory ────── 脱敏后写会话记忆 + 一次 LLM 提取,
                           │                分桶沉淀为个人记忆(溢出摘要另存情节)
@@ -92,9 +103,16 @@ classify_intent ───────── deepseek-flash 意图识别(基于�
 要点:
 
 - `resolve_time` 在意图识别**之前**固定执行,保证时间类回答以真实时钟为准;
-- `rewrite_query` 前置于意图识别:分类器与**全部四条路由**共享消解后的
+- `rewrite_query` 前置于意图识别:分类器与**全部路由**共享消解后的
   独立问题,避免"那帮我查一下它的余额"因指代未消解而误分类/查错对象;
   首轮、无历史或自包含长问题(无代词标记)自动跳过,零额外开销;
+- 知识库链路是 **retrieve → judge → (重检一次) → generate** 的回环:阈值裁到空集时
+  先换写法重检(`RETRIEVAL_MAX_RETRIES`,默认 1 次),重检后仍空或命中全被 ACL 踢掉则**不进
+  LLM** 直接给出拒答文案(不给参考来源),避免把噪声写成事实;
+- 出口还有第二道**发布态门禁**(`docs_not_ready`):`status != ready` 或未注册元数据的
+  文档视同无权,防"正在入库的半篇文档"被检索到;
+- 多任务分支只并发**只读通道**(知识库 / web / docgen 能力域);业务域 `tool_call` 与
+  `agent_delegate` 可能被 ReAct 选到写操作工具,一律串行尾随;
 - 身份与用户请求文本分离:工具调用经 System 消息、A2A 经协议级 metadata
   下发操作者身份,并显式区分"当前操作者"与"任务目标用户";
 - 每个节点均写审计记录,同一 `trace_id` 串联全链路。
@@ -109,6 +127,9 @@ RRF 只融合排名不判相关性, 全链路**唯一**的相关性阈值落在 
 
 - 稠密/稀疏两通道与 RRF 均**不设阈值**(分数不可比, 只负责召回); TEI 不可用/超时
   (总超时 3s)则本层降级为 RRF 融合序且阈值不生效, `score_mode` 随分数标度一并上报审计。
+- 阈值只作在**打分集**上: 单批上限 `MAX_CANDIDATES=32`(对齐 TEI 默认
+  `--max-client-batch-size`), 超出部分不打分、保持 RRF 相对序附在尾部; 生产
+  `RAG_TOP_K=8` 远未触顶, 仅评测拉高 top_k 时需知道这一段不过阈值。
 - 推理交给独立的 TEI 容器(compose 服务 `tei-rerank`), 而不是 Ollama —— 之前的伪 rerank
   是拿 Ollama `/api/embed` 的向量做 cosine, 且该 GGUF 在 Windows llama.cpp 上调用即崩。
 
@@ -143,14 +164,61 @@ RAG:  Query → Embedding
   **ACL 永远以 PG/ES 标量列做前置裁剪, MongoDB 只按** **`_id`** **取文本, 不承载权限语义**;
   正文与 `extra`(JSONB) 只放展示字段, 权限字段禁止入 JSONB。
 - **可见性策略**:`public`(全员) / `dept`(指定部门) / `role`(指定角色)
-  / `private`(仅上传者);管理员角色全量可见。
+  / `private`(仅上传者);管理员角色全量可见。未知 visibility 一律 default-deny。
+  `allowed_roles` 以逗号包裹形式存储(`",hr,admin,"`), PG 侧 LIKE 匹配前转义
+  `%`/`_`/`\`, ES 侧则拆成 keyword 数组做精确 term。
 - **前置裁剪**:稠密通道用 SQL 谓词(`app.rag.vectorstore.build_sql_filter`, 作用于
   `doc_chunks`), 与列白名单 `NARROW_COLUMNS`(不含 `chunk_text`/`embedding`) 一起作用在
   `ORDER BY embedding <=> ? LIMIT k` 之前, 在 ANN 检索阶段即排除无权文档且不拉宽行; 命中的窄行
   在 rerank 之前按 `chunk_id` 主键批量回表补正文。稀疏通道(Elasticsearch BM25)用等价的
   bool filter(`app.rag.bm25._acl_filter`), 两通道逐条语义严格一致。
-- **最终授权**:`kb_answer` 在父块组装后、拼接 Context 前再逐条复核一次,
-  拦截组装/脏数据可能引入的越权块,剔除项写审计(`acl_final_check_dropped`)。
+- **最终授权**:`kb_retrieve` 在父块组装后、拼接 Context 前再逐条复核一次(判定口径单一事实源
+  `app.security.acl.is_allowed`, 与 SQL 谓词/ES filter 逐条对应),
+  拦截组装/脏数据可能引入的越权块,剔除项写审计(`acl_final_check_dropped`);越权与"知识库没有"
+  用同一拒答文案,不泄漏文档存在性。
+
+### 三层缓存与降级口径
+
+三类缓存统一落 Redis(`app/cache/`), 全部按"能降级就降级"设计: Redis 关闭/连不上
+(`get_redis()` 返回 None)就退回直连真实调用, 行为等同于本功能上线前, 不报错不阻断。
+
+| 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                       |
+| ------------------------------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/拆分/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)     |
+| Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名;文档重入库时 `refresh_knowledge()` 调 `invalidate_all()`(SCAN 而非 KEYS)     |
+| Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入 |
+
+两个刻意保留的"不优化":流式闲聊不读 Prompt Cache(命中的重放没有思考过程, 收益小于
+体验损失);多任务合并不再过一次 LLM(各节已是事实, 再过一次只会引入改写与编造风险)。
+
+### 个人级记忆的双时态(会随时间波动的属性)
+
+体重/身高/年龄/部门/职位/职级/汇报对象/所在地/入职时间这类值不是"身份", 而是**随时间
+变化的观测序列**。拿写入顺序当真相会出事故: 用户先说"我现在 70kg", 后一句"2015 年秋
+我才 64kg"就把当前态改成了一个十年前的值。现行口径与业界一致(健康数据建模的 FHIR
+`Observation`: 观测只追加, 当前值按 effective 时间派生; 时序知识图谱 Graphiti/Zep 的
+`valid_at`/`invalid_at` 双时态与 fact invalidation; OpenAI 个性化记忆 cookbook 的
+"冲突按日期取最新"), 实现集中在 `app/memory/temporal.py`:
+
+| 属性类别                                       | 存储与合并语义                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------ |
+| 波动类(`_MEASURE_KEYS`)                        | 值存成 `(值, valid_at 生效时间, recorded_at 记录时间)` 观测序列(`user_profiles.attribute_history`), **当前值按生效时间派生**; 在讲过去的陈述只进历史 |
+| 身份修正类(`_CORRECTION_KEYS`: 姓名/工号/生日等) | 覆盖即修正, 不留历史                                                                 |
+| 多值类(技能/负责事务/家庭等)                  | 并集去重, 只增不删(删旧值留给用户在"我的记忆"页自服务)                              |
+| 记忆条目(情节/知识)                          | 语义查重命中且 `occurred_at` 相差在 `memory_observation_window_days` 内才合并, 否则视为不同时刻观测各存一条; 合并时时间只往前走 |
+| 个人图谱(`:REL` 边)                          | 带 `valid_at`/`invalid_at`/`as_of`; 单值关系被新事实取代时旧边只关窗不删, 补说的旧事写入即失效 |
+
+三个容易踩的点:
+
+- **两轴分开**才拦得住事故: 用户明说的时间进 `valid_at`(现实轴), 何时听到的进
+  `recorded_at`(录入轴); 只在 `explicit=True` 时画像摘要才渲染"（自 2026-09）", 历史值不进
+  prompt(只给前端的"我的记忆"页看), 不然 `profile_max_chars` 预算会被吃掉。
+- **近期起始日期不算历史**: "从上个月起我改汇报给张总" 描述的是**持续到当下**的变更,
+  所以在 `profile_current_grace_days`(默认 90 天)内的明说时间仍算当前态、能顶掉旧值;
+  超出宽限期才归入历史。画像与图谱共用同一个宽限期, 否则两个召回通道会给模型矛盾答案。
+- **情节侧的 `occurred_at` 仍只收近三年**(`extraction._parse_date`): 情节有
+  `episodic_window_days` 时间窗过滤, 模型猜错年份会让整条记忆被误杀; 画像的 `valid_at`
+  只参与排序(猜错最多沉进历史), 所以放到 1900 年(`temporal.MIN_VALID_AT_YEAR`)。
 
 ## 目录结构
 
@@ -161,19 +229,23 @@ mxi/
 │   ├── schemas.py                # 共享数据模型(意图/角色/知识块)
 │   ├── main.py                   # FastAPI 网关入口(有 web/dist 才托管 SPA, 否则提示走 vite dev)
 │   ├── assistant/                # ★ Assistant 调度核心
-│   │   ├── graph.py              #   LangGraph 编排:意图→分层路由→记忆
-│   │   ├── intent.py             #   意图识别(deepseek-flash + 关键词兜底)
+│   │   ├── graph.py              #   LangGraph 编排:消解→拆分→三层意图→分层路由→记忆
+│   │   ├── intent.py             #   意图三层漏斗(规则 → bge-m3 语义 → LLM → 关键词保底)
+│   │   ├── planner.py            #   复合问法拆分(只拆问题不出意图)
 │   │   ├── memory.py             #   短期窗口 + LLM 摘要长期记忆
+│   │   ├── stream.py             #   SSE 事件缓冲区(RunBuffer/StreamHub, 断点重放)
 │   │   ├── mcp_client.py         #   MCP Client(langchain-mcp-adapters)
 │   │   ├── a2a_client.py         #   A2A Client(Agent Card 发现/message.send)
-│   │   └── router.py             #   /api/chat 统一入口
+│   │   ├── prompts.py            #   五类路由/改写/拆分/提取 Prompt
+│   │   └── router.py             #   /api/chat 与 /api/chat/stream 统一入口
 │   ├── memory/                   # ★ 个人级记忆层(按 user_id 隔离)
 │   │   ├── taxonomy.py           #   分桶语义单一事实源(kind/注入方式/标签)
+│   │   ├── temporal.py           #   双时态口径单一事实源(生效轴/录入轴/历史判定)
 │   │   ├── personal.py           #   编排:读路径并行召回, 写路径分桶落盘
-│   │   ├── profile_store.py      #   画像(user_profiles 表, 确定性合并)
-│   │   ├── vector_store.py       #   偏好/习惯/情节/知识(pgvector 长表)
-│   │   ├── graph_store.py        #   个人图谱(Neo4j, :MemoryUser 锚点)
-│   │   ├── extraction.py         #   一次 LLM 调用产出全部桶
+│   │   ├── profile_store.py      #   画像(user_profiles 表, 当前值派生 + 有界历史)
+│   │   ├── vector_store.py       #   情节/知识(向量召回)与偏好/习惯(标量直读)的 pgvector 长表
+│   │   ├── graph_store.py        #   个人图谱(Neo4j, :MemoryUser 锚点, REL 边带生效/失效时间)
+│   │   ├── extraction.py         #   一次 LLM 调用产出全部桶(画像/关系带生效时间)
 │   │   └── router.py             #   /api/memory 自服务(查看/删除/整理)
 │   ├── rag/                      # ★ RAG 知识底座
 │   │   ├── embeddings.py         #   bge-m3 (Ollama /api/embed)
@@ -193,7 +265,7 @@ mxi/
 │   │   ├── finance_server.py     #   财务报销系统(:8002/mcp)
 │   │   ├── analytics_server.py   #   数据洞察(:8005/mcp, Text2SQL/图表/周报)
 │   │   ├── procurement_server.py #   采购与合同初审(:8006/mcp)
-│   ├── analytics/                # ★ 数据洞察支撑(零依赖, 不引 matplotlib)
+│   ├── analytics/                # ★ 数据洞察支撑(不引 matplotlib/cairosvg)
 │   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie) + Pillow PNG(供 office 嵌图)
 │   │   ├── reports.py            #   固定口径指标 SQL + Markdown 报告组装
 │   │   └── store.py              #   产物落 data/reports + 台账 + 相对 URL 寻址
@@ -210,7 +282,7 @@ mxi/
 │   │   ├── docgen.py             #   generate_docx/xlsx/pptx/pdf/md/image(回下载链接)
 │   │   └── _http.py              #   共享 httpx 连接池(follow_redirects=False 逐跳校验)
 │   ├── files/                    # ★ 生成物下载路由 /api/files/{token}/{file_name}
-│   │   └── router.py             #   令牌形状/穿越断言/MIME 白名单四层防护
+│   │   └── router.py             #   四层防护: 令牌形状/文件名安全集/子树断言/扩展名→MIME 白名单
 │   ├── procurement/              # ★ 采购/合同确定性规则引擎
 │   │   └── rules.py              #   必备条款/高风险表述/金额分级/预算余额
 │   ├── agents/                   # ★ A2A 专业智能体
@@ -225,8 +297,8 @@ mxi/
 │       ├── audit.py              #   全链路审计 JSONL(trace_id 串联)
 │       └── masking.py            #   身份证/银行卡/手机号/金额脱敏
 ├── scripts/
-│   ├── dev_services.py           # docker 依赖服务一键起 + 对接自检(含密钥/串味守护)
-│   ├── dev.ps1                   # 开发启动器: 依赖服务 + 宿主网关 + vite dev(-Stop 可停)
+│   ├── dev_services.py           # docker 全栈一键起 + 对接自检 + env-check 防覆盖(含密钥/串味守护)
+│   ├── dev.ps1                   # 开发启动器: docker 全栈(含网关容器) + vite dev(-Stop 可停)
 │   ├── package.py                # 一键打包前后端为部署目录(内含两道密钥闸门)
 │   ├── ingest_knowledge.py       # 知识库构建脚本
 │   ├── init_db.py                # PostgreSQL + pgvector 建表/自检
@@ -309,7 +381,8 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.mig
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.ingest_knowledge --dir /data/knowledge
 # 重刷业务数据(可选)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.seed_business_data --force
-# Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload   创作工坊: http://localhost:18000/docgen
+# Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload
+#   (另有 我的记忆 /memory 与 知识图谱 /graph; 原 /docgen 创作工坊页已随网页链路下线)
 # Neo4j Browser: http://localhost:17474   (bolt: localhost:17687; 原 7687 已落进本机 winnat 排除段)
 ```
 
@@ -342,59 +415,76 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 
 ### 本地开发
 
-开发/验证期的拓扑约定(见 `CONFIG_RULES.md` 第 9 条):**宿主机只跑两个前台进程** ——
-网关(`uvicorn --reload`)与前端(vite dev);compose 里有的服务全部对接 docker, 不在宿主
-重复起一份。唯一不在 docker 里的依赖是宿主机 Ollama。
+开发/验证期的拓扑约定(2026-09 起, 见 `CONFIG_RULES.md` 第 9 条与
+`.qoder/rules/container-first-verification.md`): **容器是唯一的验证环境** ——
+assistant 网关与全部依赖都在 compose 里跑, **宿主机禁止直跑网关做代码验证**;
+宿主只跑 vite dev(前端页面) 与 Ollama(唯一非 docker 依赖)。改过 `app/` 任何后端
+代码都要 `-Build` 重建镜像才生效(镜像层缓存了依赖, 重建通常只重 COPY)。
 
 ```bash
-# 0. 依赖与环境(pip 仅用于引导 uv)
+# 0. 依赖与环境(pip 仅用于引导 uv; 宿主侧仅装管理脚本/评测脚本所需的 dev 依赖)
 pip install uv
 uv sync
 
 # 1. 首次开发: 从模板建两份配置 + 密钥目录(模板入库, 真实值不入库)
-cp .env.example .env                      # 宿主轨: 全部指向 docker 已发布端口
+cp .env.example .env                      # 宿主轨: 供宿主侧脚本(dev_services check/init_db/评测)连 docker 已发布端口
 cp docker/.env.example docker/.env        # 容器轨: 服务名 + /data 卷路径 + compose 插值
 # 密钥只写 docker/secrets/<name>.txt(见该目录 README.md), 不写进任何 .env
 
 # 2. 建表自检(含 CREATE EXTENSION vector); Mongo 集合索引由网关启动幂等创建
 uv run python -m scripts.init_db
 
-# 3. 一键起: docker 依赖服务 + 对接自检 + 拉起网关(:18000) 与前端(:5173)
+# 3. 一键起: docker 全栈(含 assistant 容器网关) + 对接自检 + 前端(:5173)
 ./scripts/dev.ps1
-uv run python -m scripts.dev_services check        # 只看对接结果(幂等, 可随时跑)
+./scripts/dev.ps1 -Build                          # 改过 app/ 后端代码后的标准动作
+uv run python -m scripts.dev_services check --gateway   # 只看对接结果(含探容器网关, 幂可随时跑)
 
 # 4. 页面入口(开发期一律走 vite dev, 不依赖 web/dist)
 #   聊天 http://localhost:5173   文档上传 http://localhost:5173/upload
-#   创作工坊 http://localhost:5173/docgen
 #   记忆 http://localhost:5173/memory   知识图谱 http://localhost:5173/graph
 #   API 文档 http://localhost:18000/docs   健康检查 http://localhost:18000/api/health
 
-./scripts/dev.ps1 -Stop                            # 结束两个前台进程(docker 服务不动)
-uv run python -m scripts.dev_services down         # 停掉 docker 依赖(只停不删卷)
+./scripts/dev.ps1 -Stop                            # 结束 vite 并停掉 docker 全栈(含网关容器)
+uv run python -m scripts.dev_services down         # 只停 docker 服务(只停不删卷)
 ```
 
-`dev.ps1` 等价的手工四步(想单独控制某一层时用):
+`dev.ps1` 等价的手工三步(想单独控制某一层时用):
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d \
-  postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp hr-agent finance-agent analyst-agent contract-agent
-uv run python -m scripts.dev_services check
-uv run uvicorn app.main:app --host 0.0.0.0 --port 18000 --reload   # 宿主网关(cd .venv 已激活或用 uv run)
-cd web-ui && pnpm install && pnpm dev                              # 前端 dev, /api 代理到上面的端口
+docker compose -f docker/docker-compose.yml up -d --build \
+  assistant postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp hr-agent finance-agent analyst-agent contract-agent
+uv run python -m scripts.dev_services check --gateway    # 对接结果 + 容器网关健康
+cd web-ui && pnpm install && pnpm dev                    # 前端 dev, /api 代理到 assistant 容器发布端口(18000)
+docker logs -f assistant                                 # 网关日志(不再落宿主文件)
 ```
 
 要点:
 
-- **不起** **`assistant`** **容器**: 宿主网关要 bind `ASSISTANT_PORT`(默认 18000), 与容器发布端口互斥;
-  整栈验证时才 `dev_services up --with-assistant`(此时宿主网关起不来)。
-- **配置分两轨**: `app/config.py` 只读宿主侧 `.env`/`.env.local`; 容器侧靠 compose 的
-  `env_file: [.env]`(= `docker/.env`) + `environment:` 注入。两侧地址不同是**故意的**,
-  任何一侧混入另一侧的地址都会让对应层静默降级(见 `CONFIG_RULES.md` 第 5 条)。
+- **网关只在容器里**: `dev_services up` 默认含 `assistant`; 宿主直跑 `uvicorn app.main:app`
+  做验证属违规(宿主轨与容器轨配置视角不同, 宿主结论对容器部署不成立)。
+- **配置分两轨**: `app/config.py` 只读宿主侧 `.env`/`.env.local`(仅供宿主脚本连 docker
+  发布端口); 容器侧靠 compose 的 `env_file: [.env]`(= `docker/.env`) + `environment:` 注入,
+  且红线键已**字面量锁死**, 改 docker/.env 地址不再生效(防覆盖, 见 `CONFIG_RULES.md` 第 10 条;
+  专项自检 `uv run python -m scripts.dev_services env-check`)。两侧地址不同是**故意的**,
+  任何一侧混入另一侧的地址都会让对应层静默降级(第 5 条)。
 - **降级是静默的**: Redis/Neo4j/TEI/Mongo/ES 连不上时功能照跑, 只是退回内存态或 RRF 融合序。
   所以改了配置先跑 `dev_services check`, 别看页面表现猜。
-- **改过 MCP/A2A 代码要重建镜像**: docker 里跑的是镜像快照, 用 `./scripts/dev.ps1 -Build`。
+- **改过任何后端代码要重建镜像**: 容器里跑的是镜像快照(含 assistant 自身),
+  用 `./scripts/dev.ps1 -Build`; 没有热重载兼容层, "改了没反应"先查是否忘了 -Build。
 - **SSE 在 dev 模式可用**: vite 代理是 http-proxy 非缓冲透传, `POST /api/chat/stream` 与断点续传
   都正常:`MXI_BASE=http://127.0.0.1:5173 uv run python scripts/test_sse_resume.py`。
+- **前端 pnpm v11 只认 `web-ui/pnpm-workspace.yaml`**: v11 起 `package.json` 的 `pnpm` 字段不再被
+  读取(命中会打 `[WARN] The "pnpm" field in package.json is no longer read`), `.npmrc` 也只留
+  认证/registry —— 所以构建脚本白名单写在 `pnpm-workspace.yaml` 的 `allowBuilds`(v10 的
+  `onlyBuiltDependencies` 已被它合并取代), esbuild 必须列在里面, 否则 Vite 二进制没装配好。
+  `shamefullyHoist`/`strictPeerDependencies` 同样只能写在 yaml 里; 旧的 `.npmrc` 写法(以及历史上
+  的 `shamefully-hoist=true`)在 v11 下**静默失效**, 现存 `node_modules` 就是默认隔离布局 ——
+  真打开会换掉依赖目录结构, 需要删 `node_modules` 重装, 属行为变更而非配置润色。
+- **前端 pnpm 版本已钉死**(`web-ui/package.json` + `pnpm-workspace.yaml`): `packageManager:
+"pnpm@11.9.0"` 管版本不符(`pmOnFail: download` → 自动改用声明版本, 也可临时 `--pm-on-fail=error/warn
+/ignore` 覆盖), `engines.pnpm: ">=11.9.0"` 兜住旧版(pnpm 9/10 跳 `ERR_PNPM_UNSUPPORTED_ENGINE`
+  硬失败, 不会静默装出另一种 node_modules 布局)。升级 pnpm 大版本时两个字段跟着改, 且得确认
+  lockfile 版本与 `allowBuilds` 写法仍适用。
 
 > Windows 上 `8000`/`8001`/`8002`/`7474`/`7687` 若落在端口排除段内(见上节, 段内容每次开机都变),
 > 宿主直跑也无法 bind; 因此宿主发布端口抬到 `18000/18001/18002/17474/17687`。换机后若再撞上,
@@ -438,17 +528,105 @@ tracing 默认关闭(`LANGSMITH_TRACING=false`, 代码默认值与容器侧配�
 - `uv sync` 已自动安装 dev 组依赖(`langgraph-cli[inmem]`), 不会进入生产镜像(Dockerfile 用 `--no-dev`)。
 - LangSmith trace 与现有 `audit.jsonl` 全链路审计互补: 前者面向开发调试/评估, 后者面向合规留痕。
 
+### Langfuse 自托管可观测(与 LangSmith 并存的独立开关)
+
+第二条 trace 通道, 面向"想把调用链/成本/token 统计留在自己基础设施里"的场景。
+与 LangSmith 的关键差别: Langfuse 跑在同一 compose 网络内(`profile=langfuse` 的
+6 个容器), 对话数据不出本机, 因此**容器侧也可以开**; 而 LangSmith 传向外部云端,
+容器侧恒锁 `false`。两者互不影响, 可只开一个、都开、或都关(默认全关)。
+
+```powershell
+# 1) 起 Langfuse 栈(默认不随 dev.ps1 起, 需显式带 profile)
+docker compose -f docker/docker-compose.yml --profile langfuse up -d
+# 2) 浏览器开 http://localhost:18100 -> 注册 -> 建 org/project -> 取 pk-lf-/sk-lf-
+#    写入 docker/secrets/langfuse_api_key.txt(第一行 sk, 第二行 pk)
+# 3) docker/.env 置 LANGFUSE_ENABLED=true 并重建 assistant 镜像
+./scripts/dev.ps1 -Build
+```
+
+secret 文件是在容器创建时才解析挂载点, 如果文件是后来才补的, 记得
+`docker compose -f docker/docker-compose.yml up -d --force-recreate assistant`
+(否则 `/run/secrets/langfuse_api_key` 是个空目录, 密钥读不到; 日志会给出明确告警)。
+
+要点:
+
+- 接入点是 `app/tracing.py::langfuse_callback()`, 在图顶层 `ainvoke` 的 config 上挂
+  LangChain `CallbackHandler`; 回调沿 LangGraph 传播到所有子 run(意图识别/RAG/ReAct
+  工具/MCP/A2A), 一轮对话归并为**一条 trace**。
+- trace id 由 `audit.jsonl` 的 `trace_id` 经 `Langfuse.create_trace_id(seed=...)` 确定性
+  派生, 且原始 `trace_id` 也落进 trace metadata(`mxi_trace_id`): 从审计日志可直接跳到
+  Langfuse 对应 trace, 反之亦然。
+- 一条命令验证整条链路(先按上面三步启用):
+
+  ```powershell
+  docker compose -f docker/docker-compose.yml run --rm --no-deps assistant `
+      python scripts/smoke_langfuse.py
+  ```
+
+  未启用时会打印 FAIL + 具体原因(开关 / 密钥 / 地址), 不抛栈。
+
+- 读回接口注意: Langfuse v4 默认 `events_only` 写入模式, v3 时代的 `/api/public/traces`
+  列表/详情接口已不可用(实测 404); 程序化读回走 `observations` 接口(按 `trace_id`
+  取全链路节点, `session_id`/`user_id`/`environment` 就在上面)或直接看 UI。
+  镜像默认 `langfuse/langfuse:4`, 想回到 v3 体验只改 `LANGFUSE_IMAGE`/`LANGFUSE_WORKER_IMAGE`。
+- 降级口径与全仓一致: 未启用/未配密钥/没装 langfuse 包 -> `langfuse_callback()` 返回
+  空 dict, 图调用 config 里 `**` 展开即无操作, 不影响业务链路; 上报失败只告警。
+- Langfuse 栈的存储(PG/ClickHouse/redis/MinIO)与业务的 postgres/redis 完全隔离,
+  删栈不伤业务数据; 详见 `docker/docker-compose.yml` 内注释。
+
 ## 端到端链路("我要报销")
 
-1. `POST /api/chat` → Assistant 载入会话记忆(短期窗口 + 长期摘要);问题含相对时间时,
-   先在进程内取平台当前时间并注入后续 Prompt
-2. `deepseek-flash` 意图识别 → `agent_delegate / finance`
-3. 权限校验(角色白名单)→ A2A Client 拉取 Finance_Agent 的 Agent Card 并 `message/send`
+1. `POST /api/chat` → Assistant 载入会话记忆(短期窗口 + 长期摘要)与个人级记忆各桶
+   (开关开启时);问题含相对时间时, 先在进程内取平台当前时间并注入后续 Prompt
+2. `rewrite_query` 消解指代后走意图三层漏斗 —— "我要报销"这类高频固定指令在第一层
+   (规则)就短路命中 → `agent_delegate / finance`, 零网络调用
+3. 权限校验(角色白名单)→ A2A Client 拉取 Finance_Agent 的 Agent Card(卡片**通告地址不作
+   路由依据**, 统一按配置端点覆盖)并 `message/send`
 4. Finance_Agent(LangGraph ReAct + deepseek-flash)追问/补齐要素后,经 MCP 调用
    `create_reimbursement` 创建报销单
 5. 单号/审批节点沿 A2A 返回 → Assistant 回复用户;全程写 `logs/audit.jsonl`
-   (同一 trace_id),敏感字段(金额/证件号/手机号)脱敏。
+   (同一 trace_id),敏感字段(金额/证件号/手机号)脱敏;下载链接/URL 段原样保留
+   (否则脱敏会把链接撕成坏链)。
 
-K8s 部署:将 `docker/docker-compose.yml` 中 5 个服务各映射为 Deployment+Service
-(compose 可用 `kompose convert` 直接转换),Ollama 建议独立部署为推理服务,
+K8s 部署:把 `docker/docker-compose.yml` 里的各服务(网关/四个 MCP/四个 Agent 与
+postgres/ES/Redis/Mongo/Neo4j/TEI/MinerU 依赖)逐个映射为 Deployment+Service
+(应用类服务可用 `kompose convert` 直接转换后人工校对),有状态组件建议换集群托管存储;
+Ollama 建议独立部署为推理服务,
 `OLLAMA_BASE_URL` 指向其集群内 Service 地址即可,应用代码无需改动。
+
+## 并发容量(多少人共用一个网关要看哪些数)
+
+网关是单进程异步服务: 代码里任何一处"每请求新建客户端/每请求编译一张图/在事件循环里做
+同步 IO"都会被人数乘出来。下面这些键不是功能开关, 而是容量旋钮 —— 调小的现象不是报错,
+而是静默排队到超时(所以出了问题先看日志里的降级告警, 而不是等 500)。
+
+| 键                                                          | 默认         | 卡住的是什么                                                                  |
+| ----------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------- |
+| `PG_POOL_SIZE` / `PG_MAX_OVERFLOW` / `PG_POOL_TIMEOUT`      | 30 / 20 / 15 | 异步引擎连接池(SQLAlchemy 默认只有 5+10)                                      |
+| `PG_SYNC_POOL_SIZE` / `PG_SYNC_MAX_OVERFLOW`                | 5 / 5        | 同步引擎(psycopg3); 网关 + 每个 mcp/agent 进程各建一份                        |
+| postgres `max_connections`                                  | 200          | 上面两项的总和必须留得下, 对账口径见 `app/config.py::pg_pool_size` 注释       |
+| `REDIS_MAX_CONNECTIONS`                                     | 100          | 会话记忆 + 三类 Cache + Checkpointer 共用一个客户端(默认 50)                  |
+| `EMBEDDING_QUERY_CONCURRENCY` / `EMBEDDING_MAX_CONNECTIONS` | 8 / 32       | Ollama 推理并发: 超过它在内部 tokenize 阶段返 400, 语义层与稠密通道会集体降级 |
+| `ES_SEARCH_TIMEOUT` / `ES_SEARCH_CONCURRENCY`               | 3s / 32      | 稀疏通道: 原来是 30s 挂钟, ES 半死时把连接和内存拖爆                          |
+| `RERANK_TIMEOUT` + TEI 连接池                               | 3s / 16      | 重排在热路径上, 超即降级 RRF 融合序                                           |
+| `A2A_TIMEOUT` / `A2A_MAX_CONNECTIONS`                       | 120 / 64     | 委派是多步办理, 没有墙钟就是一条永不返回的请求                                |
+| `MCP_TOOLS_TTL`                                             | 300s         | 工具清单缓存: 否则每次 tool_call 都重开一条 MCP 会话去 discover               |
+| `LLM_REQUEST_TIMEOUT` / `LLM_MAX_RETRIES`                   | 120 / 2      | 在线供应商挂起时不能长期占住一个并发额度; 重试放大会把 429 放大成雪崩         |
+| `STREAM_MAX_CONCURRENT_RUNS`                                | 200          | 背压闸门: 超上限直接 503(+`Retry-After`), 保护已经在流的人                    |
+| `STREAM_MAX_EVENTS` / `STREAM_MAX_BUFFERS`                  | 4000 / 2000  | 单个 run 的事件数与缓冲区总数的内存硬顶                                       |
+| `THREAD_POOL_TOKENS`                                        | 64           | `asyncio.to_thread`(默认 min(32,cpu+4))与 anyio(默认 40)两个线程池            |
+| `SESSION_MEMORY_LOCAL_MAX`                                  | 5000         | Redis 不可用时进程内会话记忆的 LRU 上限(防无界涨内存)                         |
+
+单 worker 部署下真正的天花板依次是: 在线 LLM 的并发配额 → 一份 Ollama/TEI 的推理吞吐 →
+PG 连接总量。闸门取 200 的含义是"到此为止接新流量", 不是"能同时服务 200 人"。
+
+验证手段(不起宿主网关, 压的是 **容器内** 网关, 见 `.qoder/rules/container-first-verification.md`):
+
+```powershell
+# 纯逻辑并发不变量(事件缓冲封顶与跳号提示、审计批量落盘、背压闸门、fetch 流式读取)
+uv run python -m scripts.test_concurrency_offline
+# 真打并发(默认 120 路流式对话; --clients N --kind chat|kb)
+uv run python -m scripts.stress_concurrency --clients 200 --kind kb
+# 就绪探针(过载时返回 503, 供负载器摘流量)
+curl http://localhost:18000/api/health/ready
+```

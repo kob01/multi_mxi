@@ -1,5 +1,10 @@
 """个人记忆提取: 一次 LLM 调用同时产出全部记忆桶。
 
+画像与关系额外带**生效时间**(口径见 ``app/memory/temporal.py``): 用户讲过去的状态
+("2015 年秋我 64kg")时, 时间必须落到 ``valid_at`` 而不是混进值里 —— 否则十年前的
+旧值会按"最后听到"顶掉当前态。未标时间即本轮日期当下生效, 因此这里必须把"今天"
+一并交给模型并自己算好兜底值。
+
 Profile / Preference / Habit / Episode / Knowledge 与 entities/relations 共用的
 是这一份提取结果, 不做多次 LLM 调用 —— 每轮对话结束都触发一次提取本身就是额外
 开销, 拆成六七次纯属浪费(桶的定义见 ``app/memory/taxonomy.py``)。
@@ -13,17 +18,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from app.assistant.prompts import MEMORY_EXTRACTION_PROMPT
 from app.config import get_settings
 from app.llm import get_chat_model
+from app.memory.temporal import parse_embedded_date, parse_event_time, today_cst
 
 logger = logging.getLogger(__name__)
 
-# 内网统一东八区(与调度图的平台时钟同源): 模型需要"今天是几号"才能换算相对时间。
-_CST = timezone(timedelta(hours=8))
 # occurred_at 的合理区间: 晚于未来 1 天或早于三年前的值一律当作模型猜错。
 _FUTURE_TOLERANCE = timedelta(days=1)
 _PAST_TOLERANCE = timedelta(days=365 * 3)
@@ -128,17 +133,55 @@ def _llm():
     return _extraction_llm
 
 
-def _parse_profile(raw: object) -> list[dict]:
+def _parse_profile(raw: object, *, today: datetime) -> list[dict]:
+    """画像原子 -> ``[{key, value, valid_at, explicit}]``。
+
+    时间是这一桶最容易丢的信息: 用户说"2015 年秋我 64kg", 只留 value 就会让十年前的
+    旧值顶掉当前态, 所以话里的时间必须拆出来落到 ``valid_at``(现实轴), value 只留纯值。
+    ``at`` 缺失或解析不出时按本轮日期兜底("现在说的即当下生效"), 并用 ``explicit``
+    区分"用户明说的时间"与"系统兜底的时间" —— 只有前者会在画像摘要里渲染成生效日期。
+    """
     if not isinstance(raw, list):
         return []
     items: list[dict] = []
     for entry in raw:
         if not isinstance(entry, dict):
             continue
-        key = _clean_str(entry.get("key"), 40)
-        value = _clean_str(entry.get("value"), 120)
-        if key and value:
-            items.append({"key": key, "value": value})
+        # 键名也可能被写成"体重（2015年）": 剥掉时间修饰, 否则同一个属性会开成两个槽。
+        key, key_stamp = parse_embedded_date(_clean_str(entry.get("key"), 40))
+        value, value_stamp = parse_embedded_date(_clean_str(entry.get("value"), 120))
+        if not (key and value):
+            continue
+        valid_at = parse_event_time(entry.get("at")) or value_stamp or key_stamp
+        items.append(
+            {
+                "key": key,
+                "value": value,
+                "valid_at": valid_at or today,
+                "explicit": valid_at is not None,
+            }
+        )
+    return items
+
+
+def _parse_relations(raw: object, entity_names: set[str], *, today: datetime) -> list[dict]:
+    """关系三元组, 额外带 ``valid_at``(现实轴, 缺省为本轮日期)。
+
+    沿用"src/dst 必须已在 entities 出现"的校验(图里不允许凭空节点); 时间用来让写入侧
+    分辨"当前态变更"与"用户在讲过去的关系", 解析不出就按听到这句话的时间兜底。
+    """
+    items: list[dict] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("src") not in entity_names or entry.get("dst") not in entity_names:
+            continue
+        relation = _clean_str(entry.get("relation"), 40)
+        if not relation:
+            continue
+        items.append(
+            {**entry, "relation": relation, "valid_at": parse_event_time(entry.get("valid_at")) or today}
+        )
     return items
 
 
@@ -179,12 +222,16 @@ def _parse_knowledge(raw: object) -> list[KnowledgeRecord]:
     return items
 
 
-def _parse(raw: str) -> MemoryExtraction:
+def _parse(raw: str, *, today: datetime | None = None) -> MemoryExtraction:
     """解析 LLM 输出的 JSON; 结构不符合预期时退化为空提取, 不抛出。
 
     单个字段坏掉(类型不对/元素不是 dict)只让该字段为空, 不影响其它桶 —— 一份
     画像提取失败不该把同一轮的情节和实体关系一起丢掉。
+
+    ``today`` 是画像/关系的时间兜底基准(本轮对话日期): 调用方可注入以便离线测试,
+    不传则取东八区今天。
     """
+    stamp = today or today_cst()
     data = json.loads(raw)
     if not isinstance(data, dict):
         return MemoryExtraction()
@@ -193,18 +240,24 @@ def _parse(raw: str) -> MemoryExtraction:
         if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip()
     ]
     entity_names = {e["name"] for e in entities}
-    relations = [
-        r for r in data.get("relations", [])
-        if isinstance(r, dict)
-        and r.get("src") in entity_names and r.get("dst") in entity_names
-        and isinstance(r.get("relation"), str) and r["relation"].strip()
-    ]
+    raw_relations = data.get("relations")
+    # 关系端点没被单独列进 entities 是小模型常见写法(如 src="我" 只出现在关系里):
+    # 补一个 other 型实体把它挂上图, 否则整条关系会被"端点必须已存在"的校验丢掉,
+    # 个人图谱就永远只有节点没有边(双时态关系失效也就无从发生)。
+    for entry in raw_relations if isinstance(raw_relations, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for name in (entry.get("src"), entry.get("dst")):
+            if isinstance(name, str) and name.strip() and name not in entity_names:
+                entity_names.add(name)
+                entities.append({"name": name, "type": "other"})
+    relations = _parse_relations(raw_relations, entity_names, today=stamp)
     # 遗留 facts 并入 knowledge: 老库里的 fact 记录仍在召回, 新提取也不该丢这部分信息。
     legacy_facts = _str_list(data.get("facts"))
     knowledge = _parse_knowledge(data.get("knowledge"))
     knowledge.extend(KnowledgeRecord(topic="", content=text) for text in legacy_facts)
     return MemoryExtraction(
-        profile=_parse_profile(data.get("profile")),
+        profile=_parse_profile(data.get("profile"), today=stamp),
         preferences=_str_list(data.get("preferences")),
         habits=_str_list(data.get("habits")),
         episodes=_parse_episodes(data.get("episodes")),
@@ -215,16 +268,42 @@ def _parse(raw: str) -> MemoryExtraction:
     )
 
 
-async def extract_memories(message: str, answer: str) -> MemoryExtraction:
-    """对一轮 ``(user, assistant)`` 对话做个人记忆提取。"""
+def _format_existing(preferences: Sequence[str], habits: Sequence[str]) -> str:
+    """把已存的偏好/习惯拼成提取 prompt 的"已记住"小节。
+
+    提取器本身无状态, 不告诉它"已经记过什么"就会每轮重复抽同一件事的
+    不同说法(语义查重阈值 0.92 卡不住改写的近义句)。这里只列文本, 让模型
+    自己判断本轮是否已被覆盖; 两个桶都为空时给一个占位行, 避免 prompt 里出现
+    空小节让模型误解为"没有已存信息"。
+    """
+    lines: list[str] = []
+    lines.extend(f"- [偏好] {text}" for text in preferences if text.strip())
+    lines.extend(f"- [习惯] {text}" for text in habits if text.strip())
+    return "\n".join(lines) if lines else "(无)"
+
+
+async def extract_memories(
+    message: str,
+    answer: str,
+    *,
+    existing_preferences: Sequence[str] = (),
+    existing_habits: Sequence[str] = (),
+) -> MemoryExtraction:
+    """对一轮 ``(user, assistant)`` 对话做个人记忆提取。
+
+    ``existing_preferences`` / ``existing_habits`` 是该用户已存的对应桶文本,
+    供提取器判重(不传则退化为旧行为: 只看本轮, 容易重复写入)。
+    """
+    _today = today_cst()  # 东八区今天: 既是 prompt 里的"今天是几号", 也是未标时间属性的生效时间
     prompt = MEMORY_EXTRACTION_PROMPT.format(
         message=message,
         answer=answer,
-        today=datetime.now(_CST).strftime("%Y-%m-%d"),
+        today=_today.strftime("%Y-%m-%d"),
+        existing=_format_existing(existing_preferences, existing_habits),
     )
     try:
         resp = await _llm().ainvoke(prompt)
-        return _parse(str(resp.content))
+        return _parse(str(resp.content), today=_today)
     except Exception as exc:  # noqa: BLE001 - 提取失败只是这一轮不写长期记忆, 不影响对话
         logger.warning("长期记忆提取失败, 本轮跳过: %s", exc)
         return MemoryExtraction()

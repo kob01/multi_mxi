@@ -8,7 +8,7 @@
 与 finance_server 的边界: 报销是"费用已发生后核销", 采购是"付款前的事前把关",
 两者共用 fin_department_budgets 预算池, 但单据与状态机各自独立, 不互相冒充。
 
-写操作纪律(与既有 server 一致): create_*/submit_*/approve_* 一律不被 Tool Cache
+写操作纪律(与既有 server 一致): create_*/submit_*/save_* 一律不被 Tool Cache
 缓存(前缀白名单不含它们), 初审结论每次实算, 防止把一次"提交成功"复用到下一次。
 
 Run:

@@ -1,9 +1,10 @@
 """RAG knowledge-base build script.
 
 Parses documents under KNOWLEDGE_DIR (txt/md/pdf/docx + video transcripts),
-chunks, embeds with bge-m3 and upserts into the pgvector ``knowledge_chunks``
-table, then rebuilds the Elasticsearch BM25 index (also the repair path for an
-existing corpus: re-running this script re-syncs PostgreSQL -> ES wholesale).
+chunks, embeds with bge-m3 and publishes them into the pgvector parent/child
+tables (``doc_chunks`` + ``doc_parents``, 正文入 Mongo), then rebuilds the
+Elasticsearch BM25 index (also the repair path for an existing corpus:
+re-running this script re-syncs PostgreSQL -> ES wholesale).
 
 Usage:
     python -m scripts.ingest_knowledge [--dir ./data/knowledge]

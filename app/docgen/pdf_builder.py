@@ -9,7 +9,8 @@ spec 结构(与 docx 同构):
      "sections": [{"heading": "小节标题", "body": "正文, 换行分段"}],
      "bullets": ["要点1"],
      "table": {"columns": [...], "rows": [[...]]},
-     "images": [{"path": "本地png", "caption": "图1"}]}
+     "images": [{"src": "本地png或图片URL", "caption": "图1"}]}
+     (图片项统一用 ``src``; ``url``/``path`` 作为同义写法也被解析层接受)
 """
 
 from __future__ import annotations

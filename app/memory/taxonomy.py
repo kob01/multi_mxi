@@ -53,7 +53,12 @@ BUCKET_SPECS: dict[MemoryBucket, BucketSpec] = {
         label="画像",
         inject="full",
         top_k_key="",
-        prompt_header="[用户画像]",
+        # 第二行是给模型的阅读口径: 画像里的值是"按生效时间派生的当前态", 避免模型
+        # 把带日期的旧值(只会在用户明说过时间时才出现)当成现在的状况。
+        prompt_header=(
+            "[用户画像]\n"
+            "(以下为当前态; 括号内是该值的生效时间; 同一属性另有历史值时以当前态为准)"
+        ),
     ),
     MemoryBucket.PREFERENCE: BucketSpec(
         bucket=MemoryBucket.PREFERENCE,

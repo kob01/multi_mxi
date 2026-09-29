@@ -13,6 +13,7 @@ candidates; the relevance cutoff is applied exclusively at the rerank stage
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Sequence
@@ -113,19 +114,73 @@ def _doc_source(chunk: KnowledgeChunk) -> dict:
 
 
 class ElasticBM25Retriever:
-    """BM25 lexical channel backed by Elasticsearch."""
+    """BM25 lexical channel backed by Elasticsearch.
+
+    高并发下的三个要点(都不是可选的):
+    - 索引存在性只探一次: 旧实现每次 ``search`` 都跑一次 ``indices.exists``,
+      等于每轮对话白送一个 ES 往返(几百 QPS 时它比查询本身还贵)。
+    - 检索超时是秒级而非 30s: ES 半死时 30s 挂钟会把连接和内存拖爆,
+      这里宁可快速失败走"稀疏通道为空"的降级。
+    - 稀疏通道有并发上限: 超出部分在本地排队而不是把 ES 压到雪崩。
+    """
 
     def __init__(self, url: str | None = None, index: str | None = None) -> None:
         settings = get_settings()
         self.index = index or settings.es_index
+        self._search_timeout = max(0.5, float(settings.es_search_timeout))
+        self._rebuild_timeout = max(5, int(settings.es_rebuild_timeout))
+        self._index_exists = False
+        self._ensure_lock: asyncio.Lock | None = None
+        self._search_gate = asyncio.Semaphore(max(1, settings.es_search_concurrency))
+        # 探询失败只告警一次: ES 长期不可用时不要每轮刷一条 warning 把日志冲掉。
+        self._warned = False
+        # 两个客户端分开: 检索要快失败, 重建要允许慢(两者共用一个超时会两头不对)。
         self._client = AsyncElasticsearch(
-            url or settings.es_url, request_timeout=30, verify_certs=False
+            url or settings.es_url,
+            request_timeout=self._search_timeout,
+            verify_certs=False,
+            max_retries=0,
+            retry_on_timeout=False,
+        )
+        self._bulk_client = AsyncElasticsearch(
+            url or settings.es_url,
+            request_timeout=self._rebuild_timeout,
+            verify_certs=False,
         )
 
+    async def aclose(self) -> None:
+        """释放两个连接池(供 lifespan 关停调用)。"""
+        for client in (self._client, self._bulk_client):
+            try:
+                await client.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("closing elasticsearch client failed: %s", exc)
+
     async def ensure_index(self) -> None:
-        """Create the index + mapping on first use (idempotent)."""
-        if await self._client.indices.exists(index=self.index):
+        """Create the index + mapping on first use (幂等且只探一次)。
+
+        重建路径(:meth:`rebuild`)会显式重置标记, 因为 ``delete`` + ``create`` 后
+        存在性确实变了; 除此之外只有首次真正发一次 ``exists`` 请求。
+        """
+        if self._index_exists:
             return
+        if self._ensure_lock is None:
+            self._ensure_lock = asyncio.Lock()
+        async with self._ensure_lock:
+            if self._index_exists:
+                return
+            if await self._client.indices.exists(index=self.index):
+                self._index_exists = True
+                return
+            await self._create_index()
+            self._index_exists = True
+
+    async def _create_index(self) -> None:
+        """只建索引: 存在性判断在 :meth:`ensure_index` 里做(幂等不靠这里抢)。
+
+        多进程/多实例并发同时建会报 resource_already_exists: 语义上就是成功,
+        调用方(search/rebuild 已在自己的降级分支里兜异常)不需要区分这个。
+        """
         await self._client.indices.create(
             index=self.index,
             mappings={
@@ -167,13 +222,16 @@ class ElasticBM25Retriever:
 
         流式重建时批间不 refresh(最后一批才 refresh), 避免大语料重建的 refresh 抖动。
         语料源 = PG ``doc_chunks``(title + chunk_text), 与向量同一张表, 不依赖 Mongo。
+
+        走重建专用的宽松超时客户端, 并重置存在性标记(delete 后确实不存在了)。
         """
-        await self._client.indices.delete(index=self.index, ignore=[404])
+        self._index_exists = False
+        await self._bulk_client.indices.delete(index=self.index, ignore=[404])
         await self.ensure_index()
         if hasattr(chunks_or_iter, "__aiter__"):
             async for batch in chunks_or_iter:
                 await self.index_chunks(batch, refresh=False)
-            await self._client.indices.refresh(index=self.index)
+            await self._bulk_client.indices.refresh(index=self.index)
         else:
             await self.index_chunks(list(chunks_or_iter))
 
@@ -186,7 +244,7 @@ class ElasticBM25Retriever:
             {"_index": self.index, "_id": c.chunk_id, "_source": _doc_source(c)}
             for c in chunks
         ]
-        await async_bulk(self._client, actions, refresh=refresh)
+        await async_bulk(self._bulk_client, actions, refresh=refresh)
 
     async def search(
         self, query: str, top_k: int, principal: Principal | None = None
@@ -195,29 +253,41 @@ class ElasticBM25Retriever:
 
         不设任何分数阈值 —— 稀疏通道只负责召回, 相关性裁剪统一在 rerank
         阶段完成; 这里即使低分也按排名返回, 供 RRF 融合。
+
+        并发上限内的查询才发到 ES, 超出部分在本地排队; 任何失败(含超时)都降级为
+        空通道由稠密通道兜底, 且同类失败只告警一次(否则 ES 挂了会被刷成日志风暴)。
         """
         tokens = tokenize(query)
         if not tokens:
             return []
         try:
-            await self.ensure_index()
-            bool_query: dict = {"must": [{"match": {"content_tokens": " ".join(tokens)}}]}
-            if acl_filter := _acl_filter(principal):
-                bool_query["filter"] = acl_filter
-            resp = await self._client.search(
-                index=self.index,
-                size=top_k,
-                query={"bool": bool_query},
-                source=[
-                    "chunk_id", "doc_id", "title", "source", "modality",
-                    "parent_id", "page_no", "section",
-                    "visibility", "owner_id", "dept_id", "allowed_roles",
-                ],
-            )
+            async with self._search_gate:
+                await self.ensure_index()
+                bool_query: dict = {"must": [{"match": {"content_tokens": " ".join(tokens)}}]}
+                if acl_filter := _acl_filter(principal):
+                    bool_query["filter"] = acl_filter
+                resp = await self._client.search(
+                    index=self.index,
+                    size=top_k,
+                    query={"bool": bool_query},
+                    source=[
+                        "chunk_id", "doc_id", "title", "source", "modality",
+                        "parent_id", "page_no", "section",
+                        "visibility", "owner_id", "dept_id", "allowed_roles",
+                    ],
+                )
         except Exception as exc:
             # ES 故障不阻断对话: 稀疏通道降级为空, 由稠密通道兜底。
-            logger.warning("elasticsearch BM25 search failed, sparse channel empty: %s", exc)
+            if not self._warned:
+                self._warned = True
+                logger.warning(
+                    "elasticsearch BM25 search failed, sparse channel empty "
+                    "(后续同类失败不再刷屏): %s", exc
+                )
+            else:
+                logger.debug("elasticsearch BM25 search failed: %s", exc)
             return []
+        self._warned = False
         chunks: list[KnowledgeChunk] = []
         for hit in resp["hits"]["hits"]:
             src = hit["_source"]
@@ -252,3 +322,11 @@ def get_es_bm25() -> ElasticBM25Retriever:
     if _retriever is None:
         _retriever = ElasticBM25Retriever()
     return _retriever
+
+
+async def close_es_client() -> None:
+    """释放单例里的两个连接池(挂到 lifespan 关停, 与 close_redis/close_mongo 同风格)。"""
+    global _retriever
+    if _retriever is not None:
+        await _retriever.aclose()
+        _retriever = None

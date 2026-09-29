@@ -23,6 +23,10 @@ dependencies = [
     "langchain-ollama>=0.2.1",
     "langchain-openai>=0.2.0",
     "langgraph>=0.2.60",
+    # 自托管 LLM 可观测(app/tracing.py): 与 LangSmith 并存, 以 LangChain
+    # CallbackHandler 挂在图顶层调用上。必须与 compose 里 profile=langfuse 的
+    # 服务同大版本(镜像 langfuse/langfuse:4 -> SDK v4; v4 才支持 trace_context)。
+    "langfuse>=4,<5",
     # 记忆层: Session Memory/Working State Checkpoint 落 Redis, Long Memory(Graph) 落 Neo4j
     # 注意: langgraph-checkpoint-redis 要求 Redis 侧带 RedisJSON + RediSearch 模块,
     # 因此 compose 中用的是 redis-stack-server 镜像(非裸 redis:alpine)。

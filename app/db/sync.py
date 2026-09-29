@@ -62,6 +62,13 @@ def get_sync_engine() -> Engine:
             url,
             pool_pre_ping=True,
             pool_recycle=3600,
+            # 同步池容量显式给: 默认 5+10 在"每个业务工具调用都拿一条"的 ReAct 循环
+            # 下会排队(抢不到默认等 30s 再抛), 而同步工具是在线等结果的路径。
+            # 本引擎不只服务网关: 每个 mcp/agent 进程也各自建一份, 所以取小值
+            # (它是总预算里的乘数项, 对账口径见 Settings.pg_pool_size 注释)。
+            pool_size=max(1, s.pg_sync_pool_size),
+            max_overflow=max(0, s.pg_sync_max_overflow),
+            pool_timeout=max(1, s.pg_pool_timeout),
             # psycopg 走 libpq, 这些均为原生 libpq 参数 (无需像 asyncpg 那样转 SSLContext)。
             connect_args={
                 "connect_timeout": s.pg_connect_timeout,

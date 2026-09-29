@@ -1,4 +1,18 @@
+# pnpm v11 配置入口: 除认证/registry 外的所有设置都写在本文件(驼峰键),
+# package.json 的 "pnpm" 字段已不再被读取(命中会打 [WARN] ... no longer read)。
+# allowBuilds 是 v11 的构建脚本白名单(strictDepBuilds 默认开启),
+# 取代 v10 的 onlyBuiltDependencies / neverBuiltDependencies / ignoredBuiltDependencies。
 allowBuilds:
   esbuild: true
-onlyBuiltDependencies:
-  - esbuild
+
+# 下面两项是 v11 从 .npmrc 搬进来的写法, 当前项目依赖树不需要扁平化, 保持关闭。
+# 打开会改变 node_modules 结构, 必须删 node_modules 后重新 pnpm install 才生效。
+# shamefullyHoist: true
+# strictPeerDependencies: false
+
+# 包管理器版本锁: package.json 里 packageManager 钉 pnpm@11.9.0, engines.pnpm 兜住旧版,
+# pmOnFail 决定运行时版本不匹配怎么处理(v11 新增, 取代 managePackageManagerVersions /
+# packageManagerStrict / packageManagerStrictVersion):
+#   download 下载并改用声明版本(v11 默认, 保证各环境 node_modules 布局一致)
+#   error    直接失败, 要求手工切版本;  warn 只告警继续;  ignore 不检查(版本交 mise/asdf/Volta)
+pmOnFail: download

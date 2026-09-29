@@ -36,6 +36,30 @@ logger = logging.getLogger(__name__)
 _OVERFETCH = 3
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    """naive 时间按 UTC 补齐(容器默认 UTC, 老行可能是 naive)。"""
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _is_same_observation(existing: datetime | None, incoming: datetime | None, window_days: int) -> bool:
+    """两条时间是不是"同一件事的再一次说法": 任一没时间或相差在窗口内即算同一观测。
+
+    相差超出窗口就是同一事实的**不同时刻观测**(如"现在 70kg"与"2015 年秋 64kg"),
+    这种必须各存一条 —— 语义查重救的是"同一件事反复说", 不是"不同时间同一指标"。
+    """
+    if existing is None or incoming is None:
+        return True
+    return abs((_aware(incoming) - _aware(existing)).days) <= window_days
+
+
+def _later(a: datetime | None, b: datetime | None) -> datetime | None:
+    """取两者中较新的时间(空值忽略): 合并时 ``occurred_at`` 只往前走, 不回退。"""
+    stamps = [s for s in (_aware(a), _aware(b)) if s is not None]
+    return max(stamps) if stamps else None
+
+
 @dataclass
 class MemoryHit:
     """一条记忆 + 召回信息(分数为 cosine 相似度, 越大越相关)。"""
@@ -97,6 +121,11 @@ class LongTermMemoryStore:
 
         查重范围是"同用户 + 同桶": 跨桶查重会把语义相近但用途不同的记录合并,
         例如把偏好"回复用中文"和知识"项目语言是中文"当成一条。
+
+        命中查重也不等于直接覆盖: 两条 ``occurred_at`` 相差超出
+        ``memory_observation_window_days`` 时当作"同一事实的不同时刻观测"各存一条,
+        否则"2015 年我 64kg"会把"现在 70kg"整条抹掉(而这两条都是有用的);
+        留在窗口内才真的合并, 且 ``occurred_at`` 只往前走不后退。
         """
         if not user_id or not content.strip():
             return 0
@@ -106,7 +135,12 @@ class LongTermMemoryStore:
             async with session.begin():
                 dist = LongTermMemoryRow.embedding.cosine_distance(list(vec))
                 stmt = (
-                    select(LongTermMemoryRow.id, dist.label("dist"))
+                    select(
+                        LongTermMemoryRow.id,
+                        LongTermMemoryRow.content,
+                        LongTermMemoryRow.occurred_at,
+                        dist.label("dist"),
+                    )
                     .where(
                         LongTermMemoryRow.user_id == user_id,
                         LongTermMemoryRow.kind == kind,
@@ -117,12 +151,31 @@ class LongTermMemoryStore:
                 await session.execute(sa_text(f"SET LOCAL hnsw.ef_search = {max(100, 10)}"))
                 row = (await session.execute(stmt)).first()
                 similarity = 1.0 - float(row.dist) if row else 0.0
-                if row and similarity >= settings.memory_dedup_threshold:
+                # 命中查重不等于"同一条记忆": 时间超出观测窗口就是同一事实的不同时刻
+                # 观测(体重 70kg vs 2015 年 64kg), 那种各存一条, 读路径按较新的锚点排序。
+                same_observation = bool(row) and _is_same_observation(
+                    row.occurred_at, occurred_at, settings.memory_observation_window_days
+                )
+                if row and similarity >= settings.memory_dedup_threshold and same_observation:
+                    # 命中查重 = 同一条记忆的又一次表述: 保留信息更完整的那一句,
+                    # 不能让本轮可能更短的说法把已有富表述冲掉(如"喜欢单板滑雪"
+                    # 覆盖掉"最喜欢的运动是单板滑雪和爬山")。
+                    old_content = (row.content or "").strip()
+                    merged_content = content if len(content) >= len(old_content) else old_content
+                    # embedding 严格对齐最终 content: 采用本轮文本时直接复用函数开头
+                    # 已算好的 vec(零额外 embedding); 保留既有更长文本时重算其向量,
+                    # 顺带修复历史上"改过 content 却没同步 embedding"的漂移行。
+                    merged_vec = (
+                        vec
+                        if merged_content == content
+                        else await self.embedder.embed_query(merged_content)
+                    )
                     values: dict[str, object] = {
-                        "content": content,
+                        "content": merged_content,
+                        "embedding": list(merged_vec),
                         "kind": kind,
                         "source": source,
-                        "occurred_at": occurred_at,
+                        "occurred_at": _later(row.occurred_at, occurred_at),
                         "last_accessed_at": datetime.now(timezone.utc),
                     }
                     # 命中查重时不抹掉已有标题(本轮提取常常不带 title)。
@@ -291,6 +344,35 @@ class LongTermMemoryStore:
                 delete(LongTermMemoryRow).where(
                     LongTermMemoryRow.user_id == user_id,
                     LongTermMemoryRow.id.in_(list(memory_ids)),
+                )
+            )
+            await session.commit()
+        return int(result.rowcount or 0)
+
+    async def merge_group(
+        self, user_id: str, keep_id: int, content: str, drop_ids: Sequence[int]
+    ) -> int:
+        """把一个语义重复组归并成一条: 保留 ``keep_id`` 并刷新其文本, 删除组内其余。
+
+        所有操作都限定 ``user_id`` 且排除 ``keep_id`` 本身, 返回实际删除行数。
+        重算保留行的 embedding(文本变了, 不重算会让后续查重/召回对新文本失准)。
+        """
+        keep_id = int(keep_id)
+        drop = [int(i) for i in drop_ids if int(i) != keep_id]
+        if not user_id or not drop or not content.strip():
+            return 0
+        vec = await self.embedder.embed_query(content)
+        async with self._sessions()() as session:
+            await session.execute(
+                update(LongTermMemoryRow)
+                .where(LongTermMemoryRow.user_id == user_id, LongTermMemoryRow.id == keep_id)
+                .values(content=content.strip(), embedding=list(vec),
+                        last_accessed_at=datetime.now(timezone.utc))
+            )
+            result = await session.execute(
+                delete(LongTermMemoryRow).where(
+                    LongTermMemoryRow.user_id == user_id,
+                    LongTermMemoryRow.id.in_(drop),
                 )
             )
             await session.commit()

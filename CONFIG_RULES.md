@@ -16,7 +16,9 @@
 | 6    | 宿主端口走 `*_HOST_PORT`（18000/18001/18002/17474/17687） | `config-env-tracks.md` §4      |
 | 7    | A2A 卡片通告地址不作路由依据                              | `a2a-endpoint.md`              |
 | 8    | 密钥只住 `docker/secrets/*.txt`，dotenv 留空              | `config-env-tracks.md` §5      |
-| 9    | 开发拓扑：宿主只跑网关 + vite dev                         | `config-env-tracks.md` §6      |
+| 9    | 开发拓扑：容器 = 唯一验证环境，宿主只跑 vite dev + Ollama | `config-env-tracks.md` §6      |
+| 10   | 容器轨防覆盖：compose 红线键字面量锁死 + env-check        | `config-env-tracks.md` §7      |
+| 11   | 禁止宿主直跑网关验证，改代码必重建镜像                    | `container-first-verification.md` |
 | —    | 存储三层分工（PG / ES / Mongo）                           | `config-env-tracks.md` §3      |
 | —    | 症状 → 红线定位速查（动手前看）                           | `config-redlines-checklist.md` |
 
@@ -35,6 +37,7 @@
 ## 自检
 
 ```
+uv run python -m scripts.dev_services env-check
 uv run python -m scripts.dev_services check
 uv run python -m scripts.package --check-only
 ```

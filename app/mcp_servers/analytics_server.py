@@ -5,8 +5,9 @@
   任何写操作在语法层就被拒; 这是"分析"与"办理"的分界, 分析不改业务数据。
 - **图表/报告是产物, 不是文本**: 出图落 data/reports 并回 URL(SVG 由浏览器渲染,
   中文不需要服务端字体), 报告同理。把 400 行 SVG 塞进对话既烧 token 又画不出来。
-- **零新增依赖**: 图表用 app/analytics/charts.py 的纯 Python SVG 渲染, 不引
-  matplotlib(镜像体积与容器 CJK 字体的双重代价)。
+  图要进 office 文档时另取同一次调用返回的 png_url(位图才能被 docx/pptx/pdf 嵌)。
+- **不新增绘图依赖**: 图表用 app/analytics/charts.py 的纯 Python SVG 渲染, PNG 走
+  既有依赖 Pillow —— 不引 matplotlib/cairosvg(镜像体积与容器 CJK 字体的双重代价)。
 - **口径写死在 SQL 里**: 周报的固定指标由 app/analytics/reports.py 产出, LLM 只
   读数值写结论, 不负责定义统计口径 —— 防"两版周报对不上账"。
 

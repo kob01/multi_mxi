@@ -38,6 +38,11 @@ def get_redis() -> Redis | None:
     这里不做 ping 探活: ``redis.asyncio`` 本身是惰性连接, 探活反而会在启动
     路径上引入一次不必要的阻塞。真正的连通性问题由 ``try_redis()`` 在每条
     命令执行时兜住。
+
+    连接池上限必须显式给: ``redis.asyncio`` 默认 ``max_connections=50``, 而会话记忆
+    /三类 Cache/Checkpointer 都共用这个客户端 —— 百人并发下拿不到连接的命令会直接
+    抛 ``ConnectionError``, 在 ``try_redis`` 里表现为"缓存永远不命中 + 一堆 WARNING",
+    看着像功能坏了而不是容量不够。
     """
     global _redis
     settings = get_settings()
@@ -49,6 +54,8 @@ def get_redis() -> Redis | None:
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2,
+            max_connections=max(10, settings.redis_max_connections),
+            health_check_interval=30,
         )
     return _redis
 

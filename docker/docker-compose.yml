@@ -33,13 +33,34 @@ x-build: &build
 #   2) environment:      -> 锁死"红线"键(服务名地址、/data 卷路径、tracing 开关);
 #                          compose 中 environment 优先级高于 env_file, 会覆盖 1) 的同名键。
 # 宿主 .env 里的 HR_MCP_URL/FINANCE_MCP_URL 是宿主端口(18001/18002), 容器内靠 2) 覆盖回服务名。
+#
+# ---------- 红线键 = 字面量, 禁止插值 (2026-09 彻底修复"docker 变量易被覆盖") ----------
+# 历史写法 `ES_URL: ${ES_URL:-http://elasticsearch:9200}` 让 docker/.env 这个"插值源"能悄悄
+# 改容器地址; 部署者 shell 里残留的同名 export 同样会赢过代码默认值, 两者都表现为静默降级。
+# 红线键(environment 中的地址/卷路径/tracing)一律写字面量, 插值覆盖不动它;
+# env-check 会同时扫 compose 源: 红线键行若含 "${" 直接 FAIL。
+#
+# ---------- 验证拓扑 (2026-09 起: 容器唯一验证环境) ----------
+# assistant 网关只允许跑在本 compose 内(含依赖的 mcp/agent), 宿主机禁止直跑网关做代码验证
+# (见 .qoder/rules/container-first-verification.md)。宿主只留 vite dev(页面热更) + Ollama。
+# 改过 app/ 任何代码 → 必须重建镜像: ./scripts/dev.ps1 -Build。
 secrets:
   pg_password:
     file: ./secrets/pg_password.txt
   deepseek_api_key:
     file: ./secrets/deepseek_api_key.txt
+  # 智谱开放平台(GLM 系列): LLM_MODEL 切到 glm-* 时生效; 文件不存在时
+  # compose 会拒绝启动, 故部署前如需切 GLM 先按 secrets/README 建文件。
+  zhipu_api_key:
+    file: ./secrets/zhipu_api_key.txt
   langsmith_api_key:
     file: ./secrets/langsmith_api_key.txt
+  # Langfuse 项目密钥(与 LangSmith 那把完全独立): 单文件两行 = 第一行 secret key
+  # (sk-lf-...) / 第二行 public key (pk-lf-...), 由 config.py 拆分。
+  # 与其他 secret 同等待遇: 文件不存在则 compose 拒绝启动整个栈(spec 不支持
+  # secrets.*.required), 所以不用 Langfuse 也得建个空文件 —— 见 secrets/README.md。
+  langfuse_api_key:
+    file: ./secrets/langfuse_api_key.txt
 
 services:
   # PostgreSQL: 统一存储层 —— 文档/业务元数据 (原 MySQL) + pgvector 知识块
@@ -49,6 +70,14 @@ services:
       POSTGRES_USER: ${PG_USER:-mxi}
       POSTGRES_DB: ${PG_DATABASE:-mxi}
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      # 连接总量上限(非红线键: 镜像默认 100 撑不住多进程连接池之和):
+      #   网关 async 池(pg_pool_size+pg_max_overflow) + 网关/各 mcp/各 agent 进程各自的
+      #   同步池(pg_sync_*), 默认参数下上限合计已超 100 —— 现象是后起的进程
+      #   "too many connections"而先起的池毫无异常。每连接约 10MB, 200 完全可负。
+      # 改任一池容量都要回来重算这笔账(口径见 app/config.py::pg_pool_size 注释)。
+      # 写法沿用官方镜像: 只覆盖 CMD(即传给 postgres 的参数), entrypoint 仍会处理
+      # POSTGRES_PASSWORD_FILE 与 /docker-entrypoint-initdb.d。
+    command: ["postgres", "-c", "max_connections=200"]
     ports: ["5432:5432"]
     volumes:
       - pg_data:/var/lib/postgresql/data
@@ -66,12 +95,13 @@ services:
     command: python -m app.mcp_servers.hr_server
     ports: ["${HR_MCP_HOST_PORT:-18001}:8001"]
     env_file: [.env]
+    # 红线键字面量锁死(禁止插值, 见文件头约定); PG_PORT/PG_USER 等跨部署可调项仍插值。
     environment:
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      PG_SSLMODE: disable
     secrets: [pg_password]
     depends_on:
       postgres:
@@ -84,11 +114,11 @@ services:
     ports: ["${FINANCE_MCP_HOST_PORT:-18002}:8002"]
     env_file: [.env]
     environment:
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      PG_SSLMODE: disable
     secrets: [pg_password]
     depends_on:
       postgres:
@@ -101,8 +131,10 @@ services:
     ports: ["9001:9001"]
     env_file: [.env]
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
+      # LLM_MODEL/INTENT_MODEL 非红线键: 改 docker/.env 同名键即可整站切换供应商
+      # (deepseek-flash / glm-5.3-flash / 本地 Ollama 模型名), 无需重建镜像。
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       HR_MCP_URL: http://hr-mcp:8001/mcp
@@ -112,12 +144,12 @@ services:
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
       # 专业智能体经 common_tools 直连 PG 按姓名查工号: 缺这几项会退回代码默认值
       # localhost(容器内=自身), 表现为"查不到员工"的静默降级而非启动报错。
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
-    secrets: [deepseek_api_key, pg_password]
+      PG_SSLMODE: disable
+    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [hr-mcp]
@@ -131,19 +163,19 @@ services:
     ports: ["9002:9002"]
     env_file: [.env]
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
       FINANCE_AGENT_URL: http://finance-agent:9002
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
-    secrets: [deepseek_api_key, pg_password]
+      PG_SSLMODE: disable
+    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [finance-mcp]
@@ -159,16 +191,16 @@ services:
     ports: ["${ANALYTICS_MCP_HOST_PORT:-18005}:8005"]
     env_file: [.env]
     environment:
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      PG_SSLMODE: disable
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
       REPORT_DIR: /data/reports
-    secrets: [pg_password, deepseek_api_key]
+    secrets: [pg_password, deepseek_api_key, zhipu_api_key]
     volumes:
       - ../data:/data
     depends_on:
@@ -186,11 +218,11 @@ services:
     ports: ["${PROCUREMENT_MCP_HOST_PORT:-18006}:8006"]
     env_file: [.env]
     environment:
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      PG_SSLMODE: disable
     secrets: [pg_password]
     depends_on:
       postgres:
@@ -203,19 +235,19 @@ services:
     ports: ["9005:9005"]
     env_file: [.env]
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       ANALYTICS_MCP_URL: http://analytics-mcp:8005/mcp
       ANALYST_AGENT_URL: http://analyst-agent:9005
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
-    secrets: [deepseek_api_key, pg_password]
+      PG_SSLMODE: disable
+    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [analytics-mcp]
@@ -229,19 +261,19 @@ services:
     ports: ["9006:9006"]
     env_file: [.env]
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       PROCUREMENT_MCP_URL: http://procurement-mcp:8006/mcp
       CONTRACT_AGENT_URL: http://contract-agent:9006
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: ${PG_HOST:-postgres}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
-    secrets: [deepseek_api_key, pg_password]
+      PG_SSLMODE: disable
+    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
     volumes:
       - ../logs:/data/logs
     depends_on: [procurement-mcp]
@@ -361,25 +393,225 @@ services:
       - mineru_models:/root/.cache
     networks: [mxi]
 
+  # ---------- Langfuse 自托管可观测栈 (profile=langfuse, 默认不拉起) ----------
+  # 与 LangSmith 并存的第二条 trace 通道: 数据只落本栈(容器网络内), 不出宿主机
+  # 也不上外部 SaaS, 因此不触发"容器侧禁止把对话上传云端"的合规红线; 又因为
+  # LANGFUSE_ENABLED 默认 false, 不开就一个容器都不起。
+  # 六个服务是一个整体: web 收 trace + UI, worker 异步批量写 ClickHouse,
+  # 底下 postgres(元数据) / clickhouse(trace 明细) / redis(队列) / minio(原始事件)
+  # 四件套缺一个都跑不通, 故全部挂同一 profile。
+  #   注: 这里不复用业务的 postgres/redis —— Langfuse 要独立库与独立 schema 迁移
+  #   权限, 且其 BullMQ 队列要求 noeviction, 与 checkpoint/缓存共用会互相拖累。
+  # 用法(三步):
+  #   1) docker compose -f docker/docker-compose.yml --profile langfuse up -d
+  #   2) 浏览器开 http://localhost:18100 注册用户 -> 建 org/project -> 拿 pk-lf-/sk-lf-,
+  #      写进 docker/secrets/langfuse_api_key.txt(第一行 sk, 第二行 pk)
+  #   3) docker/.env 置 LANGFUSE_ENABLED=true 并重启 assistant 容器
+  # 凭据策略对齐本栈已有的 ES/Neo4j/Mongo/redis 先例: 内部存储一律不开认证
+  # (不发布宿主端口, 仅 compose 网络内可见), 所以 git 里不会落任何口令字面量。
+  # 仅 NEXTAUTH_SECRET/SALT/ENCRYPTION_KEY 是 Langfuse 应用级必需密钥(zod 强校)且无
+  # _FILE 通道, 只能走环境变量: 下面是上游同样的占位默认值, 一旦 langfuse-web
+  # 要被本机以外的人访问, 就在 docker/.env(已 gitignore) 里覆盖 LANGFUSE_* 三个键。
+  langfuse-web:
+    image: ${LANGFUSE_IMAGE:-docker.m.daocloud.io/langfuse/langfuse:4}
+    profiles: [langfuse]
+    ports: ["${LANGFUSE_WEB_HOST_PORT:-18100}:3000"]
+    environment: &langfuse-env
+      # NEXTAUTH_URL 必须是浏览器实际打开的地址(登录回跳与链接都拼它),
+      # 所以它跟 LANGFUSE_WEB_HOST_PORT 联动; 改端口不改这里会登录后 401。
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:18100}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-dev-only-nextauth-secret}
+      SALT: ${LANGFUSE_SALT:-dev-only-salt}
+      # 必须恰好 64 个 hex 字符(256 bit): openssl rand -hex 32
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      # 合规: 关掉向 Langfuse 官方的匿名使用统计上报(内网也无外网出口)
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # PG 走 trust(见 langfuse-postgres), 所以 URL 里没有口令
+      DATABASE_URL: postgresql://langfuse@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # ClickHouse 必须给一个非空的 CLICKHOUSE_PASSWORD(实测空字符串直接退出:
+      # "CLICKHOUSE_PASSWORD is not set"), 所以这里只能放一个仅内网可见的本地值;
+      # 不发布宿主端口, 无真实数据可泄。跨机部署用 LANGFUSE_CLICKHOUSE_PASSWORD 覆盖。
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse}
+      # 单节点: 关簇模式, 否则迁移会等 Keeper。
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      # 不设 REDIS_AUTH: langfuse 侧 nullish 即不带认证, 对齐 redis 容器的无密码启动
+      # BullMQ 与 redis 7 的版本校验(镜像自带 client 略旧), 官方 compose 亦需置 true
+      LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: "true"
+      # 原始事件落 MinIO(Langfuse v3+ 强依赖, 无法关掉); 桶由 minio 启动前建目录。
+      # 未发布 minio 宿主端口 => 多模态媒体上传这类需浏览器直访桶的功能不启用。
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      # 无头初始化(headless init): 免浏览器点注册就把 user/org/project/API key 建好。
+      # 全空 = 该特性关闭(首次启动后手工在 UI 里建)。要用就在 shell 里临时 export
+      # LANGFUSE_INIT_* 后 up —— 密钥值不进 git 也不进 docker/.env, 建好后把 pk/sk
+      # 写进 docker/secrets/langfuse_api_key.txt 即可。worker 不读这些键, 共享无害。
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    networks: [mxi]
+
+  langfuse-worker:
+    image: ${LANGFUSE_WORKER_IMAGE:-docker.m.daocloud.io/langfuse/langfuse-worker:4}
+    profiles: [langfuse]
+    # 与 web 共享同一套变量(锚点复用), 只是不对外发布 3000。
+    environment: *langfuse-env
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    networks: [mxi]
+
+  # Langfuse 元数据库(用户/org/project/API key/prompt): 独立于业务 postgres,
+  # 因为它要跑自己的 schema 迁移; 不发布宿主端口。
+  langfuse-postgres:
+    image: ${LANGFUSE_PG_IMAGE:-docker.m.daocloud.io/library/postgres:16}
+    profiles: [langfuse]
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_DB: langfuse
+      # 同网络内免认证(对齐 ES/Neo4j/Mongo 的部署取舍): 端口不对外发布。
+      POSTGRES_HOST_AUTH_METHOD: trust
+      # Langfuse 明确要求 PG/CH 时区为 UTC, 否则 trace 查询可能返回空。
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [mxi]
+
+  # ClickHouse: trace/observation 明细的分析型存储(Langfuse v3+ 必需, v2 没有)。
+  langfuse-clickhouse:
+    image: ${LANGFUSE_CLICKHOUSE_IMAGE:-docker.m.daocloud.io/clickhouse/clickhouse-server:25.12}
+    profiles: [langfuse]
+    environment:
+      CLICKHOUSE_DB: default
+      # 首次初始化(卷为空)时 entrypoint 会按这两个值建好 langfuse 用户;
+      # 与上面 langfuse-web/worker 的 CLIENT 侧必须同值。
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse}
+      TZ: UTC
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [mxi]
+
+  # Langfuse 自己的 redis: 只做 BullMQ 队列 + 缓存, 必须 noeviction(队列不能丢)。
+  langfuse-redis:
+    image: ${LANGFUSE_REDIS_IMAGE:-docker.m.daocloud.io/library/redis:7}
+    profiles: [langfuse]
+    command: >-
+      redis-server --maxmemory-policy noeviction --appendonly yes
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [mxi]
+
+  # MinIO: 原始 ingestion 事件的 S3 兼容存储(Langfuse v3+ 强依赖, 无法关闭)。
+  # 镜像在 quay(docker hub 的 minio/minio 已下架), 故走 quay 镜像源。
+  langfuse-minio:
+    image: ${LANGFUSE_MINIO_IMAGE:-quay.m.daocloud.io/minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    profiles: [langfuse]
+    entrypoint: sh
+    # 启动前先用文件系统建好 langfuse 桶(path-style 访问下目录即桶)。
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      # 镜像内置默认账号(minioadmin), 非自建口令; 同样不发布宿主端口。
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks: [mxi]
+
   assistant:
     build: *build
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports: ["${ASSISTANT_HOST_PORT:-18000}:8000"]
     env_file: [.env]
+    # 本块除 LLM_MODEL/INTENT_MODEL/LANGFUSE_ENABLED|PROJECT|ENVIRONMENT 外全部是红线键:
+    # 只允许字面量, 禁止 ${...} 插值(env-check 会扫, 见文件头约定)。LLM_MODEL/INTENT_MODEL
+    # 是可调的模型选择键, 无地址/合规副作用, 故意允许 docker/.env 整站切换在线供应商;
+    # LANGFUSE_* 三键同理(默认关, 开启只影响本网络内的自建可观测栈, 不引入宿主串味)。
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_MODEL: bge-m3
       # 合规红线: trace 会把对话内容上传到 LangSmith, 容器侧永远置 false;
-      # 开发机如需 trace 在宿主 .env 里显式打开(代码默认值也是 false, 双保险)。
-      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      # 宿主 .env 里的 LANGSMITH_TRACING=true 只影响宿主侧脚本, 进不了容器。
+      LANGSMITH_TRACING: "false"
+      LANGSMITH_PROJECT: mxi-assistant
+      LANGSMITH_ENDPOINT: https://api.smith.langchain.com
+      # Langfuse(自托管可观测, 与 LangSmith 并存): 地址是上面 profile=langfuse 的
+      # 服务名(红线字面量); 与 LANGSMITH_TRACING 不同, 它传向容器网络内的自建实例,
+      # 数据不出本机, 所以容器侧允许开启。仍默认关: 需 docker/.env 置
+      # LANGFUSE_ENABLED=true 并 --profile langfuse 把栈起起来才有数据。
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-false}
+      LANGFUSE_PROJECT: ${LANGFUSE_PROJECT:-mxi-assistant}
+      LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-development}
       # Rerank 走同网络内的 TEI 服务 (容器内必须用服务名 tei-rerank, 非 localhost)。
-      TEI_RERANK_URL: ${TEI_RERANK_URL:-http://tei-rerank:8080}
+      TEI_RERANK_URL: http://tei-rerank:8080
       # ES 跑在同一 compose 网络, 用服务名访问; 无需 host.docker.internal
-      ES_URL: ${ES_URL:-http://elasticsearch:9200}
-      ES_INDEX: ${ES_INDEX:-kb_chunks}
+      ES_URL: http://elasticsearch:9200
       # 上传文件必须落在持久卷 /data (../data:/data), 否则默认 ./data/uploads
       # 会解析到容器工作目录 /srv/data/uploads, 容器重启即丢失原始上传文件。
       UPLOAD_DIR: /data/uploads
@@ -398,21 +630,27 @@ services:
       # 分析产物目录: 与 analytics-mcp 写入同一 /data/reports(共用 ../data 卷),
       # 网关才能凭 /api/files/reports/{name} 回取到智能体生成的图表/报告。
       REPORT_DIR: /data/reports
-      # 统一存储层: 元数据与 pgvector 知识块同一个库
-      PG_HOST: ${PG_HOST:-postgres}
+      # 正文外置存储: MongoDB (容器内用 compose 服务名 mongo, 非 localhost)
+      MONGO_URL: mongodb://mongo:27017
+      # 容器内监听端口恒为 8000(见 command/ports 右侧), 锁死防 docker/.env 里的同名值漂移;
+      # 宿主访问端口由 ports 发布映射决定, 与本键无关。
+      ASSISTANT_PORT: "8000"
+      # 非红线(跨部署可调): ES_INDEX / PG_* / EMBEDDING_DIM / REDIS_URL / NEO4J_URI /
+      # MONGO_DATABASE / DOC_KG_ENABLED / MINERU_* / LANGFUSE_ENABLED|PROJECT|ENVIRONMENT
+      # 仍走 docker/.env 插值, 带服务名默认兜底。
+      ES_INDEX: ${ES_INDEX:-kb_chunks}
+      PG_HOST: postgres
       PG_PORT: ${PG_PORT:-5432}
       PG_USER: ${PG_USER:-mxi}
       PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      PG_SSLMODE: disable
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       # 记忆层/缓存层: Session Memory + Checkpoint + 三类 Cache 共用同一个 redis
       # 服务; Graph 长期记忆走 neo4j 服务 (同一 compose 网络, 用服务名访问)。
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
-      # 文档知识图谱(GraphRAG)总开关, 复用同一个 neo4j 服务; 默认关闭, 置 true 开启
+      # 文档知识图谱(GraphRAG)总开关, 复用同一个 neo4j 服务; 容器侧默认开。
       DOC_KG_ENABLED: ${DOC_KG_ENABLED:-true}
-      # 正文外置存储: MongoDB (容器内用 compose 服务名 mongo, 非 localhost)
-      MONGO_URL: ${MONGO_URL:-mongodb://mongo:27017}
       MONGO_DATABASE: ${MONGO_DATABASE:-mxi}
       MONGO_ENABLED: ${MONGO_ENABLED:-true}
       NORMALIZER_VERSION: ${NORMALIZER_VERSION:-n1}
@@ -424,7 +662,9 @@ services:
     secrets:
       - pg_password
       - deepseek_api_key
+      - zhipu_api_key
       - langsmith_api_key
+      - langfuse_api_key
     volumes:
       - ../data:/data
       - ../logs:/data/logs
@@ -461,6 +701,12 @@ volumes:
   redis_data:
   neo4j_data:
   mongo_data:
+  # Langfuse 栈专用(profile=langfuse): 与业务存储完整隔离, 删栈不伤业务数据。
+  langfuse_pg_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_redis_data:
+  langfuse_minio_data:
 
 networks:
   mxi:

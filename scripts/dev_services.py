@@ -1,22 +1,26 @@
-"""开发/验证期的 docker 依赖服务管理 + 对接自检。
+"""开发/验证期的 docker 服务管理 + 对接自检 + 容器轨防覆盖检查。
 
 用法::
 
-    uv run python -m scripts.dev_services up [--build] [--with-assistant]
-    uv run python -m scripts.dev_services check [--strict]
+    uv run python -m scripts.dev_services up [--build]
+    uv run python -m scripts.dev_services check [--strict] [--gateway]
+    uv run python -m scripts.dev_services env-check   # 容器轨防覆盖专项(无需 docker 在跑)
     uv run python -m scripts.dev_services down
 
-为什么需要这个脚本: 本项目除了 Ollama 以外的依赖在 compose 里都有对应服务
-(postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp /
-finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent /
-contract-agent), 宿主只跑网关与
-vite dev。麻烦之处在于这些层
+为什么需要这个脚本: 本项目的全部服务(含 assistant 网关)都在 compose 里
+(assistant / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru /
+hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent /
+analyst-agent / contract-agent), 宿主只跑 vite dev 与 Ollama。**验证代码改动只允许
+走容器**(.qoder/rules/container-first-verification.md), 宿主直跑网关属违规。
+麻烦之处在于这些层
 连不上时**全是静默降级**: Redis 退回内存 dict、checkpoint 退回 InMemorySaver、TEI 超时
 退回 RRF 融合序、Neo4j 关图记忆、Mongo 父块退回子块文本。看功能表现分不清"代码坏了"和
-"配置指到了容器内服务名"。本脚本把每个降级点变成显式的一行结论, 并顺带拦住两类配置事故:
+"配置指到了容器内服务名"。本脚本把每个降级点变成显式的一行结论, 并拦住三类配置事故:
 
 1. 宿主轨混入容器地址(旧版 app/config.py 同时加载 docker/.env 造成的串味, 见 CONFIG_RULES);
-2. 真实密钥被写进 .env / docker/.env(应当只放 docker/secrets/<name>.txt)。
+2. 真实密钥被写进 .env / docker/.env(应当只放 docker/secrets/<name>.txt);
+3. 容器轨被覆盖: compose 红线键退回 ${VAR} 插值写法、docker/.env 地址键串味、
+   双轨同名参数漂移、docker/.env 缺键(容器退代码默认值) —— 即 env-check 子命令。
 """
 
 from __future__ import annotations
@@ -37,9 +41,10 @@ from app.db.session import async_database_url, get_engine
 BASE_DIR = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = "docker/docker-compose.yml"
 
-# dev 期由 docker 提供的服务; assistant 默认不含 —— 它是宿主热重载改造的对象,
-# 一起起会抢宿主发布端口(18000)并让"改代码不生效"这种错觉长期存在。
+# dev 期由 docker 提供的服务; 自 2026-09 起 assistant 网关也在列 —— 验证只允许走容器
+# (容器唯一验证环境, 宿主禁止直跑网关), 改代码后用 up --build 重建镜像生效。
 DEV_SERVICES = [
+    "assistant",
     "postgres",
     "elasticsearch",
     "redis",
@@ -60,7 +65,10 @@ DEV_SERVICES = [
 # 允许出现在 .env / docker/.env 里的密钥字段: 出现非空值即视为写错了位置。
 SECRET_KEYS = (
     "DEEPSEEK_API_KEY",
+    "ZHIPU_API_KEY",
     "LANGSMITH_API_KEY",
+    # Langfuse 项目密钥(sk/pk 共用一个 secret 文件): dotenv 里只写键名、值留空。
+    "LANGFUSE_API_KEY",
     "PG_PASSWORD",
     "MONGO_PASSWORD",
     "NEO4J_PASSWORD",
@@ -86,6 +94,9 @@ CONTAINER_HOSTS = (
     "finance-agent",
     "analyst-agent",
     "contract-agent",
+    # Langfuse 自建可观测栈(profile=langfuse)的服务名。
+    "langfuse-web",
+    "langfuse-minio",
     "host.docker.internal",
 )
 
@@ -318,10 +329,12 @@ async def _probe_agent(name: str, base_url: str) -> tuple[str, str]:
 
 
 async def _probe_gateway() -> tuple[str, str]:
-    s = get_settings()
+    # 探的是 **assistant 容器**发布到宿主的端口(不是宿主自建进程): 容器轨健康检查。
+    host_port = _read_env_pairs("docker/.env").get("ASSISTANT_HOST_PORT") or \
+        _read_env_pairs("docker/.env.example").get("ASSISTANT_HOST_PORT") or "18000"
     # 健康端点在 assistant_router 的 /api 前缀下: GET /health 会落到 SPA catch-all
     # 并返 200 + index.html, 看起来"服务正常"其实探的是静态页。
-    return await _probe_http(f"http://127.0.0.1:{s.assistant_port}/api/health", expect_json=True)
+    return await _probe_http(f"http://127.0.0.1:{host_port}/api/health", expect_json=True)
 
 
 # ---------------------------------------------------------------- 配置轨与密钥检查
@@ -461,11 +474,12 @@ async def _build_checks(with_gateway: bool) -> list[Check]:
     if with_gateway:
         checks.append(
             Check(
-                "assistant(宿主)",
-                f"http://127.0.0.1:{s.assistant_port}/api/health",
+                "assistant(容器)",
+                "compose assistant 容器的发布端口 /api/health",
                 _probe_gateway,
                 required=False,
-                fix="uv run uvicorn app.main:app --host 0.0.0.0 --port " + str(s.assistant_port) + " --reload (或 ./scripts/dev.ps1)",
+                fix="容器网关未起: uv run python -m scripts.dev_services up (宿主直跑网关属违规, "
+                    "见 .qoder/rules/container-first-verification.md)",
             )
         )
     # 单条探测失败不影响其他条(每条自带异常掉到 FAIL), 并发跑省掉十几秒
@@ -514,7 +528,7 @@ async def _action_check(strict: bool, gateway: bool) -> int:
     return 0
 
 
-def _action_up(build: bool, with_assistant: bool) -> int:
+def _action_up(build: bool) -> int:
     missing = [
         n for n in ("pg_password", "deepseek_api_key")
         if not (BASE_DIR / "docker" / "secrets" / f"{n}.txt").is_file()
@@ -526,38 +540,231 @@ def _action_up(build: bool, with_assistant: bool) -> int:
             file=sys.stderr,
         )
         return 2
-    services = list(DEV_SERVICES) + (["assistant"] if with_assistant else [])
-    rc = _run_compose("up", "-d", *services, build=build)
+    rc = _run_compose("up", "-d", *DEV_SERVICES, build=build)
     if rc != 0:
         return rc
     print("\n服务拉起中(TEI 加载权重、ES 建索引需要几十秒), 就绪与否以自检为准:")
-    print("  uv run python -m scripts.dev_services check")
+    print("  uv run python -m scripts.dev_services check --gateway")
     return 0
 
 
 def _action_down() -> int:
-    return _run_compose("stop", *DEV_SERVICES, "assistant")
+    return _run_compose("stop", *DEV_SERVICES)
+
+
+# ---------------------------------------------------------------- env-check: 容器轨防覆盖专项
+
+# compose environment: 里必须锁死为字面量的红线键(地址/卷路径/tracing)。
+# 历史写法 `${ES_URL:-http://elasticsearch:9200}` 让 docker/.env 这个插值源、以及部署
+# shell 里残留的同名 export 都能悄悄改容器地址, 表现为静默降级 —— 改为字面量后这三条
+# 覆盖通道全部失效; 本检查防止日后被人改回去。REDIS_URL/NEO4J_URI/PG_HOST 等带服务名
+# 默认兜底的跨部署可调项不在列(它们故意允许 docker/.env 覆盖)。
+COMPOSE_REDLINE_KEYS = {
+    "OLLAMA_BASE_URL",
+    "DEEPSEEK_BASE_URL",
+    "EMBEDDING_MODEL",
+    "LANGSMITH_TRACING",
+    # Langfuse 上报地址必须锁成 compose 服务名(自建栈在同一个网络里)。
+    "LANGFUSE_BASE_URL",
+    "TEI_RERANK_URL",
+    "ES_URL",
+    "UPLOAD_DIR",
+    "KNOWLEDGE_DIR",
+    "AUDIT_LOG_PATH",
+    "REPORT_DIR",
+    "ASSISTANT_PORT",
+    "PG_SSLMODE",
+    "HR_MCP_URL",
+    "FINANCE_MCP_URL",
+    "ANALYTICS_MCP_URL",
+    "PROCUREMENT_MCP_URL",
+    "HR_AGENT_URL",
+    "FINANCE_AGENT_URL",
+    "ANALYST_AGENT_URL",
+    "CONTRACT_AGENT_URL",
+    "MONGO_URL",
+}
+
+# 双轨故意不同值的键, 不参与漂移比对: 地址/路径/端口类两轨视角天然不同,
+# LANGSMITH_TRACING 是"宿主可开、容器锁关"的合规设计。
+DRIFT_IGNORE = {
+    "OLLAMA_BASE_URL", "ES_URL", "MONGO_URL", "REDIS_URL", "NEO4J_URI", "TEI_RERANK_URL",
+    "MINERU_BASE_URL", "PG_HOST", "DATABASE_URL",
+    "HR_MCP_URL", "FINANCE_MCP_URL", "ANALYTICS_MCP_URL", "PROCUREMENT_MCP_URL",
+    "HR_AGENT_URL", "FINANCE_AGENT_URL", "ANALYST_AGENT_URL", "CONTRACT_AGENT_URL",
+    "WEB_DOCGEN_MCP_URL", "WEB_DOCGEN_AGENT_URL", "WEB_DOCGEN_SANDBOX_URL",
+    "ASSISTANT_HOST", "ASSISTANT_PORT", "WEB_SEARCH_PROXY", "AUDIT_LOG_PATH",
+    "UPLOAD_DIR", "KNOWLEDGE_DIR", "REPORT_DIR",
+    "ASSISTANT_HOST_PORT", "HR_MCP_HOST_PORT", "FINANCE_MCP_HOST_PORT",
+    "ANALYTICS_MCP_HOST_PORT", "PROCUREMENT_MCP_HOST_PORT",
+    "NEO4J_HTTP_HOST_PORT", "NEO4J_BOLT_HOST_PORT", "TEI_PORT",
+    "DOCGEN_MCP_HOST_PORT", "DOCGEN_SANDBOX_HOST_PORT",
+    "LANGSMITH_TRACING",
+    # Langfuse: 两轨故意不同值的地址键, 以及"宿主脚本可开、容器默认关"的开关。
+    "LANGFUSE_BASE_URL", "LANGFUSE_ENABLED", "LANGFUSE_WEB_HOST_PORT",
+}
+
+
+def _parse_compose_env() -> dict[str, dict[str, str]]:
+    """从 compose 文本提取 {服务名: {env 键: 原文值}}。
+
+    故意不走 yaml 解析: 需要区分"未配置"(值为 None)与"显式置空"(值为 ""),
+    且要拿到 `${...}` 原文判断插值写法; 仅限本文件使用的缩进约定
+    (服务名 2 格 / 服务字段 4 格 / environment 键 6 格, 键形如 `KEY: value`)。
+    """
+    text = (BASE_DIR / "docker" / "docker-compose.yml").read_text(encoding="utf-8")
+    out: dict[str, dict[str, str | None]] = {}
+    service = env_mode = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 0:
+            service = env_mode = None
+        elif stripped.endswith(":") and not stripped.startswith("-"):
+            name = stripped[:-1]
+            if indent == 2:
+                service, env_mode = name, None
+            elif indent == 4 and name == "environment":
+                env_mode = {}
+                if service:
+                    out[service] = env_mode
+            elif env_mode is not None:
+                env_mode = None  # 进了 volumes/depends_on 等其他块
+        elif env_mode is not None and indent >= 6 and ": " in stripped:
+            key, _, raw = stripped.partition(": ")
+            env_mode[key.strip()] = raw.strip().strip('"').strip("'") or None
+    return out
+
+
+def _container_track_checks() -> list[Check]:
+    """容器轨四件事: compose 红线键锁死 / docker/.env 地址不串味 / 双轨不漂移 / 与模板不缺键。"""
+    checks: list[Check] = []
+    compose_env = _parse_compose_env()
+    docker_pairs = _read_env_pairs("docker/.env")
+    host_pairs = _read_env_pairs(".env")
+    example_pairs = _read_env_pairs("docker/.env.example")
+
+    # 1) compose 红线键: 存在且为字面量(不含 ${)。
+    #    env_file 会把 docker/.env 整份注入为真实环境变量, environment 同名键才能压住;
+    #    红线键从 compose 消失 = docker/.env 里的任意值直接接管容器。
+    lost, interpolated, empty = [], [], []
+    for svc, envmap in compose_env.items():
+        for key in COMPOSE_REDLINE_KEYS & set(envmap):
+            raw = envmap[key]
+            if raw is None:
+                empty.append(f"{svc}.{key}")
+            elif "${" in raw:
+                interpolated.append(f"{svc}.{key}={raw}")
+    missing = sorted(
+        k for k in COMPOSE_REDLINE_KEYS
+        if all(k not in m for m in compose_env.values())
+    )
+    lock = Check(
+        "compose 红线键: 字面量锁死",
+        "docker/docker-compose.yml environment:",
+        fix="改回字面量; 确需新增可调键时评估是否入红线名单",
+    )
+    problems = []
+    if interpolated:
+        problems.append("退回插值写法(" + ", ".join(interpolated) + ")")
+    if missing:
+        problems.append("已从 compose 消失(" + ", ".join(missing) + ", env_file 里的值将直接接管容器)")
+    if empty:
+        problems.append("显式置空(" + ", ".join(empty) + ")")
+    lock.status = FAIL if problems else OK
+    lock.detail = "; ".join(problems) if problems else f"{sum(len(m) for m in compose_env.values())} 个 env 键已扫, 红线键均为字面量"
+    checks.append(lock)
+
+    # 2) docker/.env 里的地址类键不得出现 localhost(防有人拿它覆盖非红线通道或误导阅读)。
+    host_track = Check(
+        "docker/.env: 地址键无宿主串味",
+        "docker/.env",
+        fix="容器侧地址必须用 compose 服务名(/data 卷路径); 宿主地址只写仓根 .env",
+    )
+    bad_pairs = sorted(f"{k}={v}" for k, v in docker_pairs.items() if _host_of(v) == "localhost")
+    if bad_pairs:
+        host_track.status = FAIL
+        host_track.detail = "出现 localhost 地址: " + ", ".join(bad_pairs)
+    else:
+        host_track.status = OK
+        host_track.detail = "无 localhost 地址键"
+    checks.append(host_track)
+
+    # 3) 双轨同名业务参数不得漂移: 只在单侧调参 = 容器行为与宿主脚本结论不可互相复现。
+    drift = []
+    for k, hv in host_pairs.items():
+        if k in DRIFT_IGNORE or k not in docker_pairs:
+            continue
+        if hv.strip().lower() != docker_pairs[k].strip().lower():
+            drift.append(f"{k}: .env={hv!r} docker/.env={docker_pairs[k]!r}")
+    d = Check(
+        "双轨参数: 同名键同值",
+        ".env vs docker/.env",
+        fix="调参只改一侧会令容器与宿主脚本行为不一致; 把漂移键补齐到另一轨(确属单侧专用则加入 DRIFT_IGNORE 名单)",
+    )
+    if drift:
+        d.status = WARN
+        d.detail = "值不一致: " + "; ".join(drift)
+    else:
+        d.status = OK
+        d.detail = "重叠键无漂移"
+    checks.append(d)
+
+    # 4) docker/.env 与模板不缺键: 缺一个可调键 = 容器退代码默认值(宿主轨可能同值但视角不同)。
+    only_env = sorted(k for k in host_pairs if k not in DRIFT_IGNORE and k not in docker_pairs and k not in SECRET_KEYS)
+    missing_in_example = sorted(k for k in docker_pairs if k not in example_pairs)
+    tmpl = Check(
+        "docker/.env vs 模板: 键集对齐",
+        "docker/.env.example",
+        fix="新增进容器的配置键必须同时落 docker/.env 与 docker/.env.example",
+    )
+    msgs = []
+    if only_env:
+        msgs.append("只在宿主 .env(容器退默认值): " + ", ".join(only_env))
+    if missing_in_example:
+        msgs.append("只在 docker/.env(模板缺失): " + ", ".join(missing_in_example))
+    if msgs:
+        tmpl.status = WARN
+        tmpl.detail = "; ".join(msgs)
+    else:
+        tmpl.status = OK
+        tmpl.detail = "三轨键集对齐"
+    checks.append(tmpl)
+    return checks
+
+
+def _action_env_check() -> int:
+    checks = _container_track_checks()
+    checks += _config_track_checks()
+    ok, warn, fail = _print_report(checks)
+    print(f"合计: OK={ok} WARN={warn} FAIL={fail}")
+    return 1 if any(c.status == FAIL and c.required for c in checks) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="docker 依赖服务管理与对接自检")
+    parser = argparse.ArgumentParser(description="docker 服务管理与对接自检(容器 = 唯一验证环境)")
     sub = parser.add_subparsers(dest="action", required=True)
 
-    p_up = sub.add_parser("up", help="起 dev 期需要的 compose 服务(默认不含 assistant)")
-    p_up.add_argument("--build", action="store_true", help="先重建镜像(改过 app/mcp/agent 代码时需要)")
-    p_up.add_argument("--with-assistant", action="store_true", help="连 assistant 一起起(整栈验证用, 会与宿主网关抢 18000 端口)")
+    p_up = sub.add_parser("up", help="起 dev 期全部 compose 服务(含 assistant 容器网关)")
+    p_up.add_argument("--build", action="store_true", help="先重建镜像(改过 app/ 代码后必须加, 容器跑的是镜像快照)")
 
     p_check = sub.add_parser("check", help="逐服务对接自检")
     p_check.add_argument("--strict", action="store_true", help="WARN 也视为失败(退出码 1)")
-    p_check.add_argument("--gateway", action="store_true", help="顺带探宿主网关 /health")
+    p_check.add_argument("--gateway", action="store_true", help="顺带探 assistant 容器的 /api/health")
+
+    sub.add_parser("env-check", help="容器轨防覆盖专项: compose 红线键锁死/双轨漂移/缺键(无需 docker 在跑)")
 
     sub.add_parser("down", help="停掉 dev 期服务(只停不删卷)")
 
     args = parser.parse_args(argv)
     if args.action == "up":
-        return _action_up(build=args.build, with_assistant=args.with_assistant)
+        return _action_up(build=args.build)
     if args.action == "down":
         return _action_down()
+    if args.action == "env-check":
+        return _action_env_check()
     return asyncio.run(_action_check(strict=args.strict, gateway=args.gateway))
 
 

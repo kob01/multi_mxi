@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from app.assistant.prompts import SUMMARY_PROMPT
@@ -43,7 +44,11 @@ class MemoryStore:
         self._max_turns = settings.memory_max_turns
         self._summary_threshold = settings.memory_summary_threshold
         self._ttl = settings.session_memory_ttl
-        self._sessions: dict[str, SessionMemory] = {}  # 仅降级路径使用
+        # 仅降级路径使用: 有界 LRU(dict + move_to_end)而不是无限 dict。
+        # Redis 长时间不可用且会话不重复时, 旧写法会按会话数单调涨内存(每会话
+        # 还带最多 memory_max_turns 轮原文), 到 1000 人规模就是提前写好的一次 OOM。
+        self._local_max = max(100, settings.session_memory_local_max)
+        self._sessions: OrderedDict[str, SessionMemory] = OrderedDict()
         self._summarizer = get_chat_model(settings.llm_model, temperature=0)
 
     def _redis_or_none(self):
@@ -57,7 +62,21 @@ class MemoryStore:
 
     # -------------------------------------------------------------- 降级路径
     def _local(self, session_id: str) -> SessionMemory:
-        return self._sessions.setdefault(session_id, SessionMemory())
+        """取/建一个降级会话, 并按 LRU 淘汰超出的旧会话。
+
+        淘汰只影响降级路径的历史完整性(与 Redis 掉同一个会话同性质), 不会串到
+        别人的会话: 每个会话自己的 turns 只跟着自己的 key 走。
+        """
+        mem = self._sessions.get(session_id)
+        if mem is None:
+            mem = SessionMemory()
+            self._sessions[session_id] = mem
+            while len(self._sessions) > self._local_max:
+                evicted, _ = self._sessions.popitem(last=False)
+                logger.debug("session memory 降级缓存达上限, 淘汰最旧会话 %s", evicted)
+        else:
+            self._sessions.move_to_end(session_id)
+        return mem
 
     def _local_history_text(self, session_id: str) -> str:
         mem = self._local(session_id)

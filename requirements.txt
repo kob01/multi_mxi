@@ -13,6 +13,10 @@ langchain-community>=0.3.7
 langchain-ollama>=0.2.1
 # DeepSeek 官方集成: 透出 reasoning_content(深度思考), langchain-openai v1 不提取该字段
 langchain-deepseek>=1.0.0
+# 自托管 LLM 可观测(app/tracing.py, 与 LangSmith 并存的独立开关):
+# 以 langfuse.langchain.CallbackHandler 挂在图顶层调用上; 服务侧见
+# docker-compose.yml 的 profile=langfuse 栈(同大版本)。
+langfuse>=3.4,<5
 
 # MCP (Model Context Protocol) - pin 1.x: FastMCP high-level API (renamed in mcp 2.x)
 mcp>=1.10.0,<2

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from app.assistant.prompts import EPISODE_REFLECT_PROMPT
+from app.assistant.prompts import EPISODE_REFLECT_PROMPT, MEMORY_CONSOLIDATE_PROMPT
 from app.config import get_settings
 from app.llm import get_chat_model
 from app.memory import graph_store
@@ -43,6 +43,7 @@ from app.memory.taxonomy import (
     label_of,
     spec_of,
 )
+from app.memory.temporal import format_day
 from app.memory.vector_store import MemoryHit, get_long_term_store
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,10 @@ logger = logging.getLogger(__name__)
 _REFLECT_EPISODE_LIMIT = 8
 # 记忆管理页一次拉的每桶条数(情节长得最快, 不做分页只做硬上限)。
 _OVERVIEW_LIMIT = 100
+# 喂给提取器判重的已存偏好/习惯上限: 比召回 Top-K 大得多, 目标是一次看全整桶。
+_DEDUP_CONTEXT_LIMIT = 30
+# 单次归并最多看多少条(超出硬上限不送 LLM, 避免 prompt 膨胀)。
+_CONSOLIDATE_SCAN_LIMIT = 50
 # 读路径的 Graph 邻居展开跳数与实体起点上限。
 _GRAPH_HOPS = 2
 
@@ -110,14 +115,26 @@ class PersonalContext:
             if not hits:
                 continue
             spec = spec_of(bucket)
-            lines = [f"- {hit.title}：{hit.content}" if hit.title else f"- {hit.content}" for hit in hits]
-            sections.append(spec.prompt_header + "\n" + "\n".join(lines))
+            sections.append(spec.prompt_header + "\n" + "\n".join(self._line(hit, spec) for hit in hits))
         if self.graph:
             sections.append("[关联记忆]\n" + "\n".join(self.graph))
         if self.legacy:
             # 分桶之前的老记录仍以"[长期记忆]"小节带上, 不因为升级就失联。
             sections.append("[长期记忆]\n" + "\n".join(f"- {hit.content}" for hit in self.legacy))
         return "\n".join(sections)
+
+    @staticmethod
+    def _line(hit: MemoryHit, spec) -> str:
+        """一条记忆 -> prompt 行。
+
+        带时间锚点的桶(情节)额外前缀发生日期: 同一件事的不同时刻观测(如旧体重与
+        新体重)会同时被召回, 不给日期模型就无从判断哪条是现在; 口径对齐业界
+        "记忆逐条标日期, 冲突按日期取最新"。没日期的行保持原样, 不拿记录时间充数。
+        """
+        stamp = format_day(hit.occurred_at) if spec.time_scoped and hit.occurred_at else ""
+        head = f"{stamp} " if stamp else ""
+        body = f"{hit.title}：{hit.content}" if hit.title else hit.content
+        return f"- {head}{body}"
 
     def audit(self) -> dict[str, Any]:
         """各桶命中条数与 id, 供 build_context 审计(记忆拼接必须可观测)。"""
@@ -193,6 +210,31 @@ class PersonalMemoryAgent:
             return preferences, habits
         except Exception as exc:  # noqa: BLE001
             logger.warning("偏好/习惯直读失败, 本轮跳过: %s", exc)
+            return [], []
+
+    async def existing_stable_texts(self, user_id: str) -> tuple[list[str], list[str]]:
+        """读回已存的偏好/习惯文本, 喂给提取器判重(标量直读, 零 embedding)。
+
+        这里故意拿得比召回 Top-K 多(整个桶的上限): 目的是"告诉模型已经记过什么",
+        只给最近 3 条会漏掉更早写入的重复项, 达不到防重复的效果。读失败退化为空
+        (等于回到无状态提取的旧行为), 不抛出。
+        """
+        if not user_id or not get_settings().personal_memory_enabled:
+            return [], []
+        try:
+            preferences, habits = await asyncio.gather(
+                get_long_term_store().list_recent(
+                    user_id, [MemoryBucket.PREFERENCE.value],
+                    limit=_DEDUP_CONTEXT_LIMIT, order_by="created_at",
+                ),
+                get_long_term_store().list_recent(
+                    user_id, [MemoryBucket.HABIT.value],
+                    limit=_DEDUP_CONTEXT_LIMIT, order_by="created_at",
+                ),
+            )
+            return [h.content for h in preferences], [h.content for h in habits]
+        except Exception as exc:  # noqa: BLE001 - 拿不到已存项只是少了防重复提示
+            logger.warning("读取已存偏好/习惯失败, 本轮提取不做判重: %s", exc)
             return [], []
 
     async def _safe_vector_recall(self, user_id: str, query: str) -> list[MemoryHit]:
@@ -322,6 +364,8 @@ class PersonalMemoryAgent:
         profile_result = await get_profile_store().merge(user_id, extraction.profile)
         stats["profile_added"] = int(profile_result.get("added", 0))
         stats["profile_updated"] = int(profile_result.get("updated", 0))
+        # 被拦下的历史陈述单独计数: "过去的事只入历史不改当前值"这个行为得可观测。
+        stats["profile_superseded"] = int(profile_result.get("superseded", 0))
         for bucket, items in (
             (MemoryBucket.PREFERENCE, [("", text) for text in extraction.preferences]),
             (MemoryBucket.HABIT, [("", text) for text in extraction.habits]),
@@ -450,6 +494,68 @@ class PersonalMemoryAgent:
         except Exception as exc:  # noqa: BLE001 - 蒸馏失败下次攒够情节再试
             logger.warning("情节蒸馏失败, 本轮跳过: %s", exc)
             return 0
+
+    async def consolidate_stable_buckets(self, user_id: str) -> int:
+        """偏好/习惯桶语义归并: 把存量重复条目合并成更完整的一条, 返回删除条数。
+
+        提取器无状态时留下的历史重复(同一件事的不同说法)靠 cosine 阈值卡不住,
+        这里用一次 LLM 把整桶交给模型分组, 只合并真正语义重复的组。只在手动
+        "整理记忆"时跑(不在每轮写路径上), 因为它是整桶级别的 LLM 调用。
+        """
+        if not user_id or not get_settings().personal_memory_enabled:
+            return 0
+        store = get_long_term_store()
+        merged = 0
+        for bucket in (MemoryBucket.PREFERENCE, MemoryBucket.HABIT):
+            try:
+                hits = await store.list_recent(
+                    user_id, [bucket.value], limit=_CONSOLIDATE_SCAN_LIMIT, order_by="created_at"
+                )
+                if len(hits) < 2:
+                    continue
+                merged += await self._consolidate_one_bucket(store, user_id, bucket, hits)
+            except Exception as exc:  # noqa: BLE001 - 单桶归并失败不影响另一桶
+                logger.warning("记忆桶 %s 归并失败, 跳过: %s", bucket.value, exc)
+        return merged
+
+    async def _consolidate_one_bucket(self, store, user_id: str, bucket, hits) -> int:
+        """对一个桶的条目调一次 LLM 分组, 按组归并; 返回删除条数。"""
+        by_id = {hit.id: hit for hit in hits}
+        numbered = "\n".join(f"{i}. {hit.content}" for i, hit in enumerate(hits, start=1))
+        resp = await _reflector().ainvoke(MEMORY_CONSOLIDATE_PROMPT.format(items=numbered))
+        data = json.loads(str(resp.content))
+        groups = data.get("groups") if isinstance(data, dict) else None
+        merged = 0
+        for group in groups or []:
+            if not isinstance(group, dict):
+                continue
+            content = str(group.get("content") or "").strip()
+            idxs = group.get("ids")
+            if not content or not isinstance(idxs, list):
+                continue
+            # 编号(1 基)映射回真实 id; 只认本次扫描到的条目, 越界编号直接忽略。
+            ids = [
+                hits[i - 1].id
+                for i in idxs
+                if isinstance(i, int) and 1 <= i <= len(hits)
+            ]
+            ids = [i for i in dict.fromkeys(ids) if i in by_id]
+            if len(ids) < 2:
+                continue
+            # 保留原文最长的一条(留住它的 created_at/使用记录), 其余删除。
+            keep_id = max(ids, key=lambda i: len(by_id[i].content))
+            drop_ids = [i for i in ids if i != keep_id]
+            try:
+                merged += await store.merge_group(user_id, keep_id, content, drop_ids)
+            except Exception as exc:  # noqa: BLE001 - 单组失败不影响其它组
+                logger.warning("记忆组归并失败(跳过): bucket=%s ids=%s err=%s", bucket.value, ids, exc)
+        return merged
+
+    async def tidy(self, user_id: str) -> dict[str, int]:
+        """手动"整理记忆": 情节蒸馏 + 偏好/习惯归并, 一次把两件事都做了。"""
+        knowledge_added = await self.reflect(user_id, force=True)
+        merged = await self.consolidate_stable_buckets(user_id)
+        return {"knowledge_added": knowledge_added, "merged": merged}
 
     # ------------------------------------------------------------ 管理视图
 

@@ -61,13 +61,24 @@ def _connect_args() -> dict:
 
 
 def get_engine() -> AsyncEngine:
-    """Lazily create the async engine (reads PG_PASSWORD on first use)."""
+    """Lazily create the async engine (reads PG_PASSWORD on first use).
+
+    连接池容量必须显式给: SQLAlchemy 默认 ``pool_size=5 / max_overflow=10``,
+    在一个共用进程的网关上撑不住几十轮并发对话(每轮的检索回表/ACL 门禁/元数据/
+    会话落库都抢这条池), 抢不到连接时默认等 30s 再抛 ``TimeoutError``, 而
+    代码里它会被当作"DB 抖动"吞掉 -> 表现为知识库答不对/会话不记录的静默降级。
+    容量与 PG ``max_connections`` 的对账口径见 ``Settings.pg_pool_size`` 注释。
+    """
     global _engine, _session_factory
     if _engine is None:
+        s = get_settings()
         _engine = create_async_engine(
             async_database_url(),
             pool_pre_ping=True,
             pool_recycle=3600,
+            pool_size=max(1, s.pg_pool_size),
+            max_overflow=max(0, s.pg_max_overflow),
+            pool_timeout=max(1, s.pg_pool_timeout),
             connect_args=_connect_args(),
         )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
@@ -98,6 +109,11 @@ _BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
         "source": "VARCHAR(32) NOT NULL DEFAULT 'turn'",
         "occurred_at": "TIMESTAMPTZ",
     },
+    "user_profiles": {
+        # 波动类属性的观测序列(当前值按生效时间派生): 可空 —— 老行没有历史,
+        # 首次合并时从 attributes 的旧字符串自愈出序列。
+        "attribute_history": "JSON",
+    },
     "chat_messages": {
         # docgen 创作产物 [{name,url,title}]: 可空 —— 历史轮次本来就没有产物。
         "artifacts": "JSON",
@@ -127,10 +143,10 @@ def _table_columns(sync_conn, table: str) -> set[str]:
 async def init_schema() -> None:
     """Create all metadata tables if they do not exist yet.
 
-    pgvector 扩展必须先行: ``knowledge_chunks.embedding`` 编译成 DDL 时需要
-    ``vector`` 类型已在 search_path 中。容器由 docker/init/01_vector.sql 以超管
-    预建, 这里再兜底一次 —— 失败时抛明确错误, 而不是让 create_all 报难懂的
-    "type vector does not exist"。
+    pgvector 扩展必须先行: 任何 ``Vector`` 列(``doc_chunks.embedding`` 与遗留
+    ``knowledge_chunks.embedding``)编译成 DDL 时需要 ``vector`` 类型已在 search_path
+    中。容器由 docker/init/01_vector.sql 以超管预建, 这里再兜底一次 —— 失败时抛明确
+    错误, 而不是让 create_all 报难懂的 "type vector does not exist"。
 
     Also backfills columns/indexes on pre-existing tables (``create_all`` never
     ALTERs existing tables, 见 ``_BACKFILL_COLUMNS`` / ``_BACKFILL_INDEXES``), so

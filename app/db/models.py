@@ -276,7 +276,11 @@ class ContractReview(Base):
 # RAG 知识块
 # ---------------------------------------------------------------------------
 class KnowledgeChunkRow(Base):
-    """One retrievable chunk (parent or child) with its dense vector.
+    """[遗留旧表] 父子混装的单表 ``knowledge_chunks``(迁移前的形态)。
+
+    现行检索/入库路径已全部改走父子双表(``doc_chunks`` + ``doc_parents``, 见
+    ``app/rag/vectorstore.py``), 本 ORM 仅由 ``scripts/migrate_doc_stores.py``
+    读写(存量搬迁与校验); 旧表按下线流程是改名而非 DROP, 因此仍留在 metadata 里。
 
     ``chunk_id`` 主键, ``is_parent`` 区分父块/子块
     (检索只命中子块), 四个 ACL 标量冗余在每行上供检索前置裁剪。父块也写向量
@@ -479,18 +483,25 @@ class LongTermMemoryRow(Base):
 # 用户画像 (User Memory 的 profile 桶)
 # ---------------------------------------------------------------------------
 class UserProfileRow(Base):
-    """一个用户一条聚合画像: 结构化属性 + 渲染好的 prompt 摘要。
+    """一个用户一条聚合画像: 结构化当前值 + 观测序列 + 渲染好的 prompt 摘要。
 
-    不入 ``long_term_memories`` 的原因有二: 一是画像"一人一条"、每次合并是覆盖而
-    非追加, 与逐条事实的语义不同; 二是画像每轮都要全量注入, 不需要也不应该做
+    不入 ``long_term_memories`` 的原因有二: 一是画像"一人一条"、同一个属性只留
+    一个当前值, 与逐条事实的语义不同; 二是画像每轮都要全量注入, 不需要也不应该做
     向量相似度检索(没有 embedding 列)。摘要由属性模板渲染, 不额外调 LLM。
+
+    当前值按**生效时间派生**而不是按写入顺序覆盖, 因此波动类属性(体重/身高/部门/
+    职位等)的完整观测序列另存一份在 ``attribute_history``: 旧值不会被一句历史陈述
+    抹掉, 但也不会挤进 prompt(只给"我的记忆"页看)。每键条数有界, 画像表仍是一人一行。
     """
 
     __tablename__ = "user_profiles"
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    # {"identity": [...], "role": [...], "skills": [...], "topics": [...]}
+    # 当前值: {"姓名": ["..."], "体重": ["70kg"], "技能": ["...", "..."]}(多值槽可以并列)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 观测序列(只给波动类属性): {"体重": [{value, valid_at, recorded_at, explicit}, ...]},
+    # 按"当前在前"排序; 可空 —— 列上线之前的老行没有历史, 首次合并时从 attributes 自愈。
+    attribute_history: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     summary: Mapped[str] = mapped_column(Text, default="")
     # 情节蒸馏门槛的判定基准: 上次蒸馏时间点之后新增的情节才计入触发条件
     last_reflected_at: Mapped[datetime | None] = mapped_column(

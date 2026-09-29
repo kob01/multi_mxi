@@ -1,5 +1,6 @@
 """Application settings loaded from environment / .env file."""
 
+import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _SECRET_FILES = {
     "pg_password": "/run/secrets/pg_password",
     "langsmith_api_key": "/run/secrets/langsmith_api_key",
+    "langfuse_api_key": "/run/secrets/langfuse_api_key",
     "deepseek_api_key": "/run/secrets/deepseek_api_key",
+    "zhipu_api_key": "/run/secrets/zhipu_api_key",
     "mongo_password": "/run/secrets/mongo_password",
     "tavily_api_key": "/run/secrets/tavily_api_key",
     "serper_api_key": "/run/secrets/serper_api_key",
@@ -20,10 +23,38 @@ _SECRET_FILES = {
 _SECRET_HOST_FALLBACK = {
     "pg_password": "docker/secrets/pg_password.txt",
     "langsmith_api_key": "docker/secrets/langsmith_api_key.txt",
+    "langfuse_api_key": "docker/secrets/langfuse_api_key.txt",
     "deepseek_api_key": "docker/secrets/deepseek_api_key.txt",
+    "zhipu_api_key": "docker/secrets/zhipu_api_key.txt",
     "mongo_password": "docker/secrets/mongo_password.txt",
     "tavily_api_key": "docker/secrets/tavily_api_key.txt",
     "serper_api_key": "docker/secrets/serper_api_key.txt",
+}
+
+# LLM 供应商注册表默认值(单一事实源): dotenv 的 LLM_PROVIDERS_JSON 可整体覆盖,
+# 解析失败时回退本表。字段含义见 Settings.llm_providers_json 注释。
+_DEFAULT_LLM_PROVIDERS: dict = {
+    # deepseek-flash / deepseek-reasoner: 官方集成 ChatDeepSeek(透出 reasoning_content);
+    # 关闭思考时不传 reasoning_effort, 避免参数被服务端拒
+    "deepseek": {
+        "base_url_field": "deepseek_base_url",
+        "api_key_field": "deepseek_api_key",
+        "model_class": "langchain_deepseek:ChatDeepSeek",
+        "thinking_template": (
+            '{"enabled": {"thinking": {"type": "enabled"}, "reasoning_effort": "{effort}"}, '
+            '"disabled": {"thinking": {"type": "disabled"}}}'
+        ),
+    },
+    # glm-5.3-flash 等 GLM 系列: 智谱开放平台 OpenAI 兼容端点
+    "glm": {
+        "base_url_field": "zhipu_base_url",
+        "api_key_field": "zhipu_api_key",
+        "model_class": "langchain_openai:ChatOpenAI",
+        "thinking_template": (
+            '{"enabled": {"thinking": {"type": "enabled"}}, '
+            '"disabled": {"thinking": {"type": "disabled"}}}'
+        ),
+    },
 }
 
 
@@ -35,9 +66,12 @@ class Settings(BaseSettings):
     配置只有一条宿主轨: ``.env`` 是**宿主机视角**(全部指向 docker 已发布端口),
     ``.env.local`` 是同一视角的机器私有覆盖(均已 gitignore)。**不要**把
     ``docker/.env`` 加进 env_file: pydantic-settings 是后者覆盖前者, 那会把容器
-    服务名(tei-rerank/elasticsearch/mongo/...)灌进宿主机进程, 解析失败后静默降级
-    (见 CONFIG_RULES.md 第 5 条)。容器侧一律靠 docker-compose 的
-    ``env_file: docker/.env`` + ``environment:`` 注入真实环境变量。
+    服务名(tei-rerank/elasticsearch/mongo/...)灌进宿主机进程(本轨现在只给
+    dev_services/评测等脚本用, 网关已只跑在容器内), 解析失败后静默降级
+    (见 CONFIG_RULES.md 第 5 条 → config-env-tracks §1)。
+    容器侧一律靠 docker-compose 的 ``env_file: docker/.env`` + ``environment:``
+    注入真实环境变量; 红线键在 compose 里已字面量锁死, 改 docker/.env 覆盖不动
+    (见 config-env-tracks §7, 自检 ``scripts.dev_services env-check``)。
     """
 
     model_config = SettingsConfigDict(
@@ -57,8 +91,33 @@ class Settings(BaseSettings):
     # 密钥优先取环境变量, 其次由校验器读取 /run/secrets/deepseek_api_key
     # repr=False: 防止 print(settings)/异常栈/LangSmith trace 把密钥带进日志
     deepseek_api_key: str = Field(default="", repr=False)
+    # 智谱开放平台 (GLM 系列, OpenAI 兼容): 密钥只住 docker/secrets/zhipu_api_key.txt
+    zhipu_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    zhipu_api_key: str = Field(default="", repr=False)
     llm_model: str = "deepseek-flash"
     intent_model: str = "deepseek-flash"
+    # 在线 LLM 请求上限: 一次对话轮要串/并发好几个 LLM 调用, 没有墙钟上限时一个挂住
+    # 的服务端会长期占住一个并发闸门与一个 PG 会话(比一个坏答案贵得多)。这里不是
+    # "让回答能等更久", 而是"卡死的调用必须死": 超后由现有降级路径接住。
+    llm_request_timeout: float = 120.0
+    # 重试次数取小: langchain 默认已会重试, 乘以人数就是配额翻倍; 供商 429/5xx 时
+    # 重试风暴只会把故障放大, 宁可这轮降级也不能把下游再压一次。
+    llm_max_retries: int = 2
+
+    # ---------- LLM 供应商注册表 (模型前缀 -> 在线 API 路由) ----------
+    # 切换在线大模型只需改 LLM_MODEL/INTENT_MODEL(双轨 .env), 不必动代码:
+    # 命中某前缀 -> 走该供应商的 OpenAI 兼容端点; 全部未命中 -> 回退本地 Ollama。
+    # 值里只允许 api_key="<settings 字段名>" 间接引用密钥, 禁止明文密钥进 dotenv。
+    # 条目字段:
+    #   base_url_field : 必填, 指向存 base_url 的 settings 字段名
+    #   api_key_field  : OpenAI 兼容通道必填, 指向存密钥的 settings 字段名
+    #   model_class    : "langchain 包:类名"; deepseek 必须用 ChatDeepSeek 才能透出
+    #                    思考内容(langchain-openai v1 不提取 reasoning_content), 其他
+    #                    OpenAI 兼容供应商用 ChatOpenAI 即可
+    #   thinking_template: 思考开关 extra_body, 形如 {"enabled": {...}, "disabled": {...}}
+    #                    的两个形态; 模板内 {effort} 替换为 llm_reasoning_effort。
+    #                    不支持思考的供应商置 ""(不传 extra_body)
+    llm_providers_json: str = json.dumps(_DEFAULT_LLM_PROVIDERS, ensure_ascii=False)
 
     # 意图识别三层漏斗: 规则快筛 -> bge-m3 语义分类 -> LLM 兜底。
     # 下面几项只作用于第二层(bge-m3 语义分类)的命中判定, 可按线上效果调。
@@ -71,7 +130,32 @@ class Settings(BaseSettings):
     # 最优意图需领先次优意图的最小差距, 防止边界样本在两类间摇摆。
     intent_margin: float = 0.05
 
-    # RAG (向量块与业务元数据同库: PostgreSQL + pgvector, 见 knowledge_chunks 表)
+    # ---------- 多任务并行(复合问法拆分) ----------
+    # 一句话问多件事("查我年假还剩几天, 明天北京天气咋样")时, 单个 intent 必然丢一半。
+    # 链路: rewrite -> plan_tasks(LLM 只拆问题) -> 各子问题各跑一次上面的三层漏斗
+    # -> 只读类子任务并发执行, 办理/写操作类串行尾随 -> 分节合并。
+    # 总开关: 关闭即完全回退"一句一个意图一条路由"的旧行为。
+    multi_task_enabled: bool = True
+    # 短于该字数的消息不触发拆分: 寒暄与单一指令不可能是复合诉求, 省一次 LLM 调用。
+    multi_task_min_chars: int = 8
+    # 拆分上限, 超出部分不执行(回答里说明未处理项), 防止一句话拆出十个分支打爆下游。
+    multi_task_max_subtasks: int = 3
+    # 并发上限: 并行集只放只读通道(知识库检索 / web / docgen 进程内工具), 仍设上限
+    # 以免一次问十件事时同时压满 embedding/ES/联网检索三条下游。
+    multi_task_parallelism: int = 3
+    # 单子任务超时秒数: 超时只把该节降级为"未完成", 不整轮报错(部分成功优于整轮失败)。
+    multi_task_subtask_timeout: float = 45.0
+
+    # 统一下沉到线程池的并发上限(同时受两个池约束, 见 app/main.py::_configure_thread_pools)。
+    # 为何要显式抬: ``asyncio.to_thread`` 用事件循环默认线程池(上限
+    # ``min(32, cpu+4)``), FastAPI 的同步接口/同步工具用 anyio 线程池(默认 40) ——
+    # 文档生成/文档解析/PIL 图片归一化/同步 DB 工具全挤在这两个小池里, 不抬就是
+    # 一人生成文档全厂排队。取 64: 与 PG 连接池/下游服务上限同量级, 再多只会是线程噪声。
+    thread_pool_tokens: int = 64
+
+    # RAG (向量块与业务元数据同库: PostgreSQL + pgvector; 现行为父子双表
+    # doc_chunks(子块+向量) / doc_parents(父块结构, 正文在 Mongo), 旧单表 knowledge_chunks
+    # 仅供迁移脚本读写, 见 scripts/migrate_doc_stores.py)
     knowledge_dir: str = "./data/knowledge"
     rag_top_k: int = 8
     rerank_top_n: int = 4
@@ -115,6 +199,21 @@ class Settings(BaseSettings):
     # Text2SQL 语句级超时, 替代 MySQL 的 MAX_EXECUTION_TIME hint
     # (由 app/db/sync.py 在执行前 SET LOCAL statement_timeout 注入)。
     pg_statement_timeout_ms: int = 5000
+    # ---------- 连接池容量(高并发唯一入口预算, 见下方容量对账注释) ----------
+    # SQLAlchemy 默认 pool_size=5 / max_overflow=10 —— 那是"单进程个位数并发"的假设,
+    # 百人共用一个网关进程时每个热路径(检索回表 / ACL 门禁 / 元数据 / 会话落库 /
+    # 画像读写)都要抢这 15 条连接, 抢不到的排队 30s 后抛错, 表现为整站静默降级。
+    # 预算必须和 PG 服务端的 max_connections 一起算(容器里 PG 默认 100):
+    #   网关 async 池 (pool_size + max_overflow) + 网关 sync 池 + N 个 mcp/agent 进程
+    #   各自的 sync 池 <= max_connections - 10(超级用户/巡检预留)。加一侧就要减另一侧。
+    pg_pool_size: int = 30
+    pg_max_overflow: int = 20
+    # 等池超时秒数: 宁可等一小会儿也不要立刻抛, 但绝不能无限等(会把整条对话挂死)。
+    pg_pool_timeout: int = 15
+    # 同步引擎(psycopg3): 进程内工具(如 lookup_employee_by_name)在网关里也用它,
+    # 容量要小 —— 它是"网关 sync + 各 mcp/agent 进程"这份预算里的乘数项。
+    pg_sync_pool_size: int = 5
+    pg_sync_max_overflow: int = 5
     # bge-m3 稠密向量维度; 换 embedding 模型必须同步改这里并全量重建向量表。
     embedding_dim: int = 1024
     # 单次 ON CONFLICT upsert 的行数 (避免单语句参数过多)。
@@ -148,10 +247,12 @@ class Settings(BaseSettings):
     # Document upload & metadata
     upload_dir: str = "./data/uploads"
     upload_max_mb: int = 50
-    # 创作产物(图表 SVG / 周期报告 Markdown / 网页 HTML)的落盘目录; 容器侧指向持久卷 /data/reports
-    # (与 UPLOAD_DIR 同源, 否则写在容器工作目录重启即丢)。
+    # 创作产物(图表 SVG/PNG / 周期报告 Markdown / 表格 CSV)的落盘目录; 容器侧指向持久卷
+    # /data/reports (与 UPLOAD_DIR 同源, 否则写在容器工作目录重启即丢)。
     report_dir: str = "./data/reports"
-    # MinerU OCR 服务 (mineru-api, 用于图片解析; 需先启动 mineru-api 服务)
+    # MinerU OCR 服务 (图片/扫描件解析)。容器内由 compose 的 mineru 服务提供
+    # (compose 注入 http://mineru:8888); 宿主轨默认指向已发布端口 8888。服务不可用时
+    # 图片解析直接报 RuntimeError(上传接口转 502), 不静默丢内容(见 app/docs/parsers.py)。
     mineru_base_url: str = "http://localhost:8888"
     mineru_backend: str = "pipeline"
     mineru_timeout: int = 300
@@ -171,6 +272,16 @@ class Settings(BaseSettings):
     llm_reasoning_effort: str = "high"
     # SSE run 事件缓冲区在 run 结束后的保留秒数 (断点续传窗口, 过期后前端降级为拉历史)。
     stream_buffer_ttl: int = 600
+    # 单个 run 允许缓存的事件条数上限: 超限后只保留尾部并折叠一条提示。
+    # 不设上限时一次长回答的 token 级事件(几千条)会一直堆在内存里,
+    # 而断点续传只需要"尾部 + id 单调"这两个性质。
+    stream_max_events: int = 4000
+    # 同时在跑的流式 run 上限(背压闸): 超过即立刻 503, 而不是把下游(LLM 配额 /
+    # PG 连接池 / 事件循环)拖到全体超时 —— 后者会让 1000 个人一起拿到坏结果。
+    stream_max_concurrent_runs: int = 200
+    # 已结束的 run 最多攒多少个缓冲区(内存硬顶): 触顶时按"结束时间最老"提前回收,
+    # 与 stream_buffer_ttl 无关(被挡下的是"很多人刷新页面但都不再回来"的情况)。
+    stream_max_buffers: int = 2000
 
     # ---------- 记忆层: Session Memory(Redis) / Working State(Checkpoint) ----------
     # 关闭或连接失败时一律静默降级 (内存 dict / InMemorySaver), 不阻断对话。
@@ -178,6 +289,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     # Session Memory 滚动窗口 + 摘要的 Redis Key TTL (秒)
     session_memory_ttl: int = 3600
+    # Redis 不可用时降级为进程内 dict 的会话数上限(LRU 淘汰)。不设上限时
+    # 每个会话永久占一条且 turns 只增不减, 长时间降级 = 内存单调增长直到 OOM。
+    session_memory_local_max: int = 5000
     # Working State Checkpointer 总开关: 关闭则退回进程内 InMemorySaver
     checkpoint_enabled: bool = True
 
@@ -216,6 +330,14 @@ class Settings(BaseSettings):
     personal_memory_enabled: bool = True
     # 画像注入 prompt 的字符上限: 画像不检索、每轮全量带, 不设上限会随对话越滚越大。
     profile_max_chars: int = 400
+    # 波动类属性(体重/身高/部门/职位等)每键保留的观测条数上限: 当前值按生效时间从
+    # 这些观测里派生, 被顶掉的留在历史里给"我的记忆"页看; 封顶保证画像仍是一人一行、
+    # 不长成第二张记忆表。
+    profile_history_max_entries: int = 10
+    # "还算当下生效"的宽限期: 用户明说了时间但只在此天数以内(如"从上个月起我改汇报给张总"),
+    # 视为持续到当下的变更而不当历史处理; 超出宽限期才归入历史(只入历史不改当前值)。
+    # 太小会把近期变更误判成陈迹(新值进不了当前态), 太大则十年前的陈述又能顶掉当前值。
+    profile_current_grace_days: int = 90
     # 各桶每轮注入条数: 偏好/习惯是标量直读, 情节/知识是向量召回。
     memory_preference_top_k: int = 3
     memory_habit_top_k: int = 3
@@ -227,6 +349,9 @@ class Settings(BaseSettings):
     memory_reflect_min_episodes: int = 3
     # 情节陈旧判定天数: 超出后排序降权(仅影响排序, 不删数据)。
     memory_decay_days: int = 90
+    # 语义查重命中后的"同一条观测"判定窗口: 两条 occurred_at 相差超过此天数就当同一事实
+    # 的不同时刻观测, 各存一条而不是拿新文案覆盖旧记录(否则"2015 年 64kg"会抹掉"现在 70kg")。
+    memory_observation_window_days: int = 7
 
     # ---------- 缓存层: Prompt Cache / Retrieval Cache / Tool Cache (统一落 Redis) ----------
     # 总开关: 关闭后全部直连真实调用(等同于本功能上线前的行为)。
@@ -235,6 +360,33 @@ class Settings(BaseSettings):
     retrieval_cache_ttl: int = 300
     # Tool Cache 必须最短: 余额/审批进度等是实时数据, TTL 过长会读到脏结果。
     tool_cache_ttl: int = 30
+    # Redis 连接池上限: redis.asyncio 默认 max_connections=50, 与百人并发的
+    # "每条命令借还一次"叠加会直接触发 ConnectionError(连接池爆)。
+    redis_max_connections: int = 100
+    # ES 检索侧超时(秒)与稀疏通道并发上限。request_timeout 原为 30s —— ES 半死时
+    # 每个查询都挂满 30s 把连接与内存拖爆; 这里压到秒级, 超时就按"稀疏通道为空"降级。
+    es_search_timeout: float = 3.0
+    es_search_concurrency: int = 32
+    # BM25 全量重建(灌语料)侧的超时, 比检索宽松得多, 单独一档不要和检索混用。
+    es_rebuild_timeout: int = 120
+    # Ollama embedding: 查询向量在对话热路径上, 批量向量在入库路径上, 两者共用一个
+    # 进程级连接池; 上限要按"Ollama 单进程串行推理"来给, 太大只会把排队搬到下游。
+    embedding_timeout: float = 60.0
+    embedding_query_timeout: float = 10.0
+    embedding_max_connections: int = 32
+    # 查询向量的并发上限(在本地排队, 而不是把 Ollama 压到报错):
+    # Ollama 多请求并发时会在内部 tokenize 阶段失败返 400(实测 30 并发必出现),
+    # 表现是"意图语义层集体下沉 LLM + 检索稠密通道集体为空"—— 看着像降级正常, 实则
+    # 质变。取 8: 单模型串行推理下再多的并发也只会在 Ollama 内部排队。
+    embedding_query_concurrency: int = 8
+    # MCP 工具清单缓存 TTL(秒): 每次 tool_call 都重新 discover 会新建一条 streamable-http
+    # 会话, 百人并发时 MCP server 会被 discover 打满; TTL 到期才重新发现。
+    mcp_tools_ttl: int = 300
+    # A2A 委派超时与连接池: 委派是"多步办理", 天然比一次 LLM 调用慢, 给足但必须有上限。
+    a2a_timeout: float = 120.0
+    a2a_connect_timeout: float = 10.0
+    a2a_max_connections: int = 64
+    a2a_max_keepalive: int = 16
 
     # MCP servers
     # 默认值 = Docker 已发布的宿主端口 (Windows winnat 把 7956-8055 列进 TCP 排除段,
@@ -310,9 +462,27 @@ class Settings(BaseSettings):
     langsmith_project: str = "mxi-assistant"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
 
+    # Langfuse (自托管 LLM 可观测, 与 LangSmith 并存的独立开关)
+    # 与 LangSmith 的差别: 上报目标是同 compose 网络内自建的 langfuse-web
+    # (见 docker-compose 的 profile="langfuse" 栈), 对话数据不出容器网络,
+    # 容器侧允许开启; 但默认仍 false, 由 docker/.env 置 LANGFUSE_ENABLED=true 打开。
+    # 密钥: docker/secrets/langfuse_api_key.txt 单文件两行 = secret key(第一行)
+    # / public key(第二行), 加载完成后在 model_post_init 拆分;
+    # dotenv 里 LANGFUSE_API_KEY / LANGFUSE_PUBLIC_KEY 留空(红线: 密钥不进 dotenv)。
+    langfuse_enabled: bool = False
+    langfuse_api_key: str = Field(default="", repr=False)
+    langfuse_public_key: str = Field(default="", repr=False)
+    # 容器内用服务名 langfuse-web:3000; 宿主轨默认指向已发布端口 18100。
+    langfuse_base_url: str = "http://localhost:18100"
+    # Langfuse 侧靠 pk/sk 区分项目, 项目名不参与路由; 本字段只用作 trace 名
+    # (metadata 的 langfuse_trace_name), 便于在 UI 里跟其他接入方分开。
+    langfuse_project: str = "mxi-assistant"
+    # 映射 LANGFUSE_TRACING_ENVIRONMENT: trace 按部署环境区分(development/staging/...)
+    langfuse_environment: str = "development"
+
     @field_validator(
-        "pg_password", "deepseek_api_key", "langsmith_api_key", "mongo_password",
-        "tavily_api_key", "serper_api_key",
+        "pg_password", "deepseek_api_key", "zhipu_api_key", "langsmith_api_key",
+        "langfuse_api_key", "mongo_password", "tavily_api_key", "serper_api_key",
         mode="after",
     )
     @classmethod
@@ -330,8 +500,47 @@ class Settings(BaseSettings):
             paths.append(Path(__file__).resolve().parent.parent / host_rel)
         for p in paths:
             if p.is_file():
-                return p.read_text(encoding="utf-8").strip()
+                raw = p.read_text(encoding="utf-8").strip()
+                # secret 文件里的占位值(如未填的 zhipu_api_key.txt)视同未配置,
+                # 让调用侧报"缺少密钥"而不是带占位值去请求被 401
+                if raw.upper().startswith("REPLACE_ME"):
+                    return value
+                return raw
         return value
+
+    @property
+    def llm_providers(self) -> dict[str, dict]:
+        """解析 llm_providers_json; 非法 JSON 时回退代码默认注册表(不阻断启动)。"""
+        try:
+            parsed = json.loads(self.llm_providers_json)
+        except (ValueError, TypeError):
+            parsed = _DEFAULT_LLM_PROVIDERS
+        if not isinstance(parsed, dict):
+            parsed = _DEFAULT_LLM_PROVIDERS
+        return {str(k).lower(): v for k, v in parsed.items() if isinstance(v, dict)}
+
+    def resolve_llm_provider(self, model: str) -> tuple[str, dict] | None:
+        """按模型名匹配在线供应商(最长前缀优先); 未命中 = None -> 走本地 Ollama。"""
+        name = (model or "").lower()
+        best: tuple[str, dict] | None = None
+        for prefix, cfg in self.llm_providers.items():
+            if prefix and name.startswith(prefix):
+                if best is None or len(prefix) > len(best[0]):
+                    best = (prefix, cfg)
+        return best
+
+    def model_post_init(self, __context) -> None:
+        """全部字段填完后拆 langfuse 双密钥: secret 文件单文件两行(sk/pk)。
+
+        不能放 field_validator 里做: 另一个 mode="after" 校验器随后会把整份
+        文件内容盖回已拆分的值; post_init 在所有校验器之后跑, 只改一次。
+        仅在 LANGFUSE_PUBLIC_KEY 环境变量未显式提供时回填 pk。
+        """
+        lines = [ln.strip() for ln in self.langfuse_api_key.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            object.__setattr__(self, "langfuse_api_key", lines[0])
+            if not self.langfuse_public_key:
+                object.__setattr__(self, "langfuse_public_key", lines[1])
 
     @property
     def base_dir(self) -> Path:

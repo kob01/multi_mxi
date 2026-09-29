@@ -1,10 +1,12 @@
 """Tool Cache: 缓存"MCP 工具调用 -> 文本结果"这一映射。
 
 只缓存只读查询 —— 前缀白名单(见 ``_CACHEABLE_PREFIXES``)之外的工具(如
-``create_hr_ticket`` / ``cancel_hr_ticket`` / ``create_reimbursement``)是写操作,
+``create_hr_ticket`` / ``cancel_hr_ticket`` / ``create_reimbursement`` /
+``submit_contract_review``)是写操作,
 缓存它们等价于把"提交成功"的响应复用给下一次调用, 用户会以为报销单提交了两
 次, 实际后端只创建了一条(或相反)。这与 ACL 的 default-deny 思路一致:
-无法确认是只读, 就不缓存。
+无法确认是只读, 就不缓存 —— 代价是确定性只读工具也被前缀名单筛掉(如采购域的
+``precheck_purchase_order`` 不以白名单前缀开头, 不缓存), 这是故意取的保守值。
 
 A2A ``agent_delegate`` 是"需要专业系统多步办理的复杂业务"(见 INTENT_PROMPT 对
 AGENT_DELEGATE 的定义: "我要报销""帮我开在职证明""申请离职"), 语义上就是写/

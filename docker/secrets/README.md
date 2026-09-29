@@ -14,11 +14,30 @@
 | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------- |
 | `pg_password.txt`       | PostgreSQL 口令（compose 的 postgres 初始化 + 应用连接）               | postgres / assistant / _-mcp / _-agent      |
 | `deepseek_api_key.txt`  | DeepSeek 在线 API Key                                                  | assistant / \*-agent                        |
+| `zhipu_api_key.txt`     | 智谱开放平台 API Key（GLM 系列；`LLM_MODEL` 切到 `glm-*` 前必须填入真值，否则报"缺少在线 LLM 供应商配置"） | assistant / \*-agent / analytics-mcp |
 | `langsmith_api_key.txt` | LangSmith Key（仅开发机启用 tracing 时需要）                           | assistant（容器侧 tracing 恒为 false）      |
+| `langfuse_api_key.txt`  | Langfuse 项目密钥（自托管可观测；**两行格式**，见下方说明）       | assistant（`LANGFUSE_ENABLED=true` 时才读）    |
 | `tavily_api_key.txt`    | Tavily 检索 Key（可选：启用 Tavily provider 时才需要；默认 ddgs 免密） | assistant（app/tools/web.py 的 search_web） |
 | `serper_api_key.txt`    | Serper(Google) 检索 Key（可选：启用 Serper provider 时才需要）         | assistant（同上）                           |
 
 文件内容 = 单行裸值，无引号、无 `KEY=` 前缀、行尾不要有多余空格（读取时会 `strip()`）。
+
+> **补建/改完密钥文件后必须重建容器**：compose 在**容器创建时**解析 secret 挂载点，
+> 源文件当时不存在不会报错，而是把 `/run/secrets/<name>` 挂成一个**空目录**；
+> `app/config.py` 用 `is_file()` 判定，拿到的就是空值 → 表现为“密钥填了但功能仍不可用”
+> 的静默降级。重建命令：`docker compose -f docker/docker-compose.yml up -d --force-recreate assistant`。
+
+> `zhipu_api_key.txt` 例外地**默认挂载**在 compose 各 LLM 消费服务上（DeepSeek 同等待遇），
+> 所以文件必须存在；未启用 GLM 时可留占位值 `REPLACE_ME_WITH_ZHIPU_API_KEY`，
+> `app/config.py` 会把占位值视同未配置（不会拿它去调远端 API）。
+
+> `langfuse_api_key.txt` 是全目录里唯一的**两行文件**：第一行 secret key
+> （`sk-lf-...`）、第二行 public key（`pk-lf-...`），由 `app/config.py` 的
+> `model_post_init` 拆开分填 `langfuse_api_key` / `langfuse_public_key`。Langfuse
+> 的一个项目需要这一对密钥才能上报，而 compose 的 secret 只能挂单值文件，
+> 故合成一份。它跟 `zhipu_api_key.txt` 一样被**默认挂载**在 assistant 上，
+> 所以文件必须存在（否则 compose 直接报错）；**不用 Langfuse 就留空文件**，
+> 空值等同未配置，`LANGFUSE_ENABLED` 也就起不了作用。
 
 > 检索密钥（tavily/serper）是**可选**项：默认 provider `ddgs` 免密，不建这两个文件、
 > 也不往 compose 里加 `secrets:` 声明，一切照常。若要启用，除创建文件外还需在
@@ -38,8 +57,19 @@ $s = Read-Host "DeepSeek API Key" -AsSecureString
 ([PSCredential]::new('x', $s).GetNetworkCredential().Password) |
   Set-Content -NoNewline -Encoding ascii docker/secrets/deepseek_api_key.txt
 
+# 2b) (切换到 GLM 系列前必填) 智谱开放平台 API Key
+$s = Read-Host "Zhipu API Key" -AsSecureString
+([PSCredential]::new('x', $s).GetNetworkCredential().Password) |
+  Set-Content -NoNewline -Encoding ascii docker/secrets/zhipu_api_key.txt
+
 # 3) (可选, 仅开发机) LangSmith API Key
 Set-Content -NoNewline -Encoding ascii docker/secrets/langsmith_api_key.txt "粘贴密钥"
+
+# 3b) Langfuse 项目密钥: 两行 = 第一行 sk-lf-... / 第二行 pk-lf-...
+#     (从自建 langfuse-web 的 Project Settings > API Keys 取)
+Set-Content -Encoding ascii docker/secrets/langfuse_api_key.txt "sk-lf-xxx`npk-lf-xxx"
+#     不用 Langfuse 时建空文件即可(compose 要求它存在):
+New-Item -ItemType File -Force docker/secrets/langfuse_api_key.txt | Out-Null
 
 # 4) 权限: 只允许当前用户读写(Windows 下 Docker Desktop 走文件系统读取, 不影响挂载)
 Get-ChildItem docker/secrets/*.txt | ForEach-Object {

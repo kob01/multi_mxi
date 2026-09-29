@@ -105,7 +105,11 @@ SECRETS_KEEP = {"docker/secrets/README.md"}
 # dotenv 里出现这些键的非空值 = 密钥写错了地方。
 SECRET_KEYS = (
     "DEEPSEEK_API_KEY",
+    "ZHIPU_API_KEY",
     "LANGSMITH_API_KEY",
+    # Langfuse 项目密钥(可选, 默认关): 启用时同样只住 secrets 文件,
+    # 单文件两行 = secret key / public key。
+    "LANGFUSE_API_KEY",
     "PG_PASSWORD",
     "MONGO_PASSWORD",
     "NEO4J_PASSWORD",
@@ -437,6 +441,11 @@ New-Item -ItemType Directory -Force docker/secrets | Out-Null
 # 口令自己生成, 不要复用示例值; 详见 docker/secrets/README.md
 Set-Content -NoNewline docker/secrets/pg_password.txt "换成你的PG口令"
 Set-Content -NoNewline docker/secrets/deepseek_api_key.txt "换成你的DeepSeekKey"
+# 切换 GLM 系列模型前必填(不切 GLM 可留占位值, 见 docker/secrets/README.md):
+Set-Content -NoNewline docker/secrets/zhipu_api_key.txt "换成你的智谱Key"
+# compose 默认挂载这两个文件, 不存在则起不来; 不启用对应能力时建空文件即可:
+New-Item -ItemType File -Force docker/secrets/langsmith_api_key.txt | Out-Null
+New-Item -ItemType File -Force docker/secrets/langfuse_api_key.txt | Out-Null
 ```
 
 > 密钥只放 `docker/secrets/*.txt`: compose 以 secret 文件挂载到 `/run/secrets/<name>`,

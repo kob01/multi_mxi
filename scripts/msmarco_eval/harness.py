@@ -132,11 +132,12 @@ def _connect_args() -> dict:
 
 
 async def provision_eval_database(database: str = DEFAULT_EVAL_DB) -> AsyncEngine:
-    """Create the eval database (if absent) + its knowledge_chunks table.
+    """Create the eval database (if absent) + its parent/child chunk tables.
 
     Runs ``CREATE DATABASE`` on an autocommit maintenance connection (the app
     role has CREATEDB), then opens the eval engine and creates the pgvector
-    extension + the ORM table with its HNSW index (``checkfirst`` -> idempotent).
+    extension + ``doc_parents``/``doc_chunks`` with their HNSW index
+    (``checkfirst`` -> idempotent).
     """
     settings = get_settings()
     maint = create_async_engine(
@@ -180,9 +181,9 @@ def install_eval_mongo(database: str = DEFAULT_EVAL_MONGO_DB) -> None:
 def install_eval_engine(engine: AsyncEngine) -> None:
     """Point the process-wide session factory at the eval engine.
 
-    ``PgVectorStore`` calls ``app.db.session.get_session_factory()`` lazily, so
-    swapping these module globals routes every store operation to the eval
-    database for the lifetime of this process.
+    ``ChunkStore``(别名 ``PgVectorStore``) calls ``app.db.session.get_session_factory()``
+    lazily, so swapping these module globals routes every store operation to the
+    eval database for the lifetime of this process.
     """
     db_session._engine = engine  # noqa: SLF001 - eval owns this process
     db_session._session_factory = async_sessionmaker(engine, expire_on_commit=False)  # noqa: SLF001

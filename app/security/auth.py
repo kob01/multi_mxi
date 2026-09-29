@@ -125,9 +125,12 @@ _DOMAIN_TOOL_WHITELISTS: dict[str, dict[Role, set[str] | None]] = {
 def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> list[Any]:
     """Return the subset of ``tools`` visible to ``role`` on ``server_name``.
 
-    Tools must expose a ``name`` attribute (LangChain BaseTool). Only the
-    finance/hr domains are tiered; other domains pass through unchanged.
-    Default-deny: roles missing from the matrix see nothing.
+    Tools must expose a ``name`` attribute (LangChain BaseTool). The four MCP
+    business domains (finance/hr/analytics/procurement) are tiered by the
+    matrices in ``_DOMAIN_TOOL_WHITELISTS``; unregistered domains (e.g. the
+    in-process capability domains web/docgen, which have no role×tool matrix)
+    pass through unchanged. Default-deny: roles missing from the matrix see
+    nothing.
     """
     matrix = _DOMAIN_TOOL_WHITELISTS.get(server_name)
     if matrix is None:

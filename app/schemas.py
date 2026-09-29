@@ -70,7 +70,9 @@ class ChatResponse(BaseModel):
     session_id: str
     answer: str
     intent: IntentType
-    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct"]
+    # multi_task: 本轮是复合问法拆出的多件子任务(见 graph.merge_results), 此时
+    # metadata.subtasks 携带逐项路由与成败, answer 是"一节一件事"的拼接正文。
+    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct", "multi_task"]
     target: Optional[str] = None
     trace_id: str
     # 会话记录落库后的助手消息 id(供前端历史对齐; DB 降级时为 None)

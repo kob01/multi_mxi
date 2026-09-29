@@ -38,12 +38,68 @@ const ROUTE_LABELS = {
   mcp_tool: 'MCP工具',
   a2a_agent: '专业智能体',
   direct: '直答',
+  multi_task: '多任务并行',
 }
 const ROUTE_TAG_TYPES = {
   assistant_kb: 'success',
   mcp_tool: 'warning',
   a2a_agent: 'primary',
   direct: 'info',
+  multi_task: 'primary',
+}
+
+// ---------- 多任务逐项进度的解析 ----------
+// 后端 subtask 阶段事件文本形状: ``[i/n] 子问题 → 路由标签…`` 开头,
+// ``... → 路由标签已完成/未完成`` 结尾; planning 阶段给总件数。
+const SUBTASK_RE = /^\[(\d+)\/(\d+)\]\s*(.+?)\s*→\s*(.+?)(已完成|未完成|…)$/
+const SUBTASK_STATE_ICONS = { waiting: '○', running: '◐', done: '✔', failed: '✖' }
+
+function subtaskLabel(route, target) {
+  const base = ROUTE_LABELS[route] || route || ''
+  return target && (route === 'mcp_tool' || route === 'a2a_agent') ? `${base}·${target}` : base
+}
+
+// 子任务清单只是进度的第二双眼睛(正文已含分节结果), 解不了就退回单行 status 文本。
+function trackSubTasks(msg, ev) {
+  if (ev.stage === 'planning') {
+    const m = /识别到 (\d+) 件事/.exec(ev.text || '')
+    if (m && !(msg.subTasks && msg.subTasks.length)) {
+      msg.subTasks = Array.from({ length: Number(m[1]) }, (_, i) => ({
+        index: i + 1, query: '', label: '', state: 'waiting',
+      }))
+    }
+    return
+  }
+  if (ev.stage !== 'subtask') return
+  const m = SUBTASK_RE.exec(ev.text || '')
+  if (!m) return
+  if (!msg.subTasks) msg.subTasks = []
+  const idx = Number(m[1]) - 1
+  if (!msg.subTasks[idx]) {
+    msg.subTasks[idx] = { index: idx + 1, query: '', label: '', state: 'waiting' }
+  }
+  msg.subTasks[idx] = {
+    index: idx + 1,
+    query: m[2] || msg.subTasks[idx].query,
+    label: m[3] || msg.subTasks[idx].label,
+    state: m[4] === '已完成' ? 'done' : m[4] === '未完成' ? 'failed' : 'running',
+  }
+}
+
+// result 事件里的 metadata.subtasks 是成败的单一事实源, 用它覆盖 SSE 期间推进的状态。
+function applySubTaskResults(msg, ev) {
+  const list = (ev.metadata && ev.metadata.subtasks) || []
+  if (ev.route !== 'multi_task' || !list.length) {
+    if (ev.route !== 'multi_task') msg.subTasks = []
+    return
+  }
+  msg.subTasks = list.map((s) => ({
+    index: Number(s.index || 0) + 1,
+    query: s.query || '',
+    label: subtaskLabel(s.route, s.target),
+    state: s.ok ? 'done' : 'failed',
+    error: s.error || '',
+  }))
 }
 
 const senderRef = ref()
@@ -132,6 +188,7 @@ function makeAiPending() {
     status: '',
     thinking: '',
     thinkingOpen: true,
+    subTasks: [],
     headerTag: { text: '马小i', type: 'info' },
   })
 }
@@ -211,6 +268,7 @@ function handleEvent(ev, msg) {
       break
     case 'status':
       msg.status = ev.text || ''
+      trackSubTasks(msg, ev)
       break
     case 'think':
       msg.loading = false
@@ -227,6 +285,7 @@ function handleEvent(ev, msg) {
       msg.status = ''
       if (!msg.content) msg.content = ev.answer || '' // 降级路径: 一次性全文补渲染
       if (ev.thinking_text && !msg.thinking) msg.thinking = ev.thinking_text
+      applySubTaskResults(msg, ev)
       applyRouteTag(msg, ev)
       break
     case 'error':
@@ -294,6 +353,7 @@ function historyToMessage(m) {
         content: m.content,
         thinking: m.thinking || '',
         thinkingOpen: false,
+        subTasks: [],
         headerTag: { text: '马小i', type: 'info' },
       }
   if (m.role !== 'user') {
@@ -446,6 +506,17 @@ const currentSessionId = computed(() => sessionId.value)
                 💡 思考过程{{ item.thinkingOpen ? '（点击收起）' : '（点击展开）' }}
               </div>
               <div v-show="item.thinkingOpen" class="thinking-body">{{ item.thinking }}</div>
+            </div>
+            <!-- 多任务并行: 逐项进度清单(后端 status 事件推进, result 事件定稿) -->
+            <div v-if="item.subTasks && item.subTasks.length" class="subtask-list">
+              <div v-for="t in item.subTasks" :key="t.index" class="subtask-item">
+                <span class="subtask-state" :class="'st-' + t.state">
+                  {{ SUBTASK_STATE_ICONS[t.state] || '○' }}
+                </span>
+                <span class="subtask-query">{{ t.query || '第 ' + t.index + ' 项' }}</span>
+                <span v-if="t.label" class="subtask-label">{{ t.label }}</span>
+                <span v-if="t.error" class="subtask-error">{{ t.error }}</span>
+              </div>
             </div>
             <div v-if="item.status" class="status-line">{{ item.status }}</div>
             <div v-if="item.cites && item.cites.length" class="cites">
@@ -609,6 +680,57 @@ const currentSessionId = computed(() => sessionId.value)
   font-size: 12px;
   color: #409eff;
   margin-top: 6px;
+}
+
+.subtask-list {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f7f9fc;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #5b6479;
+}
+
+.subtask-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.subtask-state {
+  width: 14px;
+  flex-shrink: 0;
+}
+
+.st-done {
+  color: #67c23a;
+}
+
+.st-failed {
+  color: #f56c6c;
+}
+
+.st-running {
+  color: #409eff;
+}
+
+.subtask-query {
+  color: #303133;
+}
+
+.subtask-label {
+  padding: 0 6px;
+  border-radius: 6px;
+  background: #eef1f6;
+  color: #8892a6;
+  font-size: 11px;
+}
+
+.subtask-error {
+  color: #f56c6c;
+  font-size: 11px;
 }
 
 .cites {

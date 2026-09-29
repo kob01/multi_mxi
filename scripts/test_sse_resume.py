@@ -18,6 +18,10 @@ import httpx
 
 BASE = os.environ.get("MXI_BASE", "http://127.0.0.1:18000")
 SESSION_ID = f"test-{uuid.uuid4().hex[:8]}"
+# 验证的是"断点续传"而不是某一条问句的路由结果: 需要一条会逐 token 流式回答的话。
+# 默认保留原题(它当初就是为了看思考流), 但可用 MXI_SSE_MESSAGE 换成确定会进 chitchat
+# 流式分支的话 —— 否则知识库没有这句话的相关文档时会走拒答(不流式), 测不到续传。
+MESSAGE = os.environ.get("MXI_SSE_MESSAGE", "9.11和9.8哪个大？请推理后再回答。")
 
 
 def parse_frame(frame: str) -> tuple[int | None, dict | None]:
@@ -37,7 +41,7 @@ async def main() -> None:
         "role": "finance",
         "department": "财务部",
         # 故意用需要真正思考的问题: deepseek-flash 思考是按需的, 简单事实题可能不产 reasoning
-        "message": "9.11和9.8哪个大？请推理后再回答。",
+        "message": MESSAGE,
         "thinking": True,
     }
     run_id = None
