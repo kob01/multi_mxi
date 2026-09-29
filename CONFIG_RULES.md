@@ -6,21 +6,21 @@
 
 历史引用（`app/config.py` 文档串、`docker/docker-compose.yml` 头注释里的「见 CONFIG_RULES.md 第 5 条」）按本表解析，条号不得变更。
 
-| 条号 | 主题                                                      | 权威正文                       |
-| ---- | --------------------------------------------------------- | ------------------------------ |
-| 1    | `OLLAMA_BASE_URL` 禁改（`host.docker.internal`）          | `config-env-tracks.md` §2      |
-| 2    | 容器内 `PG_HOST=postgres`                                 | `config-env-tracks.md` §2      |
-| 3    | 容器内 `MONGO_URL=mongodb://mongo:27017`                  | `config-env-tracks.md` §2、§3  |
-| 4    | `NORMALIZER_VERSION` 与 `normalize_text()` 同升降         | `doc-normalizer-version.md`    |
-| 5    | 配置双轨：`env_file` 只读宿主轨，禁止加回 `docker/.env`   | `config-env-tracks.md` §1      |
-| 6    | 宿主端口走 `*_HOST_PORT`（18000/18001/18002/17474/17687） | `config-env-tracks.md` §4      |
-| 7    | A2A 卡片通告地址不作路由依据                              | `a2a-endpoint.md`              |
-| 8    | 密钥只住 `docker/secrets/*.txt`，dotenv 留空              | `config-env-tracks.md` §5      |
-| 9    | 开发拓扑：容器 = 唯一验证环境，宿主只跑 vite dev + Ollama | `config-env-tracks.md` §6      |
-| 10   | 容器轨防覆盖：compose 红线键字面量锁死 + env-check        | `config-env-tracks.md` §7      |
+| 条号 | 主题                                                      | 权威正文                          |
+| ---- | --------------------------------------------------------- | --------------------------------- |
+| 1    | `OLLAMA_BASE_URL` 禁改（`host.docker.internal`）          | `config-env-tracks.md` §2         |
+| 2    | 容器内 `PG_HOST=postgres`                                 | `config-env-tracks.md` §2         |
+| 3    | 容器内 `MONGO_URL=mongodb://mongo:27017`                  | `config-env-tracks.md` §2、§3     |
+| 4    | `NORMALIZER_VERSION` 与 `normalize_text()` 同升降         | `doc-normalizer-version.md`       |
+| 5    | 配置双轨：`env_file` 只读宿主轨，禁止加回 `docker/.env`   | `config-env-tracks.md` §1         |
+| 6    | 宿主端口走 `*_HOST_PORT`（18000/18001/18002/17474/17687） | `config-env-tracks.md` §4         |
+| 7    | A2A 卡片通告地址不作路由依据                              | `a2a-endpoint.md`                 |
+| 8    | 密钥只住 `docker/secrets/*.txt`，dotenv 留空              | `config-env-tracks.md` §5         |
+| 9    | 开发拓扑：容器 = 唯一验证环境，宿主只跑 vite dev + Ollama | `config-env-tracks.md` §6         |
+| 10   | 容器轨防覆盖：compose 红线键字面量锁死 + env-check        | `config-env-tracks.md` §7         |
 | 11   | 禁止宿主直跑网关验证，改代码必重建镜像                    | `container-first-verification.md` |
-| —    | 存储三层分工（PG / ES / Mongo）                           | `config-env-tracks.md` §3      |
-| —    | 症状 → 红线定位速查（动手前看）                           | `config-redlines-checklist.md` |
+| —    | 存储三层分工（PG / ES / Mongo）                           | `config-env-tracks.md` §3         |
+| —    | 症状 → 红线定位速查（动手前看）                           | `config-redlines-checklist.md`    |
 
 规则文件均在 `d:\ai\mxi\.qoder\rules\`。
 
