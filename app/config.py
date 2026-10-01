@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     multi_task_parallelism: int = 3
     # 单子任务超时秒数: 超时只把该节降级为"未完成", 不整轮报错(部分成功优于整轮失败)。
     multi_task_subtask_timeout: float = 45.0
+    # Layer3 校验器"同工具同实体无依赖自动合并"开关: 关掉则只保留解析/环检测/截断,
+    # 不再把 LLM 误拆的近重复子任务收敛回单任务(用于排查合并是否误伤真实并列)。
+    multi_task_merge_enabled: bool = True
+    # 合并判定用的 goal 归一化核心重叠阈值(Dice 系数, 0~1): 越高越保守, 只有近乎
+    # 同实体同问法才合并。默认 0.75 可把"升旗是哪天/升旗时间几点"收敛, 又不吞掉
+    # "查年假/查社保"这类同工具不同实体。
+    multi_task_core_overlap_threshold: float = 0.75
 
     # 统一下沉到线程池的并发上限(同时受两个池约束, 见 app/main.py::_configure_thread_pools)。
     # 为何要显式抬: ``asyncio.to_thread`` 用事件循环默认线程池(上限
@@ -290,7 +297,10 @@ class Settings(BaseSettings):
     # ---------- 记忆层: Session Memory(Redis) / Working State(Checkpoint) ----------
     # 关闭或连接失败时一律静默降级 (内存 dict / InMemorySaver), 不阻断对话。
     redis_enabled: bool = True
-    redis_url: str = "redis://localhost:6379/0"
+    # 宿主轨默认地址 = compose 已发布的宿主端口(原 6379 落进 Windows winnat 排除段,
+    # 已由 docker/.env 的 REDIS_HOST_PORT 抬到 16379)。容器内不由本默认值决定,
+    # 走 compose 注入的 redis://redis:6379(服务名 + 容器内监听端口)。
+    redis_url: str = "redis://localhost:16379/0"
     # Session Memory 滚动窗口 + 摘要的 Redis Key TTL (秒)
     session_memory_ttl: int = 3600
     # Redis 不可用时降级为进程内 dict 的会话数上限(LRU 淘汰)。不设上限时

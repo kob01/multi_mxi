@@ -304,7 +304,10 @@ services:
   redis:
     image: ${REDIS_IMAGE:-docker.m.daocloud.io/redis/redis-stack-server:7.4.0-v3}
     command: ["redis-stack-server", "--dir", "/data", "--save", "60 1"]
-    ports: ["6379:6379"]
+    # 宿主发布端口可抬(容器内监听恒为 6379, compose 网络内地址 redis://redis:6379 不变):
+    # 6379 会落进 Windows winnat 开机划走的 TCP 排除段(本机实测 6334-6433), 段内端口无人
+    # 监听也无法 bind, redis 直接 Exited(255), 记忆层/缓存层静默退回内存。
+    ports: ["${REDIS_HOST_PORT:-16379}:6379"]
     volumes:
       - redis_data:/data
     networks: [mxi]

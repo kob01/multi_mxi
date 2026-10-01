@@ -5,10 +5,11 @@
     uv run python -m scripts.test_multi_task_offline
 
 覆盖计划"测试与验收"里可离线判定的部分:
-  1. 拆分器输出清洗(clean_tasks): 脏 JSON / 非数组 / 单条 / 重复 / 超长 / 截断计数;
-  2. 拆分准入(looks_multi): 总开关、长度下限、句读与连接词标记;
-  3. 并行集口径(_is_parallel_safe): 只读通道进并行, 业务域 tool_call 与委派一律串行;
-  4. 分节合并(_merge_task_answers): 一节一件事 + 部分失败 + 全失败 + 截断提示;
+  1. Layer3 校验器(validate_task_graph): 结构化解析/旧形状兼容/同工具同实体合并/
+     环检测回退/写操作 deferred/超长与截断计数;
+  2. Layer1 规则门(triage): 总开关、长度下限、单域槽位叠加判 single、连接词/跨域判 plan;
+  3. 并行集口径(_is_parallel_safe): 只读通道进并行, readonly=false 强制串行;
+  4. 分节合并(_merge_task_answers): 一节一件事 + 部分失败 + 全失败 + deferred + 截断提示;
   5. 响应组装(_build_response): route=multi_task 合法且 metadata.subtasks 成形;
   6. 图装配: plan_tasks / multi_execute / merge_results 三节点与边能编译通过。
 
@@ -22,7 +23,7 @@ import sys
 from types import SimpleNamespace
 
 from app.assistant.graph import AssistantOrchestrator
-from app.assistant.planner import TaskPlanner, clean_tasks
+from app.assistant.planner import TaskPlanner, validate_task_graph
 from app.config import get_settings
 from app.schemas import ChatRequest, IntentResult, IntentType, Role
 
@@ -40,23 +41,54 @@ def _payload(*tasks: str) -> str:
     return json.dumps({"tasks": list(tasks)}, ensure_ascii=False)
 
 
-def test_clean_tasks() -> None:
-    kept, dropped = clean_tasks(_payload("查我的年假还剩几天", "明天北京的天气怎么样"), 3)
-    check("两条独立诉求拆成 2 条", kept == ["查我的年假还剩几天", "明天北京的天气怎么样"] and dropped == 0, str(kept))
-    check("脏 JSON 回退不拆", clean_tasks("这不是 JSON", 3) == ([], 0))
-    check("非数组载荷回退不拆", clean_tasks('{"tasks": "查年假"}', 3) == ([], 0))
-    check("只有一件事按不拆处理", clean_tasks(_payload("差旅费报销标准是多少"), 3) == ([], 0))
-    kept, _ = clean_tasks(_payload("查年假", "查年假", "查天气"), 3)
-    check("重复条去重后仍是两条", kept == ["查年假", "查天气"], str(kept))
-    kept, _ = clean_tasks(_payload("查年假", "  ", "「查天气」", "x" * 300), 3)
-    check("空条与超长条被丢弃且剥掉包裹引号", kept == ["查年假", "查天气"], str(kept))
-    kept, dropped = clean_tasks(_payload("一", "二", "三", "四", "五"), 3)
-    check("超出上限截断并回报未处理条数", kept == ["一", "二", "三"] and dropped == 2, f"{kept} dropped={dropped}")
+def _gpayload(*tasks: dict) -> str:
+    return json.dumps({"tasks": list(tasks)}, ensure_ascii=False)
 
 
-def test_looks_multi() -> None:
+def _t(tid: str, goal: str, tool: str = "web", readonly: bool = True, deps: list[str] | None = None) -> dict:
+    return {"id": tid, "goal": goal, "tool_hint": tool, "readonly": readonly, "depends_on": deps or []}
+
+
+def test_validate_task_graph() -> None:
+    kept, dropped = validate_task_graph(_gpayload(
+        _t("t1", "查我的年假还剩几天", "hr"), _t("t2", "明天北京的天气怎么样", "web"),
+    ), 3)
+    check(
+        "两条独立诉求拆成 2 节点",
+        [t["goal"] for t in kept] == ["查我的年假还剩几天", "明天北京的天气怎么样"] and dropped == 0,
+        str(kept),
+    )
+    kept, _ = validate_task_graph(_payload("查年假", "查天气"), 3)
+    check("兼容旧字符串数组形状", [t["goal"] for t in kept] == ["查年假", "查天气"], str(kept))
+    check("脏 JSON 回退不拆", validate_task_graph("这不是 JSON", 3) == ([], 0))
+    check("非数组载荷回退不拆", validate_task_graph('{"tasks": "查年假"}', 3) == ([], 0))
+    check(
+        "只有一件事按不拆处理",
+        validate_task_graph(_gpayload(_t("t1", "差旅费报销标准是多少", "kb")), 3) == ([], 0),
+    )
+    kept, _ = validate_task_graph(_gpayload(
+        _t("t1", "天安门下次升旗是哪天", "web"), _t("t2", "天安门下次升旗时间是几点", "web"),
+    ), 3)
+    check("同工具同实体误拆被合并回单任务(缺陷回归)", kept == [], str(kept))
+    kept, _ = validate_task_graph(_gpayload(
+        _t("t1", "先查我的余额", "hr", deps=["t2"]), _t("t2", "再帮我下单", "hr", readonly=False, deps=["t1"]),
+    ), 3)
+    check("依赖成环回退不拆", kept == [], str(kept))
+    kept, _ = validate_task_graph(_gpayload(
+        _t("t1", "查我的年假余额", "hr"), _t("t2", "帮我提交请假申请", "hr", readonly=False),
+    ), 3)
+    check(
+        "写操作节点标 deferred 且不同实体不误合",
+        len(kept) == 2 and kept[1]["deferred"] is True and kept[0]["deferred"] is False,
+        str(kept),
+    )
+    kept, dropped = validate_task_graph(_gpayload(*[_t(f"t{i}", f"事项{i}号", "web") for i in range(1, 6)]), 3)
+    check("超出上限截断并回报未处理条数", len(kept) == 3 and dropped == 2, f"{len(kept)} dropped={dropped}")
+
+
+def test_triage() -> None:
     def gate(enabled: bool, min_chars: int) -> TaskPlanner:
-        # looks_multi 只读这两个配置项, 用 SimpleNamespace 绕开 LLM 客户端构造。
+        # triage 只读这两个配置项, 用 SimpleNamespace 绕开 LLM 客户端构造。
         planner = TaskPlanner.__new__(TaskPlanner)
         planner._settings = SimpleNamespace(  # type: ignore[attr-defined]
             multi_task_enabled=enabled, multi_task_min_chars=min_chars
@@ -64,11 +96,12 @@ def test_looks_multi() -> None:
         return planner
 
     on = gate(True, 8)
-    check("关闭总开关即不拆", gate(False, 8).looks_multi("查查我年假还剩几天，明天北京天气怎么样") is False)
-    check("短消息不拆(省一次 LLM 调用)", on.looks_multi("查年假") is False)
-    check("逗号分隔的复合问法命中", on.looks_multi("查查我年假还剩几天，明天北京天气怎么样") is True)
-    check("连接词'顺便'命中", on.looks_multi("帮我查下年假余额顺便看看明天北京天气") is True)
-    check("无分隔无连接词的单一诉求不拆", on.looks_multi("我的公积金缴纳比例是多少") is False)
+    check("关闭总开关 skip", gate(False, 8).triage("查查我年假还剩几天，明天北京天气怎么样") == "skip")
+    check("短消息 skip(省一次 LLM 调用)", on.triage("查年假") == "skip")
+    check("单域槽位叠加判 single", on.triage("天安门下次升旗是哪天，时间几点") == "single")
+    check("显式连接词判 plan", on.triage("帮我查下年假余额顺便看看明天北京天气") == "plan")
+    check("跨域多子句判 plan", on.triage("查查我年假还剩几天，明天北京天气怎么样") == "plan")
+    check("无分隔无连接词的单一诉求 skip", on.triage("我的公积金缴纳比例是多少") == "skip")
 
 
 def _intent(kind: IntentType, target: str | None = None) -> IntentResult:
@@ -84,6 +117,9 @@ def test_parallel_partition() -> None:
     check("finance tool_call 不并行", safe(_intent(IntentType.TOOL_CALL, "finance")) is False)
     check("A2A 委派不并行", safe(_intent(IntentType.AGENT_DELEGATE, "hr")) is False)
     check("闲聊不并行", safe(_intent(IntentType.CHITCHAT)) is False)
+    # Layer2 readonly 与漏斗口径取"与": readonly=false 强制非并行(即使 web)。
+    check("readonly=false 强制非并行", safe(_intent(IntentType.TOOL_CALL, "web"), {"readonly": False}) is False)
+    check("readonly=true 的 web 仍可并行", safe(_intent(IntentType.TOOL_CALL, "web"), {"readonly": True}) is True)
     route = AssistantOrchestrator._subtask_route
     check(
         "意图到路由的映射稳定",
@@ -124,6 +160,16 @@ def test_merge_answers() -> None:
     check("全失败给统一说明且带原因", "都没能完成" in all_failed and "下游无响应" in all_failed, all_failed)
     check("空结果不抛异常", isinstance(merge([]), str) and bool(merge([])))
     check("截断项在末尾说明", "另有 2 项" in merge([_outcome(0, "甲", "a"), _outcome(1, "乙", "b")], dropped=2))
+
+    deferred = merge([
+        _outcome(0, "查我的年假", "剩余 5 天。"),
+        {**_outcome(1, "帮我提交请假", "", ok=False, error="写操作需你确认后办理"), "status": "deferred"},
+    ])
+    check(
+        "deferred 节提示需确认且不当作失败",
+        "办理类操作" in deferred and "需你确认" in deferred and "未完成" not in deferred,
+        deferred,
+    )
 
 
 def test_build_response() -> None:
@@ -197,6 +243,7 @@ def test_settings_defaults() -> None:
             for name in (
                 "multi_task_enabled", "multi_task_min_chars", "multi_task_max_subtasks",
                 "multi_task_parallelism", "multi_task_subtask_timeout",
+                "multi_task_merge_enabled", "multi_task_core_overlap_threshold",
             )
         ),
     )
@@ -212,8 +259,8 @@ def test_settings_defaults() -> None:
 
 
 def main() -> int:
-    test_clean_tasks()
-    test_looks_multi()
+    test_validate_task_graph()
+    test_triage()
     test_parallel_partition()
     test_merge_answers()
     test_build_response()

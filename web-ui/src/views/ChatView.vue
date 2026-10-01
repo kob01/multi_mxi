@@ -50,9 +50,10 @@ const ROUTE_TAG_TYPES = {
 
 // ---------- 多任务逐项进度的解析 ----------
 // 后端 subtask 阶段事件文本形状: ``[i/n] 子问题 → 路由标签…`` 开头,
-// ``... → 路由标签已完成/未完成`` 结尾; planning 阶段给总件数。
-const SUBTASK_RE = /^\[(\d+)\/(\d+)\]\s*(.+?)\s*→\s*(.+?)(已完成|未完成|…)$/
-const SUBTASK_STATE_ICONS = { waiting: '○', running: '◐', done: '✔', failed: '✖' }
+// ``... → 路由标签已完成/未完成/待确认…`` 结尾; planning 阶段给总件数。
+// "待确认…"(写操作降级)必须排在裸"…"前, 否则会被裸省略号抢先匹配成 running。
+const SUBTASK_RE = /^\[(\d+)\/(\d+)\]\s*(.+?)\s*→\s*(.+?)(已完成|未完成|待确认…|…)$/
+const SUBTASK_STATE_ICONS = { waiting: '○', running: '◐', done: '✔', failed: '✖', deferred: '⊘' }
 
 function subtaskLabel(route, target) {
   const base = ROUTE_LABELS[route] || route || ''
@@ -82,7 +83,7 @@ function trackSubTasks(msg, ev) {
     index: idx + 1,
     query: m[2] || msg.subTasks[idx].query,
     label: m[3] || msg.subTasks[idx].label,
-    state: m[4] === '已完成' ? 'done' : m[4] === '未完成' ? 'failed' : 'running',
+    state: m[4] === '已完成' ? 'done' : m[4] === '未完成' ? 'failed' : m[4] === '待确认…' ? 'deferred' : 'running',
   }
 }
 
@@ -97,7 +98,8 @@ function applySubTaskResults(msg, ev) {
     index: Number(s.index || 0) + 1,
     query: s.query || '',
     label: subtaskLabel(s.route, s.target),
-    state: s.ok ? 'done' : 'failed',
+    // status=deferred 是写操作待确认(未自动执行), 既非成功也非失败, 单独标灰黄。
+    state: s.status === 'deferred' ? 'deferred' : s.ok ? 'done' : 'failed',
     error: s.error || '',
   }))
 }
@@ -714,6 +716,10 @@ const currentSessionId = computed(() => sessionId.value)
 
 .st-running {
   color: #409eff;
+}
+
+.st-deferred {
+  color: #e6a23c;
 }
 
 .subtask-query {

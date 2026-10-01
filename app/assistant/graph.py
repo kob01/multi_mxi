@@ -425,15 +425,16 @@ class AssistantOrchestrator:
         message = state.get("rewritten_query") or state["message"]
         planner = get_planner()
         empty = {"subtasks": [], "subtask_dropped": 0}
-        if not planner.looks_multi(message):
+        # Layer1 规则门: 只有 ``plan`` 才进 LLM 拆分; ``single``/``skip`` 直接走单意图。
+        if planner.triage(message) != "plan":
             return empty
-        queries, dropped = await planner.split(message, state.get("history") or "")
-        if len(queries) < 2:
+        tasks, dropped = await planner.split(message, state.get("history") or "")
+        if len(tasks) < 2:
             return empty
         history = state.get("history", "")
         try:
             intents = await asyncio.gather(
-                *(self._intent.classify(q, history) for q in queries)
+                *(self._intent.classify(t["goal"], history) for t in tasks)
             )
         except Exception as exc:  # noqa: BLE001 - 拆不出意图就按单意图走, 不阻断
             logger.warning("子任务意图分类失败, 本轮退回单意图路由: %s", exc)
@@ -441,14 +442,19 @@ class AssistantOrchestrator:
         subtasks = [
             {
                 "index": i,
-                "query": q,
+                "id": t.get("id") or f"t{i + 1}",
+                "query": t["goal"],
                 "intent": intent,
                 "target": intent.target,
                 "route": self._subtask_route(intent),
+                "tool_hint": t.get("tool_hint") or "",
+                "readonly": bool(t.get("readonly", True)),
+                "depends_on": list(t.get("depends_on") or []),
+                "deferred": bool(t.get("deferred")),
             }
-            for i, (q, intent) in enumerate(zip(queries, intents))
+            for i, (t, intent) in enumerate(zip(tasks, intents))
         ]
-        parallel_count = sum(1 for s in subtasks if self._is_parallel_safe(s["intent"]))
+        parallel_count = sum(1 for s in subtasks if self._is_parallel_safe(s["intent"], s))
         self._audit.log(
             state.get("trace_id") or "", "assistant", "multi_task_planned",
             {
@@ -461,6 +467,8 @@ class AssistantOrchestrator:
                         "target": s["intent"].target,
                         "layer": s["intent"].layer,
                         "confidence": s["intent"].confidence,
+                        "tool_hint": s["tool_hint"], "readonly": s["readonly"],
+                        "depends_on": s["depends_on"], "deferred": s["deferred"],
                     }
                     for s in subtasks
                 ],
@@ -1265,13 +1273,16 @@ class AssistantOrchestrator:
     # ---------------- 多任务并行(复合问法) ----------------
 
     @staticmethod
-    def _is_parallel_safe(intent: IntentResult) -> bool:
+    def _is_parallel_safe(intent: IntentResult, sub: dict[str, Any] | None = None) -> bool:
         """子任务能否与兄弟任务并发执行(默认拒, 口径见模块 docstring)。
 
         只读通道(知识库检索 / web / docgen 能力域)才能并发; 业务域 tool_call 与
         agent_delegate 一律串行尾随 —— 它们可能产生真实写入, 且不会并发打同一条
-        MCP session。要放开更多 target 前需先复核 MCP session 的并发语义。
+        MCP session。Layer2 的 ``readonly`` 与漏斗口径取"与"(更保守): 任一判为写
+        (readonly=false)一律非并行。要放开更多 target 前需先复核 MCP session 的并发语义。
         """
+        if sub is not None and not sub.get("readonly", True):
+            return False
         if intent.intent is IntentType.KNOWLEDGE_QA:
             return True
         return (
@@ -1391,32 +1402,113 @@ class AssistantOrchestrator:
         return outcome
 
     async def multi_execute(self, state: AssistantState) -> dict[str, Any]:
-        """只读子任务并发跑, 其余按原序串行尾随, 结果按子任务原序归位。
+        """按 ``depends_on`` 拓扑分层执行: 层内只读且并行安全的并发跑, 写操作
+        (readonly=false / deferred)降级为待确认不自动执行, 其余串行尾随; 下游节点
+        执行前注入上游结果。结果按子任务原序归位。
 
         并发上限由 ``multi_task_parallelism`` 的 Semaphore 控制(串行段共用同一个
         信号量, 因为上限要的是"同时在跑的总量"而不是只限并行段)。单子任务的
         隔离已由 :meth:`_run_subtask_guarded` 做完, 这里的 ``return_exceptions`` 只是
-        兼顶意外(例如取消之外的 BaseException)。
+        兼顶意外。若出现环/悬空(Layer3 本应拦住)导致无可执行节点, 退化为按 index
+        原序放行队首, 保证调度永不死锁(回退永远安全)。
         """
         subtasks = state.get("subtasks") or []
         if not subtasks:
             return {"task_results": []}
         sem = asyncio.Semaphore(max(1, self._settings.multi_task_parallelism))
         total = len(subtasks)
-        parallel = [s for s in subtasks if self._is_parallel_safe(s["intent"])]
-        serial = [s for s in subtasks if not self._is_parallel_safe(s["intent"])]
-        outcomes: list[dict[str, Any]] = []
-        if parallel:
-            raw = await asyncio.gather(
-                *(self._run_subtask_guarded(state, s, sem, total) for s in parallel),
-                return_exceptions=True,
-            )
-            outcomes.extend(self._fallback_outcome(s, err) if isinstance(err, BaseException) else err
-                            for s, err in zip(parallel, raw))
-        for sub in serial:
-            outcomes.append(await self._run_subtask_guarded(state, sub, sem, total))
-        outcomes.sort(key=lambda o: int(o["index"]))
-        return {"task_results": outcomes}
+        id_to_index = {str(s.get("id")): int(s["index"]) for s in subtasks}
+        outcomes: dict[int, dict[str, Any]] = {}
+        remaining = list(subtasks)
+        while remaining:
+            ready = [
+                s for s in remaining
+                if all(
+                    (idx := id_to_index.get(str(d))) is not None and idx in outcomes
+                    for d in (s.get("depends_on") or [])
+                )
+            ]
+            if not ready:  # 环/悬空兜底: 按 index 原序放行队首, 不死锁
+                ready = [min(remaining, key=lambda s: int(s["index"]))]
+            parallel = [
+                s for s in ready
+                if not s.get("deferred") and self._is_parallel_safe(s["intent"], s)
+            ]
+            serial = [
+                s for s in ready
+                if not s.get("deferred") and not self._is_parallel_safe(s["intent"], s)
+            ]
+            deferred = [s for s in ready if s.get("deferred")]
+            if parallel:
+                raw = await asyncio.gather(
+                    *(
+                        self._run_subtask_guarded(
+                            state, self._with_upstream_context(s, outcomes, id_to_index), sem, total
+                        )
+                        for s in parallel
+                    ),
+                    return_exceptions=True,
+                )
+                for s, res in zip(parallel, raw):
+                    outcomes[int(s["index"])] = (
+                        self._fallback_outcome(s, res) if isinstance(res, BaseException) else res
+                    )
+            for s in serial:
+                outcomes[int(s["index"])] = await self._run_subtask_guarded(
+                    state, self._with_upstream_context(s, outcomes, id_to_index), sem, total
+                )
+            for s in deferred:
+                outcomes[int(s["index"])] = await self._run_deferred(state, s, total)
+            done_idx = {int(s["index"]) for s in ready}
+            remaining = [s for s in remaining if int(s["index"]) not in done_idx]
+        return {"task_results": [outcomes[i] for i in sorted(outcomes)]}
+
+    @staticmethod
+    def _with_upstream_context(
+        sub: dict[str, Any],
+        outcomes: dict[int, dict[str, Any]],
+        id_to_index: dict[str, int],
+    ) -> dict[str, Any]:
+        """有依赖的下游节点: 把已完成的依赖结果拼进其 query(数据流)。无依赖直接返回。"""
+        deps = sub.get("depends_on") or []
+        if not deps:
+            return sub
+        lines: list[str] = []
+        for d in deps:
+            idx = id_to_index.get(str(d))
+            out = outcomes.get(idx) if idx is not None else None
+            if out and (out.get("answer") or "").strip():
+                lines.append(f"- {str(out.get('query') or '').strip()}: {str(out['answer']).strip()}")
+        if not lines:
+            return sub
+        aug = f"{sub['query']}\n\n已知前序结果(供参考, 不要重复执行):\n" + "\n".join(lines)
+        return {**sub, "query": aug}
+
+    async def _run_deferred(
+        self, state: AssistantState, sub: dict[str, Any], total: int
+    ) -> dict[str, Any]:
+        """写操作(readonly=false)不自动执行: 产出一个"待确认"节, 由用户确认后再办。"""
+        index = int(sub.get("index") or 0)
+        intent: IntentResult = sub["intent"]
+        await self._emit_status(
+            state, "subtask",
+            f"[{index + 1}/{total}] {str(sub['query'])[:16]} → {self._subtask_label(intent)}待确认…",
+        )
+        self._audit.log(
+            state.get("trace_id") or "", "assistant", "subtask_deferred",
+            {
+                "index": index, "query": sub["query"], "route": sub.get("route"),
+                "target": sub.get("target"), "intent": intent.intent.value,
+            },
+            state.get("session_id"),
+        )
+        return {
+            "index": index, "query": sub["query"], "intent": intent,
+            "route": sub.get("route") or self._subtask_route(intent),
+            "target": sub.get("target"), "answer": "", "docs_meta": [],
+            "artifacts": [], "ok": False, "status": "deferred",
+            "error": "写操作需你确认后办理", "elapsed_ms": 0,
+        }
 
     def _fallback_outcome(self, sub: dict[str, Any], exc: BaseException) -> dict[str, Any]:
         """gather 兼顶路径: 分支连隔离都走不到时也要凑出一个完整节。"""
@@ -1441,8 +1533,9 @@ class AssistantOrchestrator:
         """
         if not results:
             return "多任务处理未产生任何结果。"
+        deferred = [r for r in results if str(r.get("status") or "") == "deferred"]
         succeeded = [r for r in results if r.get("ok")]
-        if not succeeded:
+        if not succeeded and not deferred:
             reasons = "; ".join(str(r.get("error") or "未知错误") for r in results)
             return f"这次的 {len(results)} 件事都没能完成: {reasons}"
         denied = [r for r in results if str(r.get("status") or "") == "denied"]
@@ -1457,10 +1550,15 @@ class AssistantOrchestrator:
             if label:
                 head += f"({label})"
             body = str(r.get("answer") or "").strip()
-            if not r.get("ok"):
-                prefix = "权限或额度不够" if str(r.get("status") or "") == "denied" else "未完成"
+            status = str(r.get("status") or "")
+            if status == "deferred":
+                body = "> 该项是办理类操作, 需你确认后我再执行。"
+            elif not r.get("ok"):
+                prefix = "权限或额度不够" if status == "denied" else "未完成"
                 body = f"> 该项{prefix}: {r.get('error') or '未知错误'}"
             parts.append(f"{head}\n\n{body}")
+        if deferred:
+            parts.append(f"> 有 {len(deferred)} 项是办理类操作, 为安全起见未自动执行; 需要的话回复“确认”, 我再逐项办理。")
         if denied:
             parts.append(f"> 另有 {len(denied)} 项因权限或当日额度被拒, 需要相应角色或次日再试。")
         if dropped > 0:
@@ -1914,6 +2012,7 @@ class AssistantOrchestrator:
                     "query": r.get("query"),
                     "route": r.get("route"),
                     "target": r.get("target"),
+                    "status": r.get("status") or "",
                     "ok": bool(r.get("ok")),
                     "error": r.get("error") or "",
                     "elapsed_ms": r.get("elapsed_ms"),

@@ -50,6 +50,8 @@ _COMPOUND = "查查我年假还剩几天，明天北京天气怎么样"
 # 三件事版本: 天气(web)与报销标准(知识库)都属并行集, 用于验证区间真重叠。
 _COMPOUND3 = "查查我年假还剩几天，明天北京天气怎么样，另外差旅费报销标准是多少"
 _MIXED = "查一下我的年假还剩几天，顺便帮我提一笔报销"
+# 缺陷回归: 同主体多槽位追问(日期+时刻)应判单任务, 不进多任务并行。
+_SLOT_PILING = "天安门下次升旗是哪天，时间几点"
 
 _results: list[tuple[bool, str, str]] = []
 
@@ -303,6 +305,12 @@ async def main() -> int:
         check("纯办理单问法仍走委派", delegate.get("route") == "a2a_agent", f"route={delegate.get('route')}")
         chat_, _e4, _w4, _i4 = await stream_chat(client, "你好呀", f"hi-{prefix}")
         check("寒暄仍走直答", chat_.get("route") == "direct", f"route={chat_.get('route')}")
+        # 缺陷回归: 同主体多槽位追问不得被拆成并行(一次检索即可答全)。
+        slot, _e5, _w5, _i5 = await stream_chat(client, _SLOT_PILING, f"slot-{prefix}")
+        check("同主体多槽位追问不进多任务并行", slot.get("route") != "multi_task",
+              f"route={slot.get('route')}")
+        check("同主体多槽位追问不产生逐项进度", "subtask" not in stages(_e5) and "planning" not in stages(_e5),
+              f"stages={stages(_e5)}")
         check("单意图轮次不产生逐项进度",
               all("subtask" != s for s in stages(_e2) + stages(_e3) + stages(_e4)))
 
