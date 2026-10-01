@@ -110,10 +110,13 @@ from app.security.audit import get_audit_logger, new_trace_id
 from app.security.auth import (
     PermissionDenied,
     check_agent_permission,
+    check_capability_permission,
     check_mcp_permission,
     filter_tools_for_role,
 )
+from app.security.caller import Caller, reset_caller, set_caller
 from app.security.masking import mask_text
+from app.security.quota import check_capability_quota, remaining, resolve_daily_limit
 from app.tools import CAPABILITY_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -131,6 +134,16 @@ _SELF_CONTAINED_LEN = 40
 # 低于该长度的闲聊轮不触发个人记忆提取: "你好""谢谢" 这类寒暄不可能同
 # 时携带值得跨会话记住的信息, 直接挡住这部分轮次的提取成本。
 _MIN_MEMORY_MESSAGE_LEN = 12
+# 显式记忆指令触发词(knowledge 桶唯一的写入门): "记一下/记住/帮我记"这类说法
+# 命中才调 LLM 提炼落库。词表来自 settings.memory_record_keywords, 每次现拼(量小
+# 成本忽略); 只扫用户消息, 助手回答里的"为您记住"不该触发记录。
+
+
+def _memory_command_pattern(settings) -> re.Pattern:
+    keywords = [k.strip() for k in settings.memory_record_keywords.split(",") if k.strip()]
+    return re.compile("|".join(re.escape(k) for k in keywords)) if keywords else None
+
+
 # 指代词/省略/追问标记: 命中则即使消息较长也必须走改写。
 # 只保留真正的上下文依赖标记(人称/指示代词、回指短语、追问语气词),
 # 不含"如何/哪个"等泛疑问词——它们大量出现在自包含问题中, 会触发无效改写。
@@ -894,8 +907,43 @@ class AssistantOrchestrator:
         capability_tools = CAPABILITY_TOOLS.get(target)
         domain_hint = ""
         if capability_tools is not None:
-            # 能力域: 工具在本进程内, 无 MCP 白名单可查(计划 D3: 不建角色×工具矩阵)。
-            self._audit.log(trace_id, "assistant", "capability_dispatch", {"capability": target}, session_id)
+            # 能力域: 工具在本进程内, 不走 MCP 的角色×工具矩阵, 但不是"没权限层"——
+            # 域级角色闸门(哪些角色能用) + 每人每日配额(能用多少次)都在这拦。
+            try:
+                check_capability_permission(role, target)
+            except PermissionDenied as exc:
+                logger.warning("能力域权限拒绝: role=%s target=%s err=%s", role.value, target, exc)
+                self._audit.log(
+                    trace_id, "assistant", "capability_permission_denied",
+                    {"role": role.value, "capability": target, "reason": str(exc)},
+                    session_id,
+                )
+                return {
+                    "answer": f"权限不足:{exc}", "status": "denied",
+                    "route": "mcp_tool", "target": target,
+                }
+            quota_ok, used = await check_capability_quota(target, state.get("user_id") or "")
+            limit = resolve_daily_limit()
+            if not quota_ok:
+                self._audit.log(
+                    trace_id, "assistant", "capability_quota_exceeded",
+                    {"capability": target, "user_id": state.get("user_id") or "",
+                     "used": used, "limit": limit},
+                    session_id,
+                )
+                return {
+                    "answer": (
+                        f"今日 {target} 能力用量已达上限({limit} 次), 本轮不再处理;"
+                        "请明天再来, 或把需求改成不需要联网检索/文件生成的问法。"
+                    ),
+                    "status": "denied", "route": "mcp_tool", "target": target,
+                }
+            self._audit.log(
+                trace_id, "assistant", "capability_dispatch",
+                {"capability": target, "role": role.value,
+                 "used": used, "limit": limit, "remaining": remaining(used, limit)},
+                session_id,
+            )
             await self._emit_status(state, "tool", f"正在使用 {target} 能力工具…")
             all_tools = list(capability_tools)
             domain_hint = CAPABILITY_HINTS.get(target, "")
@@ -912,7 +960,11 @@ class AssistantOrchestrator:
                     {"role": role.value, "target": target, "reason": str(exc)},
                     session_id,
                 )
-                return {"answer": f"权限不足:{exc}", "route": "mcp_tool", "target": target}
+                # status=denied: 多任务合并靠它区分"办成了"与"被拒了", 不能只看 answer 非空。
+                return {
+                    "answer": f"权限不足:{exc}", "status": "denied",
+                    "route": "mcp_tool", "target": target,
+                }
             all_tools = await get_mcp_pool().get_tools(target)
             stamp = get_mcp_pool().cache_stamp(target)
 
@@ -928,7 +980,7 @@ class AssistantOrchestrator:
         if not tools:
             return {
                 "answer": f"权限不足: 角色 {role.value} 在 {target} 域无可用工具。",
-                "route": "mcp_tool", "target": target,
+                "status": "denied", "route": "mcp_tool", "target": target,
             }
 
         agent = self._react_agent(target, role, tools, stamp)
@@ -938,10 +990,11 @@ class AssistantOrchestrator:
         system_context = (
             f"系统上下文(仅供调用工具时使用, 不要向用户复述): "
             f"当前登录操作者 employee_id={state.get('user_id') or 'anonymous'}; "
-            f"当前时间={self._now_text(state)}。"
+            f"当前角色 role={role.value}; 当前时间={self._now_text(state)}。"
             "操作者身份仅代表登录态, 不等于任务目标用户: 若用户消息中指定了目标员工"
             "(工号/姓名), 以消息指定的为准; 仅当查询\"我/本人\"相关数据且未指定他人时, "
-            "才默认使用操作者 employee_id。"
+            "才默认使用操作者 employee_id。caller_* 字段由系统注入且会覆盖你填的值, "
+            "无需也不要在工具参数里传它们。"
         )
         if domain_hint:
             system_context += f"\n{domain_hint}"
@@ -962,7 +1015,7 @@ class AssistantOrchestrator:
             if isinstance(msg, AIMessage) and msg.content:
                 answer = str(msg.content)
                 break
-        return {"answer": answer, "route": "mcp_tool", "target": target}
+        return {"answer": answer, "status": "ok", "route": "mcp_tool", "target": target}
 
     # 缓存上限: 域×角色×清单版本的笛卡尔积本来有界, 封顶只是防止版本频繁更替时
     # 旧条目无限堆积(每条都是一个编译好的图, 不能当垃圾留着)。
@@ -979,9 +1032,10 @@ class AssistantOrchestrator:
         tools = filter_tools_for_role(role, target, all_tools)
         # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号再调业务工具。
         tools = [*tools, lookup_employee_by_name]
-        # Tool Cache: ReAct 循环里工具由 LLM 自主决定何时以何参数调用, 缓存逻辑
-        # 只能下推到工具本身; 只读前缀白名单命中的工具会被包一层, 写操作工具
-        # (create_*/cancel_* 等)原样传递, 不会被缓存。
+        # 身份注入 + Tool Cache: ReAct 循环里工具由 LLM 自主决定何时以何参数调用,
+        # 缓存与"谁在调"都只能在工具本体上做。只读前缀白名单命中的工具额外接 Redis
+        # 缓存(注入的 caller_* 已在 key 里, 所以结果按调用者隔离); 写操作工具只注身份、
+        # 不缓存。见 app/cache/tool_cache.wrap_tools_for_cache。
         wrapped = wrap_tools_for_cache(tools, target, role.value)
         self._toolset_cache[key] = wrapped
         self._evict_stale(self._toolset_cache, stamp)
@@ -1109,6 +1163,9 @@ class AssistantOrchestrator:
         # append 的返回值是本轮新折叠出的会话摘要(没发生溢出压缩时为空串)。
         session_summary = await self._memory.append(session_id, masked_message, masked_answer)
         await self._write_personal_memory(state, masked_message, masked_answer, session_summary)
+        # 显式"记一下"指令是 knowledge 桶唯一的写入入口(自动提取与情节蒸馏已下线):
+        # 关键词命中才进 LLM 提炼链路, 未命中零成本; 失败只记日志不阻断对话。
+        await self._record_explicit_knowledge(state, masked_message, masked_answer)
         # 页面会话记录落库(app/chat_store.py): 失败静默降级, 不阻断对话。
         intent = state.get("intent")
         message_id = await get_chat_store().save_turn(
@@ -1132,6 +1189,31 @@ class AssistantOrchestrator:
              "chat_message_id": message_id}, session_id,
         )
         return {"message_id": message_id}
+
+    async def _record_explicit_knowledge(
+        self, state: AssistantState, message: str, answer: str
+    ) -> None:
+        """命中显式记忆指令词 -> 提炼并分"同话题更新/新增"落 knowledge 桶。"""
+        settings = self._settings
+        if not (settings.long_term_memory_enabled and settings.memory_record_enabled):
+            return
+        user_id = state.get("user_id") or ""
+        if not user_id:
+            return
+        pattern = _memory_command_pattern(settings)
+        if pattern is None or not pattern.search(message):
+            return
+        try:
+            stats = await get_personal_agent().remember_knowledge(
+                user_id, state.get("session_id") or "", message, answer
+            )
+            if any(stats.values()):
+                self._audit.log(
+                    state.get("trace_id") or "", "assistant", "explicit_knowledge_recorded",
+                    {"user_id": user_id, **stats}, state.get("session_id") or "",
+                )
+        except Exception as exc:  # noqa: BLE001 - 记不上只是这轮没记上
+            logger.warning("显式知识记录失败, 本轮跳过: %s", exc)
 
     async def _write_personal_memory(
         self,
@@ -1246,7 +1328,7 @@ class AssistantOrchestrator:
             "index": index, "query": sub["query"], "intent": intent,
             "route": sub.get("route") or self._subtask_route(intent),
             "target": sub.get("target"), "answer": "", "docs_meta": [],
-            "artifacts": [], "ok": False, "error": "",
+            "artifacts": [], "ok": False, "status": "pending", "error": "",
         }
         started = time.perf_counter()
         try:
@@ -1255,6 +1337,13 @@ class AssistantOrchestrator:
                     self._run_subtask(state, sub),
                     timeout=self._settings.multi_task_subtask_timeout,
                 )
+            # 成败看 status 而不是"answer 非空": 权限/配额被拒时 tool_execute 也带着一段
+            # 拒答文本回来, 按 answer 判成败会把"被拒"当成"办完", 合并时既不标失败也不
+            # 提示用户少办了哪几件事(只能在长结里混着一句权限不足)。
+            status = str(result.get("status") or "")
+            if status not in ("ok", "denied"):
+                status = "ok" if (result.get("answer") or "").strip() else "empty"
+            denied = status == "denied"
             outcome.update(
                 {
                     "answer": result.get("answer") or "",
@@ -1262,14 +1351,23 @@ class AssistantOrchestrator:
                     "target": result.get("target") or outcome["target"],
                     "docs_meta": result.get("docs_meta") or [],
                     "artifacts": result.get("artifacts") or [],
-                    "ok": bool(result.get("answer")),
-                    "error": "" if result.get("answer") else "未产生回答",
+                    "status": status,
+                    "ok": status == "ok",
+                    "error": ""
+                    if status == "ok"
+                    else (
+                        str(result.get("answer") or "权限不足")[:160]
+                        if denied
+                        else "未产生回答"
+                    ),
                 }
             )
         except asyncio.TimeoutError:
+            outcome["status"] = "timeout"
             outcome["error"] = f"超过 {self._settings.multi_task_subtask_timeout:.0f}s 未完成"
         except Exception as exc:  # noqa: BLE001 - 单子任务异常不连坐其他节
             logger.warning("子任务执行失败(index=%s): %s", index, exc)
+            outcome["status"] = "error"
             outcome["error"] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
         outcome["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
         # 开始与**完成**都发 status: 前端逐项清单靠这两个事件把状态从"处理中"推到
@@ -1327,7 +1425,8 @@ class AssistantOrchestrator:
             "index": int(sub.get("index") or 0), "query": sub.get("query") or "",
             "intent": intent, "route": self._subtask_route(intent),
             "target": sub.get("target"), "answer": "", "docs_meta": [], "artifacts": [],
-            "ok": False, "error": f"{exc.__class__.__name__}: {str(exc)[:160]}",
+            "ok": False, "status": "error",
+            "error": f"{exc.__class__.__name__}: {str(exc)[:160]}",
             "elapsed_ms": 0,
         }
 
@@ -1346,6 +1445,7 @@ class AssistantOrchestrator:
         if not succeeded:
             reasons = "; ".join(str(r.get("error") or "未知错误") for r in results)
             return f"这次的 {len(results)} 件事都没能完成: {reasons}"
+        denied = [r for r in results if str(r.get("status") or "") == "denied"]
         parts: list[str] = []
         if len(results) > 1:
             parts.append(f"你把 {len(results)} 件事放在一句话里问, 已分开处理(只读项并行、办理项串行):")
@@ -1358,8 +1458,11 @@ class AssistantOrchestrator:
                 head += f"({label})"
             body = str(r.get("answer") or "").strip()
             if not r.get("ok"):
-                body = f"> 该项未完成: {r.get('error') or '未知错误'}"
+                prefix = "权限或额度不够" if str(r.get("status") or "") == "denied" else "未完成"
+                body = f"> 该项{prefix}: {r.get('error') or '未知错误'}"
             parts.append(f"{head}\n\n{body}")
+        if denied:
+            parts.append(f"> 另有 {len(denied)} 项因权限或当日额度被拒, 需要相应角色或次日再试。")
         if dropped > 0:
             parts.append(f"> 另有 {dropped} 项已超出单次并行上限, 本次未处理, 请再问我一次。")
         return "\n\n".join(parts)
@@ -1728,52 +1831,69 @@ class AssistantOrchestrator:
     async def _run_graph(
         self, req: ChatRequest, trace_id: str, *, run_id: str, thinking: bool
     ) -> AssistantState:
-        """执行一次完整图调用(流式/非流式共用同一状态初始化)。"""
+        """执行一次完整图调用(流式/非流式共用同一状态初始化)。
+
+        进图前先把调用者绑到当前上下文(app/security/caller.py): 工具包装层在真正
+        发起调用前从这里取 ``caller_*`` 注入参数, 与 LLM 填的同名字段冲突时一律覆盖。
+        asyncio 任务创建时复制当前上下文, 所以图节点、并行子任务与 ReAct 工具调用
+        看的都是这一份; 离开本轮时必须复位, 否则同一个任务上下文里的下一轮会读到
+        上一个工号。
+        """
         from app.tracing import langfuse_callback
 
-        return await self._graph.ainvoke(
-            {
-                "message": req.message,
-                "session_id": req.session_id,
-                "user_id": req.user_id,
-                "role": req.role,
-                "department": req.department,
-                "trace_id": trace_id,
-                "run_id": run_id,
-                "thinking": thinking,
-                "message_id": None,
-                "thinking_text": "",
-                "artifacts": [],
-                "history": "",
-                "memory_ctx": "",
-                "current_time": "",
-                "intent": None,
-                "rewritten_query": "",
-                "answer": "",
-                "route": "direct",
-                "target": None,
-                "docs_meta": [],
-                "kb_query": "",
-                "kb_chunks": [],
-                "kb_meta_map": {},
-                "kb_attempt": 0,
-                "kb_acl_blocked": False,
-                "subtasks": [],
-                "subtask_dropped": 0,
-                "task_results": [],
-            },
-            # Working State Checkpoint: thread_id 用 session_id, 每轮对话都完整
-            # 传入上方所有 AssistantState 字段, 不会与上一轮残留的 checkpoint
-            # 状态串台(字段默认全量重置, 见 ``AssistantState``)。
-            # Langfuse: 顶层挂 CallbackHandler, 回调沿 LangGraph 传播到全部子
-            # run(节点内 LLM/工具/MCP 调用), 整轮对话归并为一条 trace;
-            # 传 trace_id 使 Langfuse trace id 与 audit.jsonl 全链路审计号对齐;
-            # 未启用时 langfuse_callback() 返回空 dict, 行为与改动前一致。
-            {
-                "configurable": {"thread_id": req.session_id},
-                **langfuse_callback(req.session_id, req.user_id, trace_id),
-            },
+        caller_token = set_caller(
+            Caller(
+                user_id=(req.user_id or "").strip(),
+                role=req.role.value,
+                department=(req.department or "").strip(),
+            )
         )
+        try:
+            return await self._graph.ainvoke(
+                {
+                    "message": req.message,
+                    "session_id": req.session_id,
+                    "user_id": req.user_id,
+                    "role": req.role,
+                    "department": req.department,
+                    "trace_id": trace_id,
+                    "run_id": run_id,
+                    "thinking": thinking,
+                    "message_id": None,
+                    "thinking_text": "",
+                    "artifacts": [],
+                    "history": "",
+                    "memory_ctx": "",
+                    "current_time": "",
+                    "intent": None,
+                    "rewritten_query": "",
+                    "answer": "",
+                    "route": "direct",
+                    "target": None,
+                    "docs_meta": [],
+                    "kb_query": "",
+                    "kb_chunks": [],
+                    "kb_meta_map": {},
+                    "kb_attempt": 0,
+                    "kb_acl_blocked": False,
+                    "subtasks": [],
+                    "subtask_dropped": 0,
+                    "task_results": [],
+                },
+                # Working State Checkpoint: thread_id 用 session_id, 每轮对话都完整
+                # 传入上方所有 AssistantState 字段, 不会与上一轮残留的 checkpoint
+                # 状态串台(字段默认全量重置, 见 ``AssistantState``)。
+                # Langfuse: 顶层挂 CallbackHandler, 回调沿 LangGraph 传播到全部子
+                # run(节点内 LLM/工具/MCP 调用), 整轮对话归并为一条 trace;
+                # 传 trace_id 使 Langfuse trace id 与 audit.jsonl 全链路审计号对齐;
+                # 未启用时 langfuse_callback() 返回空 dict, 行为与改动前一致。
+                {
+                    "configurable": {"thread_id": req.session_id},
+                    **langfuse_callback(req.session_id, req.user_id, trace_id),
+                },
+            )
+        finally:
+            reset_caller(caller_token)
 
     def _build_response(
         self, req: ChatRequest, final: AssistantState, trace_id: str

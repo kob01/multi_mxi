@@ -29,15 +29,15 @@ glob:
 
 `docker/.env` 中以下为红线键，不得改成 `localhost`、不得删除：
 
-| 键                | 必须的值                                |
-| ----------------- | --------------------------------------- |
-| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434`     |
-| `PG_HOST`         | `postgres`（配合 `PG_SSLMODE=disable`） |
-| `MONGO_URL`       | `mongodb://mongo:27017`                 |
-| `ES_URL`          | `http://elasticsearch:9200`             |
-| `TEI_RERANK_URL`  | `http://tei-rerank:8080`                |
-| `REDIS_URL`       | `redis://redis:6379/0`                  |
-| `NEO4J_URI`       | `bolt://neo4j:7687`                     |
+| 键                  | 必须的值                                                         |
+| ------------------- | ---------------------------------------------------------------- |
+| `OLLAMA_BASE_URL`   | `http://host.docker.internal:11434`                              |
+| `PG_HOST`           | `postgres`（配合 `PG_SSLMODE=disable`）                          |
+| `MONGO_URL`         | `mongodb://mongo:27017`                                          |
+| `ES_URL`            | `http://elasticsearch:9200`                                      |
+| `TEI_RERANK_URL`    | `http://tei-rerank:8080`                                         |
+| `REDIS_URL`         | `redis://redis:6379/0`                                           |
+| `NEO4J_URI`         | `bolt://neo4j:7687`                                              |
 | `LANGFUSE_BASE_URL` | `http://langfuse-web:3000`（compose 锁死，**不写 docker/.env**） |
 
 - 容器里的 `localhost` 指向容器自身，未映射端口时必定连接失败；Mongo 侧表现为写正文时 `ServerSelectionTimeoutError`。
@@ -108,8 +108,8 @@ compose 里的全部服务（**assistant** / postgres / elasticsearch / redis / 
 历史上 `environment:` 写成 `ES_URL: ${ES_URL:-http://elasticsearch:9200}` 时，docker/.env 这个插值源、部署 shell 里残留的同名 export、直接 `docker compose up` 前的环境变量，都能悄悄改掉容器地址，后果仍是静默降级。现已收敛为：
 
 - **红线键（地址/卷路径/tracing/容器内监听端口）在 compose `environment:` 里只允许字面量**：`ES_URL`、`TEI_RERANK_URL`、`MONGO_URL`、`OLLAMA_BASE_URL`、`DEEPSEEK_BASE_URL`、`UPLOAD_DIR`、`KNOWLEDGE_DIR`、`REPORT_DIR`、`AUDIT_LOG_PATH`、`ASSISTANT_PORT`、`PG_HOST`、`PG_SSLMODE`、各 `*_MCP_URL`/`*_AGENT_URL`、`LANGSMITH_TRACING`、`LANGFUSE_BASE_URL` 等（完整名单以
-   `dev_services.py::COMPOSE_REDLINE_KEYS` 为准）。改这些键 = 改 compose 本身，
-   dotenv 覆盖不动它们。
+  `dev_services.py::COMPOSE_REDLINE_KEYS` 为准）。改这些键 = 改 compose 本身，
+  dotenv 覆盖不动它们。
 - **跨部署真可调的键仍允许 `${VAR:-服务名默认}` 插值**：`PG_PORT/PG_USER/PG_DATABASE`、`REDIS_URL`、`NEO4J_URI`、`ES_INDEX`、`DOC_KG_ENABLED`、`MINERU_*`、`EMBEDDING_DIM`、`LLM_MODEL/INTENT_MODEL`、各 `*_IMAGE`/`*_HOST_PORT`（这些默认值都是容器视角，被覆盖不会引入宿主串味）。
 - **三道守护**：① `dev_services env-check` 扫 compose 源，红线键行含 `${` 或键从 compose 消失即 FAIL；② docker/.env 地址键出现 `localhost` 也 FAIL；③ 双轨同名业务参数漂移与 docker/.env ↔ `.env.example` 缺键各出一条 WARN（新增只落单侧的调参键 = 容器退代码默认值，两侧结论不可互相复现）。
 - 真实环境变量仍优先于代码默认值（对不在 env_file 里的宿主脚本依然生效），所以**宿主跑脚本前不要 export 同名地址变量**，结论存疑时先跑 env-check + check。

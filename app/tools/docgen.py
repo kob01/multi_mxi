@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
@@ -37,6 +38,10 @@ def build_image(path, spec: dict) -> None:
 
     图片已由 images.resolve_images 归一化为 token 目录下的 img_*.png; 这里只负责把它
     们中的第一张落到正式文件名上。无可用图则抛 ValueError 由 _generate 转成 {error}。
+
+    只允许复制**本次 token 目录内**的文件: spec.images[].path 是模型给的, 不校验子树
+    关系就能把任意本地文件(上一张 token 的产物、/etc/passwd)复制成一个对外可下载的
+    "图片" —— 与 app/files/router 的 resolve-后查子树同一口径。
     """
     import shutil
 
@@ -46,7 +51,13 @@ def build_image(path, spec: dict) -> None:
         # 容错: 直接把 src/path 写在顶层的简写法(generate_image 常这样传)。
         raw = str(spec.get("src") or spec.get("path") or "").strip()
         raise ValueError(f"没有可用的图片(检查 src 是否本地png或图片URL; 当前: {raw[:80]})")
-    shutil.copyfile(src, str(path))
+    target_dir = Path(path).resolve().parent
+    src_path = Path(src).resolve()
+    if not src_path.is_relative_to(target_dir):
+        raise ValueError(f"图片必须位于本次生成目录内, 拒绝复制目录外文件: {src[:120]}")
+    if not src_path.is_file():
+        raise ValueError(f"图片不存在: {src[:120]}")
+    shutil.copyfile(str(src_path), str(path))
 
 
 def _download_url(token: str, file_name: str) -> str:
@@ -97,7 +108,14 @@ async def _generate(
         logger.warning("generate_%s failed: %s", kind, exc)
         return {"error": f"文档生成失败({type(exc).__name__})", "kind": kind}
 
-    size = path.stat().st_size
+    # builder 可能"成功返回但没落文件"(内部吞异常/提前 return), 那时 stat() 会抛
+    # FileNotFoundError —— 上面刚写了"任何异常都不能炸 ReAct 循环", 不能在下两行
+    # 就把同一个约定破掉。
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        logger.warning("generate_%s produced no file: %s", kind, exc)
+        return {"error": f"生成器未产出文件({kind}), 请检查 spec 内容", "kind": kind}
     if size > settings.docgen_max_bytes:
         path.unlink(missing_ok=True)
         return {

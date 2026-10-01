@@ -28,9 +28,9 @@ AGENT_WHITELIST: dict[Role, set[str]] = {
 }
 
 # Fine-grained tool-level restrictions: sensitive tools are limited by role.
+# 本表只管"某工具对哪些角色可见"; "能不能碰别人的数据"不归它管 —— 归属校验在服务端
+# 注入的调用者身份上做(见 app/security/caller.py 与各 MCP server 的 guard_* 调用)。
 TOOL_ROLE_RESTRICTIONS: dict[str, set[Role]] = {
-    # e.g. only finance staff may look up *other* people's orders in a
-    # real system; here the tools are self-service so all roles pass.
 }
 
 # ---------------------------------------------------------------------------
@@ -38,6 +38,9 @@ TOOL_ROLE_RESTRICTIONS: dict[str, set[Role]] = {
 # 即对该角色完全隐藏 (LLM 看不见、调不到), 而非调用时报错。
 # 注意: MCP server 新增工具时必须同步维护本矩阵。
 # None 表示该域全量可见。
+# 本矩阵只管"看得见看不见"; "能不能碰别人的数据"由工具内部按网关注入的调用者
+# 身份判定(见 app/security/caller.py) —— 所以员工侧保留单据类工具是安全的:
+# 他们只能拿到自己名下的, 跨人访问会在工具侧被拒。
 # Text2SQL (execute_sql) 可查询全部员工/部门数据, 属敏感工具, 仅对管理角色开放。
 _HR_BASE_TOOLS = {
     "create_hr_ticket",
@@ -121,6 +124,36 @@ _DOMAIN_TOOL_WHITELISTS: dict[str, dict[Role, set[str] | None]] = {
     "procurement": PROCUREMENT_TOOL_WHITELIST,
 }
 
+# ---------------------------------------------------------------------------
+# 能力域(web 联网检索 / docgen 文件生成)的域级闸门
+# ---------------------------------------------------------------------------
+# 能力域的工具在本进程内, 不参与上面的 MCP 矩阵; "不建工具级矩阵" (计划 D3) 原先被
+# 实现成了"什么都不查", 于是任意角色任意调用量都能驱动联网抓取与落盘生成。现在按
+# 配置声明允许的角色与域 —— 默认拒: 未登记的域与不在白名单里的角色一律拒。
+_ALL_ROLES = frozenset(Role)
+
+
+def _capability_roles() -> frozenset[str]:
+    """从配置解出可用能力域的角色集合(解不出任何一个时 = 无人可用, 而不是全员可用)。"""
+    from app.config import get_settings
+
+    raw = (get_settings().capability_allowed_roles or "").lower()
+    known = {r.value for r in _ALL_ROLES}
+    return frozenset(p.strip() for p in raw.split(",") if p.strip() in known)
+
+
+def capability_allowed(capability: str) -> set[str]:
+    """该能力域当前对哪些角色开放(返回角色 value 集合, 空集 = 全员禁用)。"""
+    return set(_capability_roles()) if capability in ("web", "docgen") else set()
+
+
+def check_capability_permission(role: Role, capability: str) -> None:
+    """Raise PermissionDenied if the role may not use the in-process capability domain."""
+    if capability not in ("web", "docgen"):
+        raise PermissionDenied(f"未登记的能力域 {capability}")
+    if role.value not in capability_allowed(capability):
+        raise PermissionDenied(f"角色 {role.value} 无权使用 {capability} 能力域")
+
 
 def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> list[Any]:
     """Return the subset of ``tools`` visible to ``role`` on ``server_name``.
@@ -128,9 +161,11 @@ def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> lis
     Tools must expose a ``name`` attribute (LangChain BaseTool). The four MCP
     business domains (finance/hr/analytics/procurement) are tiered by the
     matrices in ``_DOMAIN_TOOL_WHITELISTS``; unregistered domains (e.g. the
-    in-process capability domains web/docgen, which have no role×tool matrix)
-    pass through unchanged. Default-deny: roles missing from the matrix see
-    nothing.
+    in-process capability domains web/docgen) pass through here **without a
+    per-tool matrix** — they are gated one level up by
+    :func:`check_capability_permission` plus :mod:`app.security.quota`, so
+    "pass through" no longer means "no permission layer at all". Default-deny:
+    roles missing from the matrix see nothing.
     """
     matrix = _DOMAIN_TOOL_WHITELISTS.get(server_name)
     if matrix is None:

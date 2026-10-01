@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -26,6 +27,7 @@ from app.llm import get_chat_model
 from app.schemas import Role
 from app.security.audit import get_audit_logger
 from app.security.auth import filter_tools_for_role
+from app.security.caller import Caller, bind_caller_tools, reset_caller, set_caller
 
 _EMPLOYEE_TAG_RE = re.compile(r"\[employee_id=([A-Za-z0-9_\-]+)\]")
 
@@ -106,20 +108,35 @@ class HRAgent:
         self._settings = settings
         self._llm = get_chat_model(settings.llm_model, temperature=0.1)
         self._tools: list[Any] | None = None
+        self._tools_at = 0.0
         self._agents: dict[Role, Any] = {}
 
+    def _ttl(self) -> float:
+        return max(1.0, float(self._settings.mcp_tools_ttl))
+
     async def _ensure_agent(self, role: Role = Role.EMPLOYEE) -> Any:
-        """Lazily connect to the MCP server and build a per-role ReAct graph."""
+        """Lazily connect to the MCP server and build a per-role ReAct graph.
+
+        工具清单与编排层一样按 ``mcp_tools_ttl`` 过期重发: 原先一次发现后永不刷新,
+        MCP server 重启/新增工具后本智能体永远拿不到新工具(也看不到工具参数的变动)。
+        清单变了就必须重建 agent: 已编译的图握的是具体一批工具对象。
+        """
+        if self._tools is None or time.monotonic() - self._tools_at > self._ttl():
+            client = MultiServerMCPClient(
+                {"hr": {"url": self._settings.hr_mcp_url, "transport": "streamable_http"}}
+            )
+            self._tools = await client.get_tools()
+            self._tools_at = time.monotonic()
+            self._agents.clear()
         if role not in self._agents:
-            if self._tools is None:
-                client = MultiServerMCPClient(
-                    {"hr": {"url": self._settings.hr_mcp_url, "transport": "streamable_http"}}
-                )
-                self._tools = await client.get_tools()
             # 权限Mask: 与编排层共用同一张角色×工具白名单矩阵 (硬控制)。
             tools = filter_tools_for_role(role, "hr", self._tools)
-            # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号。
+            # 各域共用的"姓名->工号"基础解析能力注入: 用户只给姓名时先解析工号。
             tools = [*tools, lookup_employee_by_name]
+            # 调用者身份注入: 业务工具的归属校验只认服务端注入的 caller_*, 而这份身份
+            # 在 :meth:`invoke` 里逐请求写到上下文(不写在工具对象上, 所以同一个
+            # 按角色缓存的 agent 能安全地服务不同工号)。
+            tools = bind_caller_tools(tools)
             self._agents[role] = create_agent(
                 # langchain 1.x 把 create_agent 的提示词参数改名为 system_prompt
                 # (旧写法 prompt= 会直接 TypeError, 表现为"工单智能体处理失败")。
@@ -128,21 +145,28 @@ class HRAgent:
         return self._agents[role]
 
     async def invoke(self, user_text: str, user_id: str = "", role: Role = Role.EMPLOYEE) -> str:
-        """Run one delegated task under the given (trusted) identity."""
+        """Run one delegated task under the given protocol-level identity."""
         agent = await self._ensure_agent(role)
         # 身份走 System 消息, 与用户请求文本分离; 显式区分"当前操作者"(登录态)
         # 与"任务目标用户"(消息中指定的他人), 防止 LLM 把操作者工号误用作
         # 目标员工的查询参数。
         system_context = (
             f"系统上下文(仅供调用工具时使用, 不要向用户复述): "
-            f"当前登录操作者 employee_id={user_id or 'anonymous'}。"
+            f"当前登录操作者 employee_id={user_id or 'anonymous'}; 当前角色 role={role.value}。"
             "操作者身份仅代表登录态, 不等于任务目标用户: 若用户消息中指定了目标员工"
             "(工号/姓名), 以消息指定的为准; 仅当查询/办理\"我/本人\"相关业务且未指定"
-            "他人时, 才默认使用操作者 employee_id。"
+            "他人时, 才默认使用操作者 employee_id。caller_* 字段由系统注入且会覆盖你填的值, "
+            "无需也不要在工具参数里传它们。"
         )
-        result = await agent.ainvoke(
-            {"messages": [("system", system_context), ("user", user_text)]}
-        )
+        # 把同一份身份交给 caller 上下文: 工具包装层在真正调用前从这里取注入参数,
+        # LLM 填的同名字段一律被覆盖(见 app/security/caller.py)。
+        token = set_caller(Caller(user_id=user_id or "", role=role.value))
+        try:
+            result = await agent.ainvoke(
+                {"messages": [("system", system_context), ("user", user_text)]}
+            )
+        finally:
+            reset_caller(token)
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
                 return str(msg.content)
@@ -184,4 +208,12 @@ class HRAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(new_agent_text_message(answer))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise NotImplementedError("HR_Agent does not support cancellation")
+        """取消未实现: 正在跑的 ReAct 循环没有可中断点。
+
+        显式抛出而不是静默返空, 是为了让调用方知道"取消不可用": 编排层不得把
+        cancel 当作回收手段(实际靠 a2a_timeout 兑底, 见 app/assistant/a2a_client.py)。
+        将来要支持得先把委派改成可取消的任务句柄并落 TaskStatusUpdateEvent。
+        """
+        raise NotImplementedError(
+            "HR_Agent 不支持 A2A cancel: 委派靠 a2a_timeout 兑底, 编排层不得依赖取消来回收资源"
+        )

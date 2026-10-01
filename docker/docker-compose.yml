@@ -640,7 +640,8 @@ services:
       # 宿主访问端口由 ports 发布映射决定, 与本键无关。
       ASSISTANT_PORT: "8000"
       # 非红线(跨部署可调): ES_INDEX / PG_* / EMBEDDING_DIM / REDIS_URL / NEO4J_URI /
-      # MONGO_DATABASE / DOC_KG_ENABLED / MINERU_* / LANGFUSE_ENABLED|PROJECT|ENVIRONMENT
+      # MONGO_DATABASE / DOC_KG_ENABLED / KG_MAX_RELATIONS_PER_DOC /
+      # KG_RELATION_VOCAB_ENABLED / MINERU_* / LANGFUSE_ENABLED|PROJECT|ENVIRONMENT
       # 仍走 docker/.env 插值, 带服务名默认兜底。
       ES_INDEX: ${ES_INDEX:-kb_chunks}
       PG_HOST: postgres
@@ -655,6 +656,9 @@ services:
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       # 文档知识图谱(GraphRAG)总开关, 复用同一个 neo4j 服务; 容器侧默认开。
       DOC_KG_ENABLED: ${DOC_KG_ENABLED:-true}
+      # 图谱边质量两个闸: 单篇关系条数硬上限 + 受控关系词表(词表在 app/kg/vocab.py)。
+      KG_MAX_RELATIONS_PER_DOC: ${KG_MAX_RELATIONS_PER_DOC:-40}
+      KG_RELATION_VOCAB_ENABLED: ${KG_RELATION_VOCAB_ENABLED:-true}
       MONGO_DATABASE: ${MONGO_DATABASE:-mxi}
       MONGO_ENABLED: ${MONGO_ENABLED:-true}
       NORMALIZER_VERSION: ${NORMALIZER_VERSION:-n1}

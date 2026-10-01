@@ -25,7 +25,9 @@ from datetime import datetime, timedelta, timezone
 from app.assistant.prompts import MEMORY_EXTRACTION_PROMPT
 from app.config import get_settings
 from app.llm import get_chat_model
+from app.memory import graph_vocab
 from app.memory.temporal import parse_embedded_date, parse_event_time, today_cst
+from app.memory.taxonomy import is_conversation_product
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,9 @@ class KnowledgeRecord:
 class MemoryExtraction:
     """一轮对话的结构化个人记忆提取结果, 各字段都可能为空列表。
 
-    ``facts`` 是引入分桶前的遗留字段: 解析时并入 ``knowledge``, 老调用方仍可读。
+    ``facts`` 是引入分桶前的遗留字段, 独立返回(老通道仍按 fact 落盘)。
+    ``knowledge`` 不再由每轮提取产出: 知识桶只由显式"记一下"指令写入
+    (personal.remember_knowledge 复用 ``KnowledgeRecord`` 这个类型)。
     """
 
     profile: list[dict] = field(default_factory=list)
@@ -169,20 +173,33 @@ def _parse_relations(raw: object, entity_names: set[str], *, today: datetime) ->
 
     沿用"src/dst 必须已在 entities 出现"的校验(图里不允许凭空节点); 时间用来让写入侧
     分辨"当前态变更"与"用户在讲过去的关系", 解析不出就按听到这句话的时间兜底。
+
+    端点名与 entities 走同一个归一(_clean_str): 不先归一再比对, 带空白的写法就会被
+    判成"端点不存在"而丢整条关系(或凭空补出一个另一写法的节点)。
     """
     items: list[dict] = []
     for entry in raw if isinstance(raw, list) else []:
         if not isinstance(entry, dict):
             continue
-        if entry.get("src") not in entity_names or entry.get("dst") not in entity_names:
+        src = _clean_str(entry.get("src"), 60)
+        dst = _clean_str(entry.get("dst"), 60)
+        if not src or not dst or src not in entity_names or dst not in entity_names:
             continue
         relation = _clean_str(entry.get("relation"), 40)
         if not relation:
             continue
         items.append(
-            {**entry, "relation": relation, "valid_at": parse_event_time(entry.get("valid_at")) or today}
+            {**entry, "src": src, "dst": dst,
+             "relation": relation, "valid_at": parse_event_time(entry.get("valid_at")) or today}
         )
     return items
+
+
+# 情节只装用户现实生活中的经历。本轮对话的产物 —— "用户要求生成表格/导出报告/
+# 搭看板页面""助手生成了 X 文件并提供下载""助手未找到相关文档" —— 不是一段人生
+# 事件: 会话记录里本来就有, 写进情节桶只会挤掉真正有价值的经历。prompt 里已经
+# 写了这条口径, 但小模型仍会把"助手做了某事"当成事件输出, 所以解析时再兜一层
+# 确定性拦截。口径本身(特征词表)与图谱写入共用 taxonomy 里那一份。
 
 
 def _parse_episodes(raw: object) -> list[EpisodeRecord]:
@@ -197,6 +214,9 @@ def _parse_episodes(raw: object) -> list[EpisodeRecord]:
         outcome = _clean_str(entry.get("outcome"))
         if not (what or outcome or title):
             continue
+        if is_conversation_product(title, what, outcome):
+            logger.debug("情节桶跳过本轮对话产物: %s", title or what or outcome)
+            continue
         content = what if not outcome else f"{what}(结果: {outcome})" if what else outcome
         episodes.append(
             EpisodeRecord(
@@ -206,20 +226,6 @@ def _parse_episodes(raw: object) -> list[EpisodeRecord]:
             )
         )
     return episodes
-
-
-def _parse_knowledge(raw: object) -> list[KnowledgeRecord]:
-    if not isinstance(raw, list):
-        return []
-    items: list[KnowledgeRecord] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        content = _clean_str(entry.get("content"))
-        if not content:
-            continue
-        items.append(KnowledgeRecord(topic=_clean_str(entry.get("topic"), 60), content=content))
-    return items
 
 
 def _parse(raw: str, *, today: datetime | None = None) -> MemoryExtraction:
@@ -235,10 +241,17 @@ def _parse(raw: str, *, today: datetime | None = None) -> MemoryExtraction:
     data = json.loads(raw)
     if not isinstance(data, dict):
         return MemoryExtraction()
-    entities = [
-        e for e in data.get("entities", [])
-        if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip()
-    ]
+    # 实体名先归一再入库: 图侧唯一约束是 (user_id, name, type), 带尾空格的写法与干净
+    # 写法是两个节点, 而且关系端点的比对会因写法差异错判。
+    entities = []
+    raw_entities = data.get("entities")
+    for entry in raw_entities if isinstance(raw_entities, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = _clean_str(entry.get("name"), 60)
+        if not name:
+            continue
+        entities.append({**entry, "name": name})
     entity_names = {e["name"] for e in entities}
     raw_relations = data.get("relations")
     # 关系端点没被单独列进 entities 是小模型常见写法(如 src="我" 只出现在关系里):
@@ -247,21 +260,20 @@ def _parse(raw: str, *, today: datetime | None = None) -> MemoryExtraction:
     for entry in raw_relations if isinstance(raw_relations, list) else []:
         if not isinstance(entry, dict):
             continue
-        for name in (entry.get("src"), entry.get("dst")):
-            if isinstance(name, str) and name.strip() and name not in entity_names:
+        for raw_name in (entry.get("src"), entry.get("dst")):
+            name = _clean_str(raw_name, 60)
+            if name and name not in entity_names:
                 entity_names.add(name)
                 entities.append({"name": name, "type": "other"})
     relations = _parse_relations(raw_relations, entity_names, today=stamp)
-    # 遗留 facts 并入 knowledge: 老库里的 fact 记录仍在召回, 新提取也不该丢这部分信息。
+    # 遗留 facts 独立返回: 知识桶已改为只由显式"记一下"写入, 不再拿每轮
+    # 提取兜底; 老通道(personal_memory_enabled=false)照旧按 fact 落盘。
     legacy_facts = _str_list(data.get("facts"))
-    knowledge = _parse_knowledge(data.get("knowledge"))
-    knowledge.extend(KnowledgeRecord(topic="", content=text) for text in legacy_facts)
     return MemoryExtraction(
         profile=_parse_profile(data.get("profile"), today=stamp),
         preferences=_str_list(data.get("preferences")),
         habits=_str_list(data.get("habits")),
         episodes=_parse_episodes(data.get("episodes")),
-        knowledge=knowledge,
         entities=entities,
         relations=relations,
         facts=legacy_facts,
@@ -300,6 +312,9 @@ async def extract_memories(
         answer=answer,
         today=_today.strftime("%Y-%m-%d"),
         existing=_format_existing(existing_preferences, existing_habits),
+        # 实体类型与关系词表由图侧口径单点渲染: 改词表只改 graph_vocab, 提示词跟着走。
+        entity_types=graph_vocab.entity_type_hint(),
+        relation_words=graph_vocab.relation_hint(),
     )
     try:
         resp = await _llm().ainvoke(prompt)

@@ -65,22 +65,63 @@ def split_chunks(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
     return chunks
 
 
-def _locate(needle: str, haystack: str, cursor: int) -> tuple[int, int]:
-    """在 normalized_text 里以单调游标定位块文本 -> (start, end); miss 返回 (-1, -1)。
+class _Locator:
+    """把块文本定位回 normalized_text 的一次性定位器(游标单调, 空白映射只算一遍)。
 
-    一级: 直接 find; 二级: 去全部空白后定位再映射回原始下标(仅位置变换, 不改内容)。
+    为什么不是一个无状态函数: 旧写法 ``_locate(needle, haystack, cursor)`` 在直接
+    find 未中时, 对**整篇文档**重建一次空白位置表与压缩串。而 ``normalize_text(raw)``
+    与 ``block.text.strip()`` 并不保证逐字节相等, 所以退化路径在真实文档上是常态而不
+    是例外: 一千个块 × 百万字符 = 每入库一篇都要做上千次全串扫描+全串压缩(请求级
+    挂死)。压缩映射改为懒建且全篇只建一次。
+
+    游标也不得丢: 旧写法的 ``compact.find(stripped)`` 不带游标, 内容重复的块恒返回
+    首次出现位置, start/end 会倒退或重复, 结构树与父块定位随之失真。
     """
-    idx = haystack.find(needle, cursor)
-    if idx >= 0:
-        return idx, idx + len(needle)
-    stripped = re.sub(r"\s+", "", needle)
-    if stripped:
-        comp_positions = [i for i, ch in enumerate(haystack) if not ch.isspace()]
-        compact = "".join(haystack[i] for i in comp_positions)
-        c = compact.find(stripped)
-        if c >= 0:
-            return comp_positions[c], comp_positions[c + len(stripped) - 1] + 1
-    return -1, -1
+
+    __slots__ = ("_raw", "_compact", "_positions", "_built", "_raw_cursor", "_compact_cursor")
+
+    def __init__(self, haystack: str) -> None:
+        self._raw = haystack
+        self._compact = ""
+        self._positions: list[int] = []
+        self._built = False
+        self._raw_cursor = 0
+        self._compact_cursor = 0
+
+    def _ensure_compact(self) -> None:
+        """去空白压缩串 + 下标映射: 全篇只算一次(仅退化路径需要)。"""
+        if self._built:
+            return
+        positions = [i for i, ch in enumerate(self._raw) if not ch.isspace()]
+        self._positions = positions
+        self._compact = "".join(self._raw[i] for i in positions)
+        self._built = True
+
+    def locate(self, needle: str) -> tuple[int, int]:
+        """返回 ``(start, end)``; 定位不到返回 ``(-1, -1)``(调用方计入 warnings)。"""
+        if not needle:
+            return -1, -1
+        idx = self._raw.find(needle, self._raw_cursor)
+        if idx >= 0:
+            self._raw_cursor = idx + 1
+            return idx, idx + len(needle)
+        stripped = re.sub(r"\s+", "", needle)
+        if not stripped:
+            return -1, -1
+        self._ensure_compact()
+        c = self._compact.find(stripped, self._compact_cursor)
+        if c < 0:
+            # 游标后没有不代表全篇没有: 块顺序与文本顺序不一致时退回全串重找,
+            # 但不能因此把游标往回推(否则后面每个块都从同一位置重扫)。
+            c = self._compact.find(stripped)
+        if c < 0:
+            return -1, -1
+        start = self._positions[c]
+        end = self._positions[c + len(stripped) - 1] + 1
+        self._compact_cursor = c + 1
+        if start + 1 > self._raw_cursor:
+            self._raw_cursor = start + 1
+        return start, end
 
 
 def build_structure(blocks: Sequence[ParsedBlock], normalized_text: str) -> list[dict]:
@@ -89,15 +130,13 @@ def build_structure(blocks: Sequence[ParsedBlock], normalized_text: str) -> list
     ``block.section`` 按 "/" 或 " > " 拆层级; 无 heading 的块归入单根节点。
     **不为"好看"编造章节** —— 无层级时退化为扁平列表。
     """
-    cursor = 0
+    locator = _Locator(normalized_text)
     nodes: list[dict] = []
     for seq, block in enumerate(blocks):
         text = block.text.strip()
         if not text:
             continue
-        start, end = _locate(text, normalized_text, cursor)
-        if start >= 0:
-            cursor = start + 1
+        start, end = locator.locate(text)
         parts = [p for p in re.split(r"\s*(?:/|>)\s*", block.section) if p]
         nodes.append(
             {
@@ -135,7 +174,7 @@ def build_parent_child(
     parent_items: list[ParentTextItem] = []
     children: list[KnowledgeChunk] = []
     warnings: list[str] = []
-    cursor = 0
+    locator = _Locator(normalized_text)
     ord_ = 0
     for seq, block in enumerate(blocks):
         text = block.text.strip()
@@ -146,9 +185,13 @@ def build_parent_child(
             logger.error("%s (doc_id=%s)", msg, doc_id)
             warnings.append(msg)
         parent_id = f"{doc_id}-p{seq:04d}"
-        start, end = _locate(text, normalized_text, cursor)
-        if start >= 0:
-            cursor = start + 1
+        start, end = locator.locate(text)
+        if start < 0:
+            # 静默写 -1 偏移会让"父块存在但永远定位不到正文"这类问题事后查不到,
+            # 必须回到入库报告里。
+            msg = f"block p{seq:04d} 在归一化正文中定位失败, offset 置 -1"
+            logger.warning("%s (doc_id=%s)", msg, doc_id)
+            warnings.append(msg)
         anchor = {
             "type": getattr(block, "parent_type", "section") or "section",
             "value": block.section,
@@ -272,17 +315,29 @@ async def ingest_file(
 
 
 async def ingest_directory(
-    dir_path: Path, store: ChunkStore, embedder: OllamaEmbedder
+    dir_path: Path,
+    store: ChunkStore,
+    embedder: OllamaEmbedder,
+    failures: list[tuple[str, str]] | None = None,
 ) -> dict[str, int]:
-    """Ingest every supported file under a directory (recursive)."""
+    """Ingest every supported file under a directory (recursive).
+
+    失败必须留痕: 旧写法只 ``except ValueError: continue`` 且不记日志 —— 损坏的 docx /
+    编码异常常常也以 ValueError 从 ``parse_blocks`` 抛出, 于是一整批文件"入库数为 0"
+    却查不到原因; 而非 ValueError 的异常(OSError/解析库内部错误)则会直接中断整个目录。
+    现在逐文件捕获所有异常并记 WARNING, 同时把原因回给调用方(``failures``)。
+    """
     report: dict[str, int] = {}
     for path in sorted(dir_path.rglob("*")):
         if not path.is_file():
             continue
         try:
             n = await ingest_file(path, store, embedder)
-        except ValueError:
-            continue  # unsupported extension
+        except Exception as exc:  # noqa: BLE001 - 单个文件坏不能拖垮整批入库
+            logger.warning("ingest failed %s: %s: %s", path, exc.__class__.__name__, exc)
+            if failures is not None:
+                failures.append((str(path), f"{exc.__class__.__name__}: {str(exc)[:160]}"))
+            continue
         if n:
             report[str(path)] = n
     return report

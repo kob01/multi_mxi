@@ -5,12 +5,15 @@
     GET  /api/memory/graph           单独取个人图谱子图(图谱页刷新用)
     DELETE /api/memory/items/{id}    删除一条记忆(仅本人)
     DELETE /api/memory/bucket/{kind} 清空一个桶(仅本人; profile 桶整行重置)
-    POST /api/memory/reflect         手动触发一次"情节 -> 个人知识"蒸馏
+    POST /api/memory/reflect         手动"整理记忆": 偏好/习惯语义归并(情节蒸馏已下线)
 
 个人数据必须自服务: 本系统没有 token, 身份由 ``user_id`` + ``operator`` 两个查询
-参数声明(与文档管理接口同一约定), 因此这里能做的只有"operator 必须等于
-user_id"这道校验 —— 它挡住的是误操作与前端串号, 不是恶意伪造(那需要真正的认证,
-属于本系统尚未引入的能力)。所有写操作都落审计。
+参数声明(与文档管理接口同一约定)。因此 ``operator`` **必填**且必须等于 ``user_id``——
+原先写成 ``if operator and operator != user_id`` 等于把这道校验做成了"可选":
+不传 operator 就能读/清任何人的长期记忆。现在缺 operator 直接 400, 不符 403。
+仍需记住本层挡住的是误操作、前端串号与省略参数绕过, 不是恶意伪造一个已知工号
+(那需要真正的认证, 属于本系统尚未引入的能力; 届时只换参数来源, 判定不用改)。
+所有写操作都落审计。
 """
 
 from __future__ import annotations
@@ -31,10 +34,14 @@ router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 
 def _require_self(user_id: str, operator: str) -> None:
-    """个人记忆只允许本人读写; 身份不符按 403 处理。"""
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
-    if operator and operator != user_id:
+    """个人记忆只允许本人读写: operator 必填且必须等于 user_id。
+
+    两个参数都不能省: 省掉任何一个就无法确认"调用者到底是谁", 而记忆是最怕
+    被他人读取的数据(画像/情节/健康类属性都在里面)。
+    """
+    if not user_id or not operator:
+        raise HTTPException(status_code=400, detail="user_id/operator 均为必填")
+    if operator != user_id:
         raise HTTPException(status_code=403, detail="个人记忆仅支持本人访问")
 
 
@@ -62,7 +69,7 @@ async def delete_memory_item(item_id: int, user_id: str, operator: str = "") -> 
     deleted = await get_personal_agent().delete(user_id, item_id)
     get_audit_logger().log(
         trace_id, "memory", "memory_item_deleted",
-        {"user_id": user_id, "operator": operator or user_id, "item_id": item_id, "deleted": deleted},
+        {"user_id": user_id, "operator": operator, "item_id": item_id, "deleted": deleted},
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="记忆不存在或已删除")
@@ -82,16 +89,17 @@ async def clear_memory_bucket(bucket: str, user_id: str, operator: str = "") -> 
     cleared = await get_personal_agent().clear(user_id, bucket)
     get_audit_logger().log(
         trace_id, "memory", "memory_bucket_cleared",
-        {"user_id": user_id, "operator": operator or user_id, "bucket": bucket, "cleared": cleared},
+        {"user_id": user_id, "operator": operator, "bucket": bucket, "cleared": cleared},
     )
     return {"status": "cleared", "bucket": bucket, "cleared": cleared}
 
 
 @router.post("/reflect")
 async def reflect_memories(user_id: str, operator: str = "") -> dict:
-    """手动整理记忆(前端"整理记忆"按钮): 情节蒸馏 + 偏好/习惯语义归并。
+    """手动整理记忆(前端"整理记忆"按钮): 只做偏好/习惯语义归并。
 
-    force 跳过蒸馏门槛; 归并专门清理"同一件事不同说法"累积出的重复偏好行。
+    路径沿用 ``/reflect`` 是为了不断老脚本/前端; 情节 -> 知识的蒸馏已下线
+    (知识桶只由显式"记一下"指令写入), 归并专门清理"同一件事不同说法"累积的重复行。
     """
     _require_self(user_id, operator)
     if not db_available():
@@ -99,10 +107,7 @@ async def reflect_memories(user_id: str, operator: str = "") -> dict:
     trace_id = new_trace_id()
     result = await get_personal_agent().tidy(user_id)
     get_audit_logger().log(
-        trace_id, "memory", "memory_reflected",
-        {
-            "user_id": user_id, "operator": operator or user_id,
-            "knowledge_added": result["knowledge_added"], "merged": result["merged"],
-        },
+        trace_id, "memory", "memory_tidied",
+        {"user_id": user_id, "operator": operator, "merged": result.get("merged", 0)},
     )
     return {"status": "ok", **result}

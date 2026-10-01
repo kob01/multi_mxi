@@ -66,7 +66,7 @@ class ParsedBlock:
     """A section-level block of parsed document text.
 
     ``start_offset/end_offset/anchor/parent_type`` 是正文外置后的定位字段, 默认未填:
-    offset 基准是 normalized_text, 由入库侧统一回算(build_parent_child 的 _locate);
+    offset 基准是 normalized_text, 由入库侧统一回算(build_parent_child 的 _Locator);
     无锦点时 parent_type 退化为 "section"。
     """
 

@@ -144,7 +144,11 @@ async def get_graph(
     hops: int | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """按当前用户身份返回 ACL 过滤后的图谱子图(供前端 G6 渲染)。"""
+    """按当前用户身份返回 ACL 过滤后的图谱子图(供前端 G6 渲染)。
+
+    返回的 ``edges`` 已经过边级裁剪: 没有任何可访问文档断言过的 ``KG_REL`` 不给出
+    (无溯源的历史边同样不给), 这部分数量在 ``hidden_edges`` 里, 前端据此提示跑迁移。
+    """
     settings = get_settings()
     if not settings.doc_kg_enabled:
         return {"nodes": [], "edges": [], "truncated": False, "enabled": False}

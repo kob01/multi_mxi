@@ -62,6 +62,34 @@ def parse_allowed_roles(stored: str) -> list[str]:
     return [r for r in stored.strip(",").split(",") if r]
 
 
+def is_allowed_fields(
+    visibility: str,
+    owner_id: str,
+    dept_id: str,
+    allowed_roles: str,
+    principal: Principal,
+) -> bool:
+    """字段级 ACL 谓词 (与 :func:`is_allowed` 同一口径, 供非 chunk 形态复用)。
+
+    文档元数据行(documents 表)与向量块冗余字段用的是同一套四个字段, 列表页
+    与检索侧必须走同一个判定, 否则"列表里看得见但检索不到"(或反过来)就是
+    两套口径开始漂移的信号。
+    """
+    if principal.is_admin:
+        return True
+    vis = visibility or ""
+    if vis == DocVisibility.PUBLIC.value or not vis:
+        return True
+    if vis == DocVisibility.PRIVATE.value:
+        return bool(principal.user_id) and (owner_id or "") == principal.user_id
+    if vis == DocVisibility.DEPT.value:
+        return bool(principal.department) and (dept_id or "") == principal.department
+    if vis == DocVisibility.ROLE.value:
+        return principal.role.value in parse_allowed_roles(allowed_roles)
+    # 未知可见性 -> 默认拒。
+    return False
+
+
 def is_allowed(chunk: KnowledgeChunk, principal: Principal) -> bool:
     """Per-chunk ACL predicate — the single source of truth reused by the
     BM25 in-memory filter and the final authorization pass.
@@ -70,16 +98,21 @@ def is_allowed(chunk: KnowledgeChunk, principal: Principal) -> bool:
     exactly, so the two channels and the post-rerank re-check never disagree on
     what a principal may read.
     """
+    return is_allowed_fields(
+        chunk.visibility, chunk.owner_id, chunk.dept_id, chunk.allowed_roles, principal
+    )
+
+
+def can_manage_document(principal: Principal, created_by: str) -> bool:
+    """文档管理动作(改可见性 / 删除)的闸门: 仅所有者本人或 admin。
+
+    为什么不能"看见就能改": 改 visibility 会同步改写该文全部向量块的 ACL 列, 把一篇
+    private/dept 文档改成 public 就等于把它发给全员的检索结果; 删除则不可恢复。
+    ``created_by`` 为空(历史数据里的 anonymous 上传者)时按"无主"处理 —— 只归 admin,
+    不能因为"没主人"就谁都能改。角色列表不拉 HR/财务: 他们能读制度类文档, 不代表
+    能改别人的文档发布范围。
+    """
     if principal.is_admin:
         return True
-    vis = chunk.visibility
-    if vis == DocVisibility.PUBLIC.value or not vis:
-        return True
-    if vis == DocVisibility.PRIVATE.value:
-        return bool(principal.user_id) and chunk.owner_id == principal.user_id
-    if vis == DocVisibility.DEPT.value:
-        return bool(principal.department) and chunk.dept_id == principal.department
-    if vis == DocVisibility.ROLE.value:
-        return principal.role.value in parse_allowed_roles(chunk.allowed_roles)
-    # Unknown visibility -> default-deny.
-    return False
+    owner = (created_by or "").strip()
+    return bool(owner) and owner != "anonymous" and owner == principal.user_id

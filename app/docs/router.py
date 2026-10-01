@@ -1,4 +1,10 @@
-"""Document management API: upload -> tag suggestion -> confirm ingest."""
+"""Document management API: upload -> tag suggestion -> confirm ingest.
+
+权限口径(与 /api/memory 一致): 本系统没有 token, 身份由请求里的
+``uploader``/``operator`` + ``role`` + ``department`` 声明, 因此服务层只能做两件事:
+改可见性/删除限"所有者本人或 admin", 列表按调用者的文档 ACL 裁剪。它挡住的是
+误操作与伪造角色越权改写, 不是伪造工号本身(那需要真正的认证)。
+"""
 
 from __future__ import annotations
 
@@ -7,9 +13,28 @@ from pydantic import BaseModel, Field
 
 from app.docs import service
 from app.docs.parsers import modality_of, parse_blocks
+from app.schemas import Role
+from app.security.acl import Principal
 from app.security.audit import get_audit_logger, new_trace_id
 
 router = APIRouter(prefix="/api/docs", tags=["docs"])
+
+
+def _principal(user_id: str, role: str = "employee", department: str = "") -> Principal:
+    """把客户端自报的身份三元组成 :class:`Principal`(非法角色回落到 employee)。"""
+    try:
+        role_enum = Role((role or "employee").strip().lower())
+    except ValueError:
+        role_enum = Role.EMPLOYEE
+    return Principal(user_id=(user_id or "").strip(), role=role_enum, department=(department or "").strip())
+
+
+def _require_identity(operator: str) -> str:
+    """管理类动作必须带操作者工号(缺它就无法判定你是不是所有者)。"""
+    user_id = (operator or "").strip()
+    if not user_id or user_id == "anonymous":
+        raise HTTPException(status_code=400, detail="operator 必填且不能为 anonymous")
+    return user_id
 
 
 class IngestRequest(BaseModel):
@@ -26,12 +51,14 @@ class IngestRequest(BaseModel):
 
 
 class AclRequest(BaseModel):
-    """Document visibility change payload (admin/owner operation)."""
+    """Document visibility change payload (owner/admin operation)."""
 
     visibility: str
     dept_id: str = ""
     allowed_roles: list[str] = Field(default_factory=list)
-    operator: str = "anonymous"
+    operator: str = ""
+    role: str = "employee"
+    department: str = ""
 
 
 @router.post("/upload")
@@ -95,14 +122,26 @@ async def ingest_doc(req: IngestRequest) -> dict:
 
 @router.put("/{doc_key}/acl")
 async def update_doc_acl(doc_key: str, req: AclRequest) -> dict:
-    """Change a document's visibility (metadata table + knowledge chunk rows)."""
+    """Change a document's visibility (metadata table + knowledge chunk rows).
+
+    只有文档所有者或 admin 能改(见 service.can_manage_document 的口径)。
+    """
     trace_id = new_trace_id()
+    operator = _require_identity(req.operator)
+    principal = _principal(operator, req.role, req.department)
     try:
         result = await service.update_document_acl(
-            doc_key, req.visibility, req.dept_id, req.allowed_roles, req.operator
+            doc_key, req.visibility, req.dept_id, req.allowed_roles, principal
         )
     except service.UploadError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except service.DocumentForbidden as exc:
+        get_audit_logger().log(
+            trace_id, "docs", "document_acl_denied",
+            {"doc_key": doc_key, "operator": operator, "role": principal.role.value,
+             "reason": str(exc)},
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RuntimeError as exc:  # e.g. database / pgvector unavailable
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     get_audit_logger().log(
@@ -115,26 +154,42 @@ async def update_doc_acl(doc_key: str, req: AclRequest) -> dict:
 
 
 @router.delete("/{doc_key}")
-async def delete_doc(doc_key: str, operator: str = "anonymous") -> dict:
-    """Remove a document: knowledge chunk rows + metadata + upload files."""
+async def delete_doc(
+    doc_key: str, operator: str = "", role: str = "employee", department: str = ""
+) -> dict:
+    """Remove a document: knowledge chunk rows + metadata + upload files.
+
+    删除不可恢复, 同样只允许所有者本人或 admin 做。
+    """
     trace_id = new_trace_id()
+    actor = _require_identity(operator)
+    principal = _principal(actor, role, department)
     try:
-        result = await service.delete_document(doc_key)
+        result = await service.delete_document(doc_key, principal)
     except service.UploadError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except service.DocumentForbidden as exc:
+        get_audit_logger().log(
+            trace_id, "docs", "document_delete_denied",
+            {"doc_key": doc_key, "operator": actor, "role": principal.role.value,
+             "reason": str(exc)},
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RuntimeError as exc:  # e.g. database / pgvector unavailable
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     get_audit_logger().log(
         trace_id, "docs", "document_deleted",
-        {"doc_key": doc_key, "operator": operator},
+        {"doc_key": doc_key, "operator": actor, "role": principal.role.value},
     )
     return result
 
 
 @router.get("")
-async def list_docs() -> list[dict]:
-    """Document list for the management page."""
-    return await service.list_documents()
+async def list_docs(
+    user_id: str = "", operator: str = "", role: str = "employee", department: str = ""
+) -> list[dict]:
+    """Document list for the management page, 按调用者能看到的范围裁剪。"""
+    return await service.list_documents(_principal(operator or user_id, role, department))
 
 
 @router.get("/tags")

@@ -29,7 +29,7 @@ from app.config import get_settings
 from app.db.models import DocChunkRow, DocParentRow, Document, KnowledgeChunkRow
 from app.db.session import get_session_factory, init_schema
 from app.docs.normalize import content_hash, normalize_text
-from app.rag.ingest import _locate
+from app.rag.ingest import _Locator
 
 logger = logging.getLogger("migrate_doc_stores")
 
@@ -116,15 +116,13 @@ async def _migrate_one(session, bodies, doc_key: str, parsed_text: str, dry: boo
             .order_by(KnowledgeChunkRow.chunk_id)
         )
     ).scalars().all()
-    cursor = 0
+    locator = _Locator(normalized)
     p_dicts: list[dict] = []
     p_items: list[ParentTextItem] = []
     for seq, pr in enumerate(parent_rows):
         needle = (pr.content or "").strip()
-        start, end = _locate(needle, normalized, cursor) if needle else (-1, -1)
-        if start >= 0:
-            cursor = start + 1
-        else:
+        start, end = locator.locate(needle) if needle else (-1, -1)
+        if start < 0:
             stats["offset_failed"] += 1
             REINGEST_LIST.parent.mkdir(parents=True, exist_ok=True)
             _append_reingest(doc_key)

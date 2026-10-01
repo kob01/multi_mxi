@@ -89,9 +89,15 @@ async def main() -> None:
     embedder = OllamaEmbedder()
 
     print(f"[ingest] scanning {knowledge_dir} ...")
-    report = await ingest_directory(knowledge_dir, store, embedder)
+    failures: list[tuple[str, str]] = []
+    report = await ingest_directory(knowledge_dir, store, embedder, failures=failures)
     for path, n in report.items():
         print(f"[ingest] {path}: {n} chunks")
+    # 失败不再静默: 以前一批文件"入库数为 0"而日志里什也看不到。
+    for path, reason in failures:
+        print(f"[ingest] FAILED {path}: {reason}")
+    if failures:
+        print(f"[ingest] {len(failures)} 个文件未能入库(其余已入库), 请修正后重跑本脚本")
     print(f"[ingest] total chunks in store: {await store.count()}")
 
     await _register_documents(report)

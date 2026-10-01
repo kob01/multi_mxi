@@ -7,6 +7,9 @@ Neo4j 文档图谱(``:KgDoc``/``:KgEntity``)。用于开启 ``doc_kg_enabled`` �
 需先启用图谱(``DOC_KG_ENABLED=true``)且 Neo4j 可达; PG 密码按 db.session 的既有
 方式从环境变量 / .env / secrets 解析。
 
+升级后第一次回填前请先跑一次边迁移(``scripts.migrate_kg_edges``): 查询出口按
+``KG_REL.docs`` 做边级 ACL, 没溯源的历史边不回填就会在图上隐身。
+
 Usage:
     python -m scripts.build_doc_kg [--limit 50]
 """

@@ -6,6 +6,11 @@
     (:MemoryUser {user_id})-[:MENTIONS {source}]->(:MemoryEntity {name, type})
     (:MemoryEntity)-[:REL {relation, valid_at, invalid_at, as_of}]->(:MemoryEntity)
 
+**什么能写进来不在本模块定口径**: 实体类型、关系词表、对话产物拦截、"边必须
+锚定在用户身上"四条口径全部在 ``app/memory/graph_vocab.py``(纯函数, 可离线测),
+本模块只负责把它选出的实体/边落图。关键不变式: **图里存在的节点都是当年通过口径
+写入的**, 所以"该用户图里已有这个名字"可以直接当作锚定判据用(见 ``anchor``)。
+
 ``:REL`` 带双时态(``valid_at`` 现实何时成立 / ``invalid_at`` 现实何时不再成立, 另有一
 个 ``as_of`` 与画像侧同口径地表示"这句陈述排在什么时候"): 人事关系会变(调部门、
 换汇报对象), 旧关系不能与当前关系并列喂给模型, 也不能直接删(时间旅行式提问需要它),
@@ -23,12 +28,14 @@ Session Memory / Retrieval Cache 完全一致的降级策略。
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
 
 from app.config import get_settings
+from app.memory import graph_vocab
+from app.memory.graph_vocab import SINGLE_VALUED_RELATIONS, UNKNOWN_TYPE
 from app.memory.temporal import as_datetime
 
 logger = logging.getLogger(__name__)
@@ -36,17 +43,6 @@ logger = logging.getLogger(__name__)
 _schema_ready = False
 _driver: AsyncDriver | None = None
 _driver_failed = False
-
-# 实体类型白名单: LLM 偶尔会造出自定义类型, 收敛到 other 保证图里类型可枚举。
-_ENTITY_TYPES = {"person", "department", "system", "document", "position", "topic"}
-
-# 单值关系(函数式): 同一个 (主体, 关系) 现实上只能成立一个客体, 新事实要把旧边
-# 打失效而不是并存 —— 否则"现在汇报给谁"这类问题会把新旧两个答案一起喂给模型。
-# 只列真正函数式的关系词: "负责"/"审批" 天然多值, 不进白名单(宁可漏失效不可错失效)。
-_SINGLE_VALUED_RELATIONS = {
-    "任职于", "就职于", "属于", "所在部门", "汇报", "汇报给", "直属上级", "上级",
-    "所在地", "现居", "职位", "担任", "居住于",
-}
 
 
 def _iso_utc(value: datetime | None) -> str | None:
@@ -74,7 +70,7 @@ def _relation_row(raw: dict, *, now_dt: datetime, grace_days: int) -> dict:
     宽限期与画像侧共用 ``profile_current_grace_days`` —— 同一个事实如果在画像里算"现在
     变了"而在图里算"过去的旧说法", 两个召回通道就会给模型矛盾答案。
     """
-    relation = str(raw.get("relation") or "related").strip() or "related"
+    relation = str(raw.get("relation") or "").strip()
     given = as_datetime(raw.get("valid_at"))
     stamp = given or now_dt
     historical = given is not None and given < now_dt - timedelta(days=max(1, int(grace_days)))
@@ -84,7 +80,7 @@ def _relation_row(raw: dict, *, now_dt: datetime, grace_days: int) -> dict:
         "relation": relation,
         "valid_at": _iso_utc(stamp) or "",
         "as_of": _iso_utc(stamp if historical else now_dt) or "",
-        "single": relation in _SINGLE_VALUED_RELATIONS,
+        "single": relation in SINGLE_VALUED_RELATIONS,
     }
 
 
@@ -138,10 +134,32 @@ async def ensure_schema() -> None:
         logger.warning("Neo4j schema 初始化失败, Graph 长期记忆降级为不可用: %s", exc)
 
 
-def _entity_type(raw: object) -> str:
-    """实体类型收敛到白名单(未知类型归 other, 空值归 entity)。"""
-    value = str(raw or "").strip().lower()
-    return value if value in _ENTITY_TYPES else ("other" if value else "entity")
+async def _existing_types(session, user_id: str, names: Iterable[str]) -> dict[str, str]:
+    """查这批名字里哪些已在该用户图里, 并带回它的类型。
+
+    两个用途: 给"边是否锚定在用户身上"提供已存在集合; 让新边接上**图里已有的**那个
+    节点而不是按本次标注的类型另开一个同名节点(唯一约束是 ``(user_id, name, type)``,
+    类型不一致就 MERGE 不出同一个点)。
+    """
+    wanted = sorted({str(name or "").strip() for name in names if str(name or "").strip()})
+    if not wanted:
+        return {}
+    found = await session.run(
+        "UNWIND $names AS name "
+        "MATCH (e:MemoryEntity {user_id: $user_id, name: name}) "
+        "RETURN name, collect(e.type) AS types",
+        user_id=user_id,
+        names=wanted,
+    )
+    out: dict[str, str] = {}
+    for rec in await found.data():
+        name = str(rec.get("name") or "")
+        types = [str(t) for t in (rec.get("types") or []) if t]
+        if name and types:
+            # 同名多型是旧写入不校验类型留下的脏数据: 取一个确定类型, 否则按名字连边
+            # 会命中多个节点长出笛卡尔积错边。
+            out[name] = types[0]
+    return out
 
 
 async def upsert_entities(
@@ -150,15 +168,33 @@ async def upsert_entities(
     relations: Sequence[dict],
     *,
     source: str = "turn",
-) -> None:
-    """写入/合并实体与实体关系, 节点全部 MERGE(重复写入不会产生重复节点)。
+    user_aliases: Iterable[str] = (),
+) -> dict[str, object]:
+    """按 ``graph_vocab`` 的口径过滤后写图, 返回 ``{nodes, edges, dropped}`` 供审计。
 
-    ``entities``: ``[{"name": ..., "type": ...}, ...]``
-    ``relations``: ``[{"src": ..., "relation": ..., "dst": ..., "valid_at": 可选}, ...]``,
-    src/dst 按 ``name`` 匹配同一 ``user_id`` 下的既有实体。
+    写入顺序刻意是"先问图、再落笔":
 
-    额外挂到 ``(:MemoryUser)-[:MENTIONS]->(:MemoryEntity)`` 上: 这一层让"个人
-    图谱"有中心可查, 前端子图与读路径都从锚点出发而不是猜实体名。
+    1. ``graph_vocab.plan`` 做纯语义过滤(实体类型白名单 / 关系词表 / 对话产物拦截 /
+       自称归一), 一条边都过不了就直接返回, 不碰图;
+    2. 查该用户图里已有哪些端点名 —— 图里已有的节点都是当年通过口径写入的, 因此
+       "已存在"本身就是锚定判据(跨轮才连得上的链式关系靠它才不会每轮从零判);
+    3. ``graph_vocab.anchor`` 只保留能连到"我"的边, 并把节点收敛到这些边的端点。
+
+    **不再为"只被提到、没有任何关系"的实体建点**: 旧的"提到即挂 MENTIONS"让一次联网
+    检索就能往用户锚点上挂十几个孤立点(实测 49 个节点里 26 个是孤点), 图谱页与
+    ``related_facts`` 召回都被稀释。关系端点仍会被补成节点并挂锚点 —— 小模型常只给
+    关系不把两端列进 entities, 不补会让子图查询按锚点连边时漏掉整条边。
+
+    ``user_aliases`` 是该用户的自称(画像里的姓名、工号): 用来把"朱斌-毕业于-X"这类
+    边折叠成"我-毕业于-X", 否则同一个人会在图里裂成两个中心。
+
+    实体写入一律 ``(name, type)`` 成对匹配/MERGE(与唯一约束 ``user_id,name,type``
+    同口径): 只按 name 写会同时带来两个害处:
+    1. 同一用户下同名不同型("华为"被抽成 person 又被抽成 organization)时 MATCH 命中
+       多个节点, 关系笛卡尔积错边;
+    2. MERGE 对不上带 type 的约束, 会造出一个 ``type=NULL`` 的分裂节点, 落在原节点上的
+       边对分裂节点不可见 -> 前端图谱漏边。端点类型按"图里同名实体已有类型 > 本次
+       entities 给的类型 > unknown" 三级确定。
 
     REL 边带双时态(``valid_at`` 现实何时成立 / ``invalid_at`` 现实何时不再成立,
     ``created_at``/``expired_at`` 是系统录入轴), 口径同 Graphiti 的 fact invalidation:
@@ -172,26 +208,41 @@ async def upsert_entities(
 
     三种情形都不丢历史: 时间旅行式提问("我以前汇报给谁")仍然答得上来。
     """
+    stats: dict[str, object] = {"nodes": 0, "edges": 0, "dropped": {}}
     if not user_id or not (entities or relations):
-        return
+        return stats
     driver = get_driver()
     if driver is None:
-        return
+        return stats
+    planned = graph_vocab.plan(entities, relations, user_aliases=user_aliases)
+    if not planned.relations:
+        # 语义过滤后一条关系都不剩: 这一轮就没有可落的图事实(孤立点不单独入库)。
+        stats["dropped"] = planned.dropped
+        if planned.dropped:
+            logger.debug("个人图谱本轮无可用关系, 拦下 %s (user=%s)", planned.dropped, user_id)
+        return stats
     now_dt = datetime.now(timezone.utc)
     grace_days = get_settings().profile_current_grace_days
-    rows = [
-        {"name": e["name"], "type": _entity_type(e.get("type"))}
-        for e in entities
-        if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip()
-    ]
-    relation_rows = [
-        _relation_row(r, now_dt=now_dt, grace_days=grace_days)
-        for r in relations
-        if isinstance(r, dict) and r.get("src") and r.get("dst")
-    ]
     now = _iso_utc(now_dt) or ""
     try:
         async with driver.session() as session:
+            existing = await _existing_types(
+                session,
+                user_id,
+                planned.endpoint_names() | {entry["name"] for entry in planned.entities},
+            )
+            final = graph_vocab.anchor(planned, existing.keys())
+            relation_rows = [
+                _relation_row(row, now_dt=now_dt, grace_days=grace_days) for row in final.relations
+            ]
+            stats["dropped"] = final.dropped
+            if not relation_rows:
+                logger.debug(
+                    "个人图谱本轮关系全部未锚定到用户, 不写入 (user=%s, dropped=%s)",
+                    user_id,
+                    final.dropped,
+                )
+                return stats
             await session.run(
                 "MERGE (u:MemoryUser {user_id: $user_id}) "
                 "ON CREATE SET u.created_at = $now "
@@ -199,6 +250,17 @@ async def upsert_entities(
                 user_id=user_id,
                 now=now,
             )
+            # 端点类型: 图里已有的优先(不裂节点), 其次本次通过校验的 entities, 都没有则 unknown。
+            type_by_name: dict[str, str] = dict(existing)
+            for entry in final.entities:
+                type_by_name.setdefault(str(entry["name"]), str(entry.get("type") or UNKNOWN_TYPE))
+            rows: list[dict] = []
+            for r in relation_rows:
+                r["src_type"] = type_by_name.get(r["src"]) or UNKNOWN_TYPE
+                r["dst_type"] = type_by_name.get(r["dst"]) or UNKNOWN_TYPE
+            # 节点只从"保留下来的边的端点"产生 —— 关系端点没列进 entities 也照样建点。
+            for name in sorted({r["src"] for r in relation_rows} | {r["dst"] for r in relation_rows}):
+                rows.append({"name": name, "type": type_by_name.get(name) or UNKNOWN_TYPE})
             if rows:
                 await session.run(
                     "UNWIND $rows AS row "
@@ -212,14 +274,17 @@ async def upsert_entities(
                     source=source,
                     now=now,
                 )
+            stats["nodes"] = len(rows)
+            stats["edges"] = len(relation_rows)
             if relation_rows:
                 # 1) 先关掉被取代的旧有效边(仅限单值关系, 且旧边的排期不晚于新边):
                 #    失效点落在新事实的现实起始时间上, 旧边不删、只关窗。
                 await session.run(
                     "UNWIND $rows AS row "
-                    "MATCH (a:MemoryEntity {user_id: $user_id, name: row.src})"
+                    "MATCH (a:MemoryEntity {user_id: $user_id, name: row.src, type: row.src_type})"
                     "-[old:REL {relation: row.relation}]->(other:MemoryEntity) "
-                    "WHERE row.single AND other.name <> row.dst AND old.invalid_at IS NULL "
+                    "WHERE row.single AND NOT (other.name = row.dst AND other.type = row.dst_type) "
+                    "  AND old.invalid_at IS NULL "
                     "  AND (old.as_of IS NULL OR old.as_of <= row.as_of) "
                     "SET old.invalid_at = row.valid_at, old.expired_at = $now",
                     user_id=user_id,
@@ -231,11 +296,12 @@ async def upsert_entities(
                 #    (包含"用户又说了一遍当前关系"的重述), 顺手把旧失效标记抹掉。
                 await session.run(
                     "UNWIND $rows AS row "
-                    "MATCH (a:MemoryEntity {user_id: $user_id, name: row.src}) "
-                    "MERGE (b:MemoryEntity {user_id: $user_id, name: row.dst}) "
+                    "MATCH (a:MemoryEntity {user_id: $user_id, name: row.src, type: row.src_type}) "
+                    "MERGE (b:MemoryEntity {user_id: $user_id, name: row.dst, type: row.dst_type}) "
                     "WITH a, b, row "
                     "OPTIONAL MATCH (a)-[prev:REL {relation: row.relation}]->(other:MemoryEntity) "
-                    "WHERE other.name <> b.name AND prev.invalid_at IS NULL "
+                    "WHERE NOT (other.name = b.name AND other.type = b.type) "
+                    "  AND prev.invalid_at IS NULL "
                     "  AND prev.as_of IS NOT NULL AND prev.as_of > row.as_of "
                     "WITH a, b, row, min(prev.as_of) AS superseded_by "
                     "MERGE (a)-[r:REL {relation: row.relation}]->(b) "
@@ -253,6 +319,7 @@ async def upsert_entities(
                 )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Neo4j upsert_entities 失败, 本次不写入图记忆: %s", exc)
+    return stats
 
 
 async def related_facts(
@@ -355,7 +422,9 @@ async def user_subgraph(user_id: str, limit: int = 60) -> dict[str, list[dict]]:
         if not name or name in names:
             continue
         names.add(name)
-        nodes.append({"name": name, "type": row.get("type") or "entity"})
+        etype = row.get("type") or UNKNOWN_TYPE
+        # 中文标签在后端给: 类型枚举的单点口径在 graph_vocab, 前端不再自己映一份。
+        nodes.append({"name": name, "type": etype, "type_label": graph_vocab.type_label(etype)})
     links = [
         {
             "src": r["src"],
@@ -374,12 +443,18 @@ async def user_subgraph(user_id: str, limit: int = 60) -> dict[str, list[dict]]:
 
 
 async def close_driver() -> None:
-    """释放驱动(供 FastAPI lifespan 关闭时调用)。"""
-    global _driver, _schema_ready
+    """释放驱动(供 FastAPI lifespan 关闭时调用), 并复位失败标记。
+
+    必须同时复位 ``_driver_failed``: 它是个"整进程只试一次"的闸门, 不复位则启动时
+    Neo4j 还没就绪(与 compose 启动竞态同源)导致一次建 driver 失败后, 即使后面
+    Neo4j 已健康、也重起了服务, 本进程也不会再重试图记忆 —— 表现为"图记忆永远是空"。
+    """
+    global _driver, _schema_ready, _driver_failed
     if _driver is not None:
         try:
             await _driver.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("closing neo4j driver failed: %s", exc)
-        _driver = None
-        _schema_ready = False
+    _driver = None
+    _schema_ready = False
+    _driver_failed = False

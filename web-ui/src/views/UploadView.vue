@@ -15,6 +15,16 @@ const VIS_OPTIONS = [
 
 const ACCEPT = '.txt,.md,.pdf,.docx,.pptx,.xlsx,.srt,.vtt,.jpg,.jpeg,.png,.webp,.bmp'
 
+// 后端按这份身份做文档 ACL 裁剪与"所有者/管理员"闸门(与 GraphView 同一口径):
+// 缺了它们只能看到 public 文档, 也改不动任何文档的权限。
+function authParams() {
+  return { user_id: current.empId, operator: current.empId, role: current.role, department: current.department }
+}
+
+function authQuery() {
+  return new URLSearchParams(authParams()).toString()
+}
+
 // 上传中的文件（解析后待确认入库）
 const files = reactive([])
 const dropHover = ref(false)
@@ -93,6 +103,8 @@ async function confirmIngest(item) {
         visibility: item.visibility,
         dept_id: item.deptId.trim(),
         allowed_roles: splitRoles(item.allowedRoles),
+        role: current.role,
+        department: current.department,
       }),
     })
     const res = await resp.json()
@@ -124,7 +136,7 @@ const uploadDialogVisible = ref(false)
 async function loadDocs() {
   loadingDocs.value = true
   try {
-    const resp = await fetch('/api/docs')
+    const resp = await fetch(`/api/docs?${authQuery()}`)
     docs.value = await resp.json()
   } catch (e) {
     docs.value = []
@@ -160,7 +172,12 @@ async function changeAcl(row) {
     const resp = await fetch(`/api/docs/${encodeURIComponent(row.doc_key)}/acl`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ visibility, dept_id: deptId, allowed_roles: roles, operator: current.empId }),
+      body: JSON.stringify({
+        visibility,
+        dept_id: deptId,
+        allowed_roles: roles,
+        ...authParams(),
+      }),
     })
     const data = await resp.json()
     if (!resp.ok) throw new Error(data.detail || resp.status)
@@ -185,7 +202,7 @@ async function deleteDoc(row) {
   }
   try {
     const resp = await fetch(
-      `/api/docs/${encodeURIComponent(row.doc_key)}?operator=${encodeURIComponent(current.empId)}`,
+      `/api/docs/${encodeURIComponent(row.doc_key)}?${authQuery()}`,
       { method: 'DELETE' }
     )
     const data = await resp.json()

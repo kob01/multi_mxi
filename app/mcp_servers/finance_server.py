@@ -5,6 +5,10 @@ Exposes the enterprise finance system stored in PostgreSQL
 readable for employee->department joins. Also exposes a read-only Text2SQL
 tool (execute_sql) with a hard table whitelist.
 
+归属校验与 hr_server 同一口径(见 app/security/caller.py): 身份由网关注入的
+``caller_user_id``/``caller_role`` 提供, 员工只能提/看自己的报销单, 管理角色才能
+跨人; 不带调用者的直连一律拒。
+
 Run:
     python -m app.mcp_servers.finance_server     # serves http://0.0.0.0:8002/mcp
 """
@@ -15,13 +19,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db import sync as dbsync
 from app.db.models import DepartmentBudget, Reimbursement
+from app.db.sequences import next_numbered
 from app.db.sql_guard import SQLGuardError
+from app.security.caller import guard_owner, guard_target_user, resolve_caller
 
 mcp = FastMCP("finance-reimbursement-system", host="0.0.0.0", port=8002)
 
@@ -32,10 +38,15 @@ ALLOWED_TABLES = {"fin_reimbursements", "fin_department_budgets", "hr_employees"
 
 
 def _next_order_no(session: Session) -> str:
-    max_no = session.execute(
-        text("SELECT COALESCE(MAX(CAST(SUBSTRING(order_no, 4) AS INTEGER)), 4999) FROM fin_reimbursements")
-    ).scalar_one()
-    return f"FIN{int(max_no) + 1}"
+    """取报销单号: 走序列而非 MAX+1(并发不重号)。"""
+    return next_numbered(
+        session,
+        sequence="fin_order_no_seq",
+        prefix="FIN",
+        table="fin_reimbursements",
+        column="order_no",
+        start=5000,
+    )
 
 
 def _order_dict(o: Reimbursement) -> dict[str, Any]:
@@ -53,15 +64,25 @@ def _order_dict(o: Reimbursement) -> dict[str, Any]:
 
 
 @mcp.tool()
-def create_reimbursement(user_id: str, title: str, amount: float, category: str, reason: str = "") -> dict[str, Any]:
-    """Submit a reimbursement order.
+def create_reimbursement(
+    title: str,
+    amount: float,
+    category: str,
+    reason: str = "",
+    user_id: str = "",
+    caller_user_id: str = "",
+    caller_role: str = "",
+) -> dict[str, Any]:
+    """Submit a reimbursement order (默认给本人提单; 代他人提单需管理角色)。
 
     Args:
-        user_id: Employee ID of the claimant.
         title: Expense title, e.g. 上海出差高铁票.
         amount: Amount in CNY; must be positive and <= 5000 per order.
         category: One of 差旅费/交通费/餐饮费/办公用品/培训费.
         reason: Business justification (optional).
+        user_id: 报销人工号; 留空即当前调用者本人。
+        caller_user_id: 调用者工号(网关注入, 请勿自行填写)。
+        caller_role: 调用者角色(网关注入, 请勿自行填写)。
 
     Returns:
         Created order with order_no and workflow status, or error payload.
@@ -72,56 +93,85 @@ def create_reimbursement(user_id: str, title: str, amount: float, category: str,
         return {"error": "金额必须大于 0"}
     if amount > SINGLE_LIMIT:
         return {"error": f"单笔报销上限 {SINGLE_LIMIT} 元, 请拆分后提交"}
+    effective, denial = guard_target_user(
+        resolve_caller(caller_user_id, caller_role), user_id, what="报销单"
+    )
+    if denial is not None:
+        return denial
 
     with Session(dbsync.get_sync_engine()) as session:
-        order = Reimbursement(
-            order_no=_next_order_no(session),
-            emp_id=user_id,
-            title=title,
-            amount=round(amount, 2),
-            category=category,
-            reason=reason,
-            status="SUBMITTED",
-            current_node="部门主管审批",
-            # timestamptz 列: 必须传带时区的值
-            created_at=datetime.now(timezone.utc),
-        )
-        session.add(order)
-        session.commit()
+        try:
+            order = Reimbursement(
+                order_no=_next_order_no(session),
+                emp_id=effective,
+                title=title,
+                amount=round(amount, 2),
+                category=category,
+                reason=reason,
+                status="SUBMITTED",
+                current_node="部门主管审批",
+                # timestamptz 列: 必须传带时区的值
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(order)
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            return {"error": f"报销单写入冲突({exc.__class__.__name__}), 请重试一次"}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            return {"error": f"报销单创建失败({exc.__class__.__name__}), 请稍后重试"}
         return _order_dict(order)
 
 
 @mcp.tool()
-def query_reimbursement(order_no: str) -> dict[str, Any]:
-    """Query a reimbursement order by order number.
+def query_reimbursement(
+    order_no: str, caller_user_id: str = "", caller_role: str = ""
+) -> dict[str, Any]:
+    """Query a reimbursement order by order number (只能看自己的, 管理角色除外)。
 
     Args:
         order_no: Order number, e.g. FIN5000.
+        caller_user_id: 调用者工号(网关注入, 请勿自行填写)。
+        caller_role: 调用者角色(网关注入, 请勿自行填写)。
 
     Returns:
         Order record or error payload.
     """
+    caller = resolve_caller(caller_user_id, caller_role)
     with Session(dbsync.get_sync_engine()) as session:
         order = session.get(Reimbursement, order_no)
         if order is None:
             return {"error": f"order {order_no} not found"}
+        denial = guard_owner(caller, order.emp_id, what="报销单")
+        if denial is not None:
+            return denial
         return _order_dict(order)
 
 
 @mcp.tool()
-def list_reimbursements(user_id: str) -> list[dict[str, Any]]:
-    """List all reimbursement orders of an employee.
+def list_reimbursements(
+    user_id: str = "", caller_user_id: str = "", caller_role: str = ""
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """List reimbursement orders of an employee (留空 = 列本人)。
 
     Args:
-        user_id: Employee ID.
+        user_id: 目标员工工号; 留空即本人。
+        caller_user_id: 调用者工号(网关注入, 请勿自行填写)。
+        caller_role: 调用者角色(网关注入, 请勿自行填写)。
 
     Returns:
-        List of orders (may be empty).
+        List of orders (may be empty), or {error} on 越权。
     """
+    effective, denial = guard_target_user(
+        resolve_caller(caller_user_id, caller_role), user_id, what="报销单"
+    )
+    if denial is not None:
+        return denial
     with Session(dbsync.get_sync_engine()) as session:
         orders = session.scalars(
             select(Reimbursement)
-            .where(Reimbursement.emp_id == user_id)
+            .where(Reimbursement.emp_id == effective)
             .order_by(Reimbursement.created_at.desc())
         ).all()
         return [_order_dict(o) for o in orders]

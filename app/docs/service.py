@@ -25,7 +25,12 @@ from app.rag.embeddings import OllamaEmbedder
 from app.rag.ingest import build_structure, compute_doc_id, ingest_blocks
 from app.rag.vectorstore import ChunkStore, ParentStore
 from app.schemas import DocVisibility
-from app.security.acl import format_allowed_roles
+from app.security.acl import (
+    Principal,
+    can_manage_document,
+    format_allowed_roles,
+    is_allowed_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,14 @@ TAG_PROMPT = """你是企业知识库的分类助手。基于文档内容,给出
 
 class UploadError(ValueError):
     """Raised for invalid uploads (bad type / oversize / parse failure)."""
+
+
+class DocumentForbidden(PermissionError):
+    """文档管理动作(改可见性/删除)的主体不是所有者也不是 admin。
+
+    单独开一类而不是复用 UploadError: 路由层要把两者分成 403 与 404, 而且
+    "无权"是合规上最该留痕的一类事件, 不能被当成"文档不存在"静默掉。
+    """
 
 
 def _upload_dir() -> Path:
@@ -378,13 +391,18 @@ async def update_document_acl(
     visibility: str,
     dept_id: str = "",
     allowed_roles: list[str] | str = "",
-    operator: str = "",
+    principal: Principal | None = None,
 ) -> dict[str, Any]:
     """Change a document's visibility: metadata table (truth) + chunk ACL columns.
 
     The vector rows carry the ACL used for retrieval-time filtering, so both
     stores are updated in one call; the assistant's ES BM25 index rebuilds
     afterwards so the sparse channel reflects the new permissions too.
+
+    闸门: 改可见性会同步改写该文全部向量块的 ACL 列, 把 private/dept 改成 public
+    就是把文档发给全员检索 —— 所以只有所有者本人或 admin 能做(无 principal 也拒,
+    不存在"谁都没登录所以全权限"的口子)。owner_id 固定为文档上传者, 不随本次修改
+    漂移到客户端自报的调用者身上。
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -393,8 +411,11 @@ async def update_document_acl(
         ).scalar_one_or_none()
         if doc is None:
             raise UploadError("文档不存在或已删除")
-        # owner_id 固定为文档上传者, 不随本次修改漂移。
-        acl = normalize_acl(visibility, doc.created_by or operator, dept_id, allowed_roles)
+        if principal is None or not can_manage_document(principal, doc.created_by or ""):
+            raise DocumentForbidden(
+                f"仅文档所有者({doc.created_by or '无主'})或管理员可变更可见性"
+            )
+        acl = normalize_acl(visibility, doc.created_by or principal.user_id, dept_id, allowed_roles)
         doc.visibility = acl["visibility"]
         doc.owner_id = acl["owner_id"]
         doc.dept_id = acl["dept_id"]
@@ -413,7 +434,10 @@ async def update_document_acl(
     except Exception as exc:  # ES index rebuilds on next startup anyway
         logger.warning("es bm25 refresh after acl update failed: %s", exc)
 
-    logger.info("document acl updated: doc_key=%s visibility=%s operator=%s", doc_key, acl["visibility"], operator)
+    logger.info(
+        "document acl updated: doc_key=%s visibility=%s operator=%s",
+        doc_key, acl["visibility"], principal.user_id,
+    )
     result: dict[str, Any] = {
         "doc_key": doc_key, **acl,
         "chunks_updated": updated_chunks, "parents_updated": updated_parents,
@@ -431,12 +455,14 @@ async def update_document_acl(
     return result
 
 
-async def delete_document(doc_key: str) -> dict[str, Any]:
+async def delete_document(doc_key: str, principal: Principal | None = None) -> dict[str, Any]:
     """Delete a document: PG 父子行+元数据同事务 -> 提交成功后再删 Mongo 正文。
 
     顺序: 先删子块/父块(PG), 再删元数据(PG), 同事务提交; 只有 PG 提交成功后才
     清 Mongo。PG 是事实来源, Mongo 残留由 --prune 回收(删除中途崩溃只会产生
     无 ACL 风险的孤儿文本, 不会产生丢元数据的孤儿向量)。
+
+    闸门: 删除不可恢复, 与改可见性同一口径(所有者本人或 admin)。
     """
     factory = get_session_factory()
     async with factory() as session:
@@ -445,6 +471,10 @@ async def delete_document(doc_key: str) -> dict[str, Any]:
         ).scalar_one_or_none()
         if doc is None:
             raise UploadError("文档不存在或已删除")
+        if principal is None or not can_manage_document(principal, doc.created_by or ""):
+            raise DocumentForbidden(
+                f"仅文档所有者({doc.created_by or '无主'})或管理员可删除该文档"
+            )
         name, file_path = doc.name, doc.file_path
 
     # 父子块与元数据同事务删除(同一 session, 不留"删了子块没删元数据"的中间态)。
@@ -566,12 +596,30 @@ async def get_meta_map(doc_keys: list[str]) -> dict[str, dict[str, Any]]:
     }
 
 
-async def list_documents() -> list[dict[str, Any]]:
-    """Document list with tags for the management page."""
+async def list_documents(principal: Principal | None = None) -> list[dict[str, Any]]:
+    """Document list with tags for the management page, 按调用者 ACL 裁剪。
+
+    原先这里返回全库文档及其 visibility/dept_id/allowed_roles/created_by: 管理页
+    本应只展示"你能看到的那些", 否则工号列表 + 权限结构本身就是一次元数据泄露,
+    而且列表里有、回答里永远没有会对不上口径。判定与检索侧共用
+    :func:`app.security.acl.is_allowed_fields`, 不会出现两套口径漂移。
+    无 principal 时按"未登录员工"处理: 只返回 public 文档(而不是全量)。
+    """
+    effective = principal or Principal(user_id="")
     factory = get_session_factory()
     async with factory() as session:
         docs = (await session.execute(select(Document).order_by(Document.updated_at.desc()))).scalars().all()
-        keys = [d.doc_key for d in docs]
+        visible = [
+            d for d in docs
+            if is_allowed_fields(
+                getattr(d, "visibility", "") or "public",
+                getattr(d, "owner_id", "") or (d.created_by or ""),
+                getattr(d, "dept_id", "") or "",
+                getattr(d, "allowed_roles", "") or "",
+                effective,
+            )
+        ]
+        keys = [d.doc_key for d in visible]
         meta = await get_meta_map(keys) if keys else {}
     return [
         {
@@ -588,7 +636,7 @@ async def list_documents() -> list[dict[str, Any]]:
             "allowed_roles": [r for r in (getattr(d, "allowed_roles", "") or "").strip(",").split(",") if r],
             "updated_at": d.updated_at.isoformat(timespec="seconds") if d.updated_at else "",
         }
-        for d in docs
+        for d in visible
     ]
 
 

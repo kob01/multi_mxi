@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from app.assistant.prompts import DOC_KG_EXTRACTION_PROMPT
 from app.config import get_settings
+from app.kg import vocab
 from app.llm import get_chat_model
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,19 @@ def _llm():
 def _parse(raw: str) -> DocKG:
     """解析 LLM 输出的 JSON; 结构不符合预期时退化为空抽取, 不抛出。
 
-    relation 的 src/dst 必须落在本次抽取出的实体名集合内, 否则丢弃该条(与
+    两个必须在这里定死的口径(否则图里的线就是草率的):
+
+    - **名字到类型只能解出一个**: ``:KgEntity`` 的唯一键是 ``(name, type)``, 而模型在
+      relations 里只用名字引用端点。同一个名字在本篇里挂了两个类型时, 写侧按名字
+      MATCH 会命中多个节点而长出笛卡尔积错边, 所以按 ``TYPE_PRIORITY`` 取一个确定类型。
+    - **关系词必须归一**: 同一条关系被写成"属于/隶属于/归属于"三种说法时, KG_REL 的
+      MERGE 键含 relation, 于是一对实体上挂出多条语义重复、几何完全重合的边。
+
+    relation 的 src/dst 仍然要落在本次抽取出的实体名集合内, 否则丢弃该条(与
     ``extraction._parse`` 同样的完整性校验), 防止图里出现悬空关系。
     """
+    settings = get_settings()
+    vocab_on = bool(settings.kg_relation_vocab_enabled)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         return DocKG()
@@ -59,9 +70,9 @@ def _parse(raw: str) -> DocKG:
     if not isinstance(data, dict):
         return DocKG()
     entities = [
-        {"name": e["name"].strip(), "type": (e.get("type") or "entity").strip() or "entity"}
+        {"name": vocab.normalize_entity_name(e["name"]), "type": vocab.normalize_entity_type(e.get("type"))}
         for e in data.get("entities", [])
-        if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].strip()
+        if isinstance(e, dict) and isinstance(e.get("name"), str) and vocab.normalize_entity_name(e["name"])
     ]
     # 同名同类实体去重(保持首次出现顺序)
     seen: set[tuple[str, str]] = set()
@@ -71,20 +82,48 @@ def _parse(raw: str) -> DocKG:
         if key not in seen:
             seen.add(key)
             deduped.append(e)
-    entity_names = {e["name"] for e in deduped}
-    relations = [
-        {
-            "src": r["src"].strip(),
-            "dst": r["dst"].strip(),
-            "relation": (r.get("relation") or "related").strip() or "related",
-        }
-        for r in data.get("relations", [])
-        if isinstance(r, dict)
-        and isinstance(r.get("src"), str) and r.get("src").strip() in entity_names
-        and isinstance(r.get("dst"), str) and r.get("dst").strip() in entity_names
-        and isinstance(r.get("relation"), str)
-    ]
-    return DocKG(entities=deduped, relations=relations)
+    # 一个名字只留一个类型: 先收集候选, 再按优先序解出(不保留模型原写的多个类型节点)
+    candidates: dict[str, set[str]] = {}
+    for e in deduped:
+        candidates.setdefault(e["name"], set()).add(e["type"])
+    resolved = {name: vocab.pick_type(types) for name, types in candidates.items()}
+    entities = [{"name": name, "type": type_} for name, type_ in resolved.items()]
+
+    relations: list[dict] = []
+    taken: set[tuple[str, str, str, str, str]] = set()
+    for r in data.get("relations", []):
+        if not isinstance(r, dict):
+            continue
+        if not isinstance(r.get("src"), str) or not isinstance(r.get("dst"), str):
+            continue
+        src = vocab.normalize_entity_name(r["src"])
+        dst = vocab.normalize_entity_name(r["dst"])
+        if src not in resolved or dst not in resolved or src == dst:
+            continue
+        relation, flip = vocab.normalize_relation(r.get("relation"), enabled=vocab_on)
+        src_type, dst_type = resolved[src], resolved[dst]
+        if flip:
+            # 模型写了"父 -> 子"的互逆词: 翻成规范方向才能与已有的"子 -> 父"边并为一条
+            src, dst = dst, src
+            src_type, dst_type = dst_type, src_type
+        key = (src, src_type, relation, dst, dst_type)
+        if key in taken:
+            continue
+        taken.add(key)
+        evidence = str(r.get("evidence") or "").strip()[:40]
+        relations.append(
+            {
+                "src": src,
+                "src_type": src_type,
+                "dst": dst,
+                "dst_type": dst_type,
+                "relation": relation,
+                "evidence": evidence,
+            }
+        )
+        if len(relations) >= max(1, int(settings.kg_max_relations_per_doc)):
+            break
+    return DocKG(entities=entities, relations=relations)
 
 
 async def extract_doc_graph(title: str, tags: list[str], text: str) -> DocKG:
@@ -94,7 +133,11 @@ async def extract_doc_graph(title: str, tags: list[str], text: str) -> DocKG:
         return DocKG()
     settings = get_settings()
     excerpt = text[: settings.kg_extraction_max_chars]
+    # 词表与上限都从 vocab/config 渲染进去: 提示词里再抄一份枚举必然漂移。
     prompt = DOC_KG_EXTRACTION_PROMPT.format(
+        types=vocab.entity_type_hint(),
+        relations=vocab.relation_vocab_hint(),
+        max_relations=settings.kg_max_relations_per_doc,
         title=title or "(无标题)",
         tags="、".join(tags) if tags else "(无)",
         excerpt=excerpt,

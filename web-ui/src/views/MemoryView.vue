@@ -18,7 +18,7 @@ const BUCKETS = [
 const SOURCE_LABELS = {
   turn: '对话提取',
   session_summary: '会话摘要',
-  reflection: '经验提炼',
+  reflection: '旧版蒸馏(存量)',
 }
 
 const loading = ref(false)
@@ -125,12 +125,8 @@ async function reflect() {
     )
     if (!resp.ok) throw new Error(String(resp.status))
     const result = await resp.json()
-    const added = result.knowledge_added || 0
     const merged = result.merged || 0
-    const parts = []
-    if (added) parts.push(`新增 ${added} 条经验`)
-    if (merged) parts.push(`合并 ${merged} 条重复`)
-    ElMessage.success(parts.length ? parts.join(', ') : '记忆已是最新, 无需整理')
+    ElMessage.success(merged ? `合并 ${merged} 条重复` : '记忆已是最新, 无需整理')
     await load()
   } catch {
     ElMessage.error('整理失败, 请检查服务状态')
@@ -178,9 +174,9 @@ onMounted(load)
         </el-menu-item>
       </el-menu>
       <el-button class="reflect-btn" type="primary" plain :icon="MagicStick" :loading="reflecting" @click="reflect">
-        整理近期经历
+        整理重复条目
       </el-button>
-      <p class="side-foot">整理会把近期经历提炼为可复用经验, 并合并偏好/习惯里的重复条目(语义相同的只留最完整的一条)。</p>
+      <p class="side-foot">整理只会合并偏好/习惯里的重复条目(语义相同的留最完整的一条)。个人知识仅在你明确说"记一下"时记录, 同话题同视角会更新既有记录。</p>
     </aside>
 
     <section class="memory-main">
@@ -241,7 +237,8 @@ onMounted(load)
             <h4>实体（{{ data.graph.nodes.length }}）</h4>
             <el-table :data="data.graph.nodes" size="small" max-height="360">
               <el-table-column prop="name" label="名称" />
-              <el-table-column prop="type" label="类型" width="120" />
+              <!-- 类型中文标签由后端给(口径单点在 app/memory/graph_vocab.py) -->
+              <el-table-column prop="type_label" label="类型" width="120" />
             </el-table>
           </div>
           <div class="graph-col">

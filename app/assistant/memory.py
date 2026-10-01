@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import OrderedDict
@@ -50,6 +51,19 @@ class MemoryStore:
         self._local_max = max(100, settings.session_memory_local_max)
         self._sessions: OrderedDict[str, SessionMemory] = OrderedDict()
         self._summarizer = get_chat_model(settings.llm_model, temperature=0)
+        # 按会话的压缩互斥锁(降级路径也要用): 锁里有一次 LLM 调用, 同会话并发
+        # append 会在 await 点交错, 不加锁就是"同一批轮次被折叠两次"。
+        self._compress_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        """取/建一个会话级互斥锁; 条目有界(与降级会话表同一思路)。"""
+        lock = self._compress_locks.get(session_id)
+        if lock is None:
+            while len(self._compress_locks) > self._local_max:
+                self._compress_locks.pop(next(iter(self._compress_locks)))
+            lock = asyncio.Lock()
+            self._compress_locks[session_id] = lock
+        return lock
 
     def _redis_or_none(self):
         return get_redis() if get_settings().redis_enabled else None
@@ -89,22 +103,27 @@ class MemoryStore:
         return "\n".join(lines)
 
     async def _local_append(self, session_id: str, user: str, assistant: str) -> str:
-        """降级路径的追加; 返回本轮新压缩出的摘要(未发生压缩时为空串)。"""
-        mem = self._local(session_id)
-        mem.turns.append((user, assistant))
-        if len(mem.turns) <= self._summary_threshold:
-            return ""
-        overflow = mem.turns[: -self._max_turns]
-        old = "\n".join(_render_turn(u, a) for u, a in overflow)
-        prompt = SUMMARY_PROMPT.format(history=f"{mem.summary}\n{old}".strip())
-        try:
-            resp = await self._summarizer.ainvoke(prompt)
-        except Exception as exc:  # noqa: BLE001 - 摘要失败也不能丢轮次, 故先摘要后裁剪
-            logger.warning("session summary 失败, 本轮保留原文不裁剪: %s", exc)
-            return ""
-        mem.summary = str(resp.content).strip()
-        mem.turns = mem.turns[-self._max_turns :]
-        return mem.summary
+        """降级路径的追加; 返回本轮新压缩出的摘要(未发生压缩时为空串)。
+
+        降级路径同样要按会话串行: 这里改的是本进程共享的 ``SessionMemory``, 而
+        摘要那步是 await 点, 并发 append 会把同一批 turns 折叠两次。
+        """
+        async with self._lock_for(session_id):
+            mem = self._local(session_id)
+            mem.turns.append((user, assistant))
+            if len(mem.turns) <= self._summary_threshold:
+                return ""
+            overflow = mem.turns[: -self._max_turns]
+            old = "\n".join(_render_turn(u, a) for u, a in overflow)
+            prompt = SUMMARY_PROMPT.format(history=f"{mem.summary}\n{old}".strip())
+            try:
+                resp = await self._summarizer.ainvoke(prompt)
+            except Exception as exc:  # noqa: BLE001 - 摘要失败也不能丢轮次, 故先摘要后裁剪
+                logger.warning("session summary 失败, 本轮保留原文不裁剪: %s", exc)
+                return ""
+            mem.summary = str(resp.content).strip()
+            mem.turns = mem.turns[-self._max_turns :]
+            return mem.summary
 
     # -------------------------------------------------------------- Redis 路径
     async def history_text(self, session_id: str) -> str:
@@ -128,6 +147,13 @@ class MemoryStore:
             await try_redis(lambda: redis.get(summary_key), default="", what="session memory get summary")
             or ""
         )
+        if summary:
+            # 摘要的 TTL 必须跟着每一轮读写续期: 只在"真的发生压缩"时写一次的话,
+            # 会话持续进行但长时间不再溢出时 turns 因不断续期而存活、summary 先过期,
+            # 于是此前折叠掉的全部历史默声消失(不是降级, 是丢数据)。
+            await try_redis(
+                lambda: redis.expire(summary_key, self._ttl), what="session memory expire summary"
+            )
 
         lines: list[str] = []
         if summary:
@@ -163,7 +189,27 @@ class MemoryStore:
         if pushed is None:  # 命令级降级 -> 退回进程内, 不能只丢掉这一轮不写
             return await self._local_append(session_id, user, assistant)
         await try_redis(lambda: redis.expire(turns_key, self._ttl), what="session memory expire turns")
+        # 摘要与轮次同寿命地续期(只在摘要存在时): 见 history_text 里的同一注释。
+        await try_redis(
+            lambda: redis.expire(summary_key, self._ttl), what="session memory expire summary"
+        )
 
+        # 压缩段必须按会话串行: rpush -> lrange -> LLM -> set -> ltrim 不是一个原子
+        # 操作, 同一会话的并发 append 会把同一批轮次折叠两次(摘要重复叠加),
+        # 或者把刚刚写进来的新轮次直接 ltrim 掉。LLM 调用留在锁内是故意的:
+        # 宁可慢, 也不能让两个请求同时对同一批轮次做裁剪。
+        async with self._lock_for(session_id):
+            return await self._compress_overflow(redis, session_id, turns_key, summary_key)
+
+    async def _compress_overflow(
+        self, redis, session_id: str, turns_key: str, summary_key: str
+    ) -> str:
+        """把溢出部分折叠成摘要(调用方已按会话上锁, 且在锁内重读了长度)。"""
+        pushed = await try_redis(
+            lambda: redis.llen(turns_key), default=None, what="session memory llen"
+        )
+        if not pushed:
+            return ""
         overflow_n = int(pushed) - self._max_turns
         if int(pushed) <= self._summary_threshold or overflow_n <= 0:
             return ""

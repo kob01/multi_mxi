@@ -12,9 +12,10 @@ A2A ``agent_delegate`` 是"需要专业系统多步办理的复杂业务"(见 IN
 AGENT_DELEGATE 的定义: "我要报销""帮我开在职证明""申请离职"), 语义上就是写/
 办理类任务, 整体不接入 Tool Cache —— 这是对原方案的一处安全修正。
 
-key 同样带角色(权限敏感: 同名工具对不同角色可见/结果可能不同, 如查余额,
-员工只能查自己, 管理者可查他人)。TTL 必须最短(``settings.tool_cache_ttl``,
-默认 30s)—— 报销进度/年假余额都是实时数据, 缓存久了就是读到脏结果。
+key 同样带角色(权限敏感: 同名工具对不同角色可见/结果可能不同), 并且**必带调用者**
+—— 包装层先把服务端注入的 ``caller_*`` 合进 kwargs 再算 key(见 :func:`wrap_tools_for_cache`),
+否则"查我自己余额"这种参数完全相同的请求会拿别人的结果。TTL 必须最短
+(``settings.tool_cache_ttl``, 默认 30s)—— 报销进度/年假余额都是实时数据, 缓存久了就是读到脏结果。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 
 from app.cache.redis_client import CACHE_PREFIX, get_redis, try_redis
 from app.config import get_settings
+from app.security.caller import CALLER_ARG_USER_ID, caller_tool_args
 
 logger = logging.getLogger(__name__)
 
@@ -93,29 +95,45 @@ async def cached_tool_call(
 
 
 def wrap_tools_for_cache(tools: list[BaseTool], server: str, role: str) -> list[BaseTool]:
-    """把一批 MCP 工具包一层 Tool Cache, 只读白名单命中的才包, 其余原样返回。
+    """给一批工具包上"调用者身份注入 (+ 只读工具额外接 Tool Cache)"。
 
     ``AssistantOrchestrator.tool_execute`` 走的是 LangChain ReAct 循环
     (``create_agent(self._llm, tools)``), 工具由 LLM 自主决定何时以何参数调用,
-    无法在调用点做缓存, 只能把缓存逻辑下推到工具本身。
+    既无法在调用点做缓存、也无法在调用点补身份, 只能把两件事都下推到工具本身。
+
+    身份注入是**无条件**的(不再只包只读工具): 写操作用的正是"谁在办"这个信息,
+    跳过注入就等于把归属判定交给 LLM 传参(见 app/security/caller.py 的口径)。
+    只有声明了 ``caller_user_id`` 的工具才会被注入 —— 进程内工具(web/docgen/
+    lookup_employee_by_name)签名里没有这些字段, 硬塞会被参数校验拒。
     """
-    wrapped: list[BaseTool] = []
-    for tool in tools:
-        if not is_cacheable_tool_name(tool.name):
-            wrapped.append(tool)
-            continue
-        wrapped.append(_wrap_one(tool, server, role))
-    return wrapped
+    return [_wrap_one(tool, server, role) for tool in tools]
+
+
+def _injects_caller(tool: BaseTool) -> bool:
+    """该工具的参数表是否接收编排层注入的调用者身份。"""
+    try:
+        return CALLER_ARG_USER_ID in tool.args
+    except Exception:  # noqa: BLE001 - 拿不到参数表就按"不注入"处理
+        return False
 
 
 def _wrap_one(tool: BaseTool, server: str, role: str) -> BaseTool:
     from app.assistant.mcp_client import flatten_mcp_result
 
-    async def _coro(**kwargs) -> str:
-        async def _invoke() -> str:
-            return flatten_mcp_result(await tool.ainvoke(kwargs))
+    cacheable = is_cacheable_tool_name(tool.name)
+    injects = _injects_caller(tool)
 
-        result, _hit = await cached_tool_call(server, tool.name, kwargs, role, _invoke)
+    async def _coro(**kwargs) -> str:
+        # 身份由服务端注入并覆盖 LLM 可能填的同名字段; 合进 kwargs 后再算缓存 key,
+        # 于是结果天然按调用者隔离(EMP0001 的余额不会命中给 EMP0002)。
+        args = {**kwargs, **caller_tool_args()} if injects else dict(kwargs)
+
+        async def _invoke() -> str:
+            return flatten_mcp_result(await tool.ainvoke(args))
+
+        if not cacheable:
+            return await _invoke()
+        result, _hit = await cached_tool_call(server, tool.name, args, role, _invoke)
         return result
 
     return StructuredTool.from_function(

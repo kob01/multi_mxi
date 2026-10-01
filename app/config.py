@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     # 重试次数取小: langchain 默认已会重试, 乘以人数就是配额翻倍; 供商 429/5xx 时
     # 重试风暴只会把故障放大, 宁可这轮降级也不能把下游再压一次。
     llm_max_retries: int = 2
+    # 本地 Ollama 的同类墙钟上限: 回退分支也不能没有上限。本地模型冷加载/显存换入
+    # 可以卡住分钟级, 没上限时一个挂住的请求会一直占住一个并发闸门, 直到把整个网关
+    # 拖到对新请求排队。比在线值宽(本地推理本来就慢), 但不是"不设上限"。
+    ollama_request_timeout: float = 300.0
 
     # ---------- LLM 供应商注册表 (模型前缀 -> 在线 API 路由) ----------
     # 切换在线大模型只需改 LLM_MODEL/INTENT_MODEL(双轨 .env), 不必动代码:
@@ -324,6 +328,12 @@ class Settings(BaseSettings):
     kg_graph_node_limit: int = 300
     # 概览中度数低于此值的孤立实体节点被裁剪(降噪)
     kg_min_entity_degree: int = 1
+    # 单篇文档落库的关系条数硬上限: 提示词里的"若干条"管不住模型, 超出的边
+    # 会把图糊成一团(而且每条边都要过一次 MERGE), 以代码侧截断为准。
+    kg_max_relations_per_doc: int = 40
+    # 受控关系词表开关: 关掉即退回"关系词原样入库"的旧行为(仅作回退闸,
+    # 词表本体在 app/kg/vocab.py, 不做成配置以免宿主/容器两轨各调一份)。
+    kg_relation_vocab_enabled: bool = True
 
     # ---------- 个人级记忆: User Memory / Episodic / Personal Knowledge ----------
     # 总开关: 关闭则完全回退到旧的单一 fact 通道(仍受 long_term_memory_enabled 约束)。
@@ -345,8 +355,14 @@ class Settings(BaseSettings):
     memory_knowledge_top_k: int = 3
     # 情节召回时间窗: 只取近 N 天的事件, 陈年旧事不再挤占 prompt。
     episodic_window_days: int = 30
-    # 情节 -> 知识蒸馏门槛: 自上次蒸馏以来新增情节达到该条数才调一次 LLM。
+    # 已废弃: 情节 -> 知识蒸馏已下线(知识桶只由显式"记一下"写入)。键保留是为了
+    # 宿主/容器两轨 .env 里的旧赋值不被 pydantic-settings 拒绝, 代码不再读它。
     memory_reflect_min_episodes: int = 3
+    # 显式知识记录总开关: 用户消息命中"记一下"类指令词才写 knowledge 桶。
+    memory_record_enabled: bool = True
+    # 指令触发词(逗号分隔, 拼成正则只扫用户消息): 命中才调 LLM 提炼落库;
+    # "以后都"这类易误触的说法默认不进词表, 需要时在 .env 追加。
+    memory_record_keywords: str = "记一下,记住,帮我记,记下来,别忘了"
     # 情节陈旧判定天数: 超出后排序降权(仅影响排序, 不删数据)。
     memory_decay_days: int = 90
     # 语义查重命中后的"同一条观测"判定窗口: 两条 occurred_at 相差超过此天数就当同一事实
@@ -448,6 +464,15 @@ class Settings(BaseSettings):
     # 留在异步解析层(app/docgen/images.py), 不污染纯同步的 builder。
     docgen_image_max_bytes: int = 8_000_000
     docgen_image_max_edge: int = 1600
+
+    # ---------- 能力域闸门 (web 联网检索 / docgen 文件生成, 见 app/security/quota.py) ----------
+    # 这两个域的工具在本进程内, 不进 MCP 角色×工具矩阵 —— 原先既没有域级闸门也没有
+    # 用量上限, 等于给任意调用者一个可以批量消耗 LLM 配额与磁盘的写通道。现在两件事
+    # 都补上: 哪些角色能用(白名单) + 每人每天能用多少次(计数限流)。
+    # 默认全员自助(与原行为一致, 只是加了上限); 收紧只需改配置不必改代码。
+    capability_allowed_roles: str = "employee,manager,hr,finance,admin"
+    # 同一调用者在同一能力域上的自然日调用上限(一次 tool_call 路由计 1 次)。
+    capability_daily_limit: int = 60
 
     # Security
     audit_log_path: str = "./logs/audit.jsonl"

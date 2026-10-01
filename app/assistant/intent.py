@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import re
+import time
 
 from app.assistant.prompts import INTENT_PROMPT
 from app.cache.prompt_cache import cached_llm_call
@@ -198,6 +199,17 @@ class IntentRecognizer:
         # 后的前 N 个请求)会各自发一次"全部种子文本"的 embedding 批量请求 —— 十几组
         # 种子×六条话术就是十几遍重复的同一批计算, 直接把 Ollama 压到报错。
         self._seeds_lock: asyncio.Lock | None = None
+        # 建索引失败的退避时间戳(monotonic): 刻意做的负缓存 —— 否则失败后每个请求
+        # 都重发全量 embedding(故障时那就是重试风暴)。
+        self._seeds_failed_at = 0.0
+
+    _SEEDS_RETRY_AFTER = 60.0
+
+    def _in_retry_backoff(self) -> bool:
+        """处于建索引失败的退避窗口内则 True(调用方直接下沉下一层)。"""
+        return bool(self._seeds_failed_at) and (
+            time.monotonic() - self._seeds_failed_at < self._SEEDS_RETRY_AFTER
+        )
 
     # ---------------- 第一层: 规则快筛 ----------------
 
@@ -218,23 +230,43 @@ class IntentRecognizer:
     # ---------------- 第二层: bge-m3 语义分类 ----------------
 
     async def _ensure_seeds(self) -> None:
-        """Build + cache normalized seed vectors once (best-effort, single-flight)."""
+        """Build + cache normalized seed vectors once (best-effort, single-flight).
+
+        建索引失败必须有负缓存退避: 原先只写成功路径, 失败时 ``_seed_index`` 仍为 None
+        且 ``_embedding_ok`` 不会转 False, 于是**每一个后续请求都重新发一遍"全部种子"
+        的批量 embedding** —— 单飞锁只能挡冷启动风暴, 挡不住故障态下的持续重试风暴
+        (而后者恰好是注释里那个"把 Ollama 压到报错"的持续版本)。失败后
+        ``_SEEDS_RETRY_AFTER`` 秒内不再重试建索引, 其间直接下沉 LLM 层。
+        """
         if self._seed_index is not None or not self._embedding_ok:
+            return
+        if self._in_retry_backoff():
             return
         if self._seeds_lock is None:
             self._seeds_lock = asyncio.Lock()
         async with self._seeds_lock:
-            # 双检: 等锁期间另一个请求已经把种子嵌好了
+            # 双检: 等锁期间另一个请求已经把种子嵌好了(或刚建索引失败进了退避窗口)
             if self._seed_index is not None or not self._embedding_ok:
+                return
+            if self._in_retry_backoff():
                 return
             labels = list(_SEEDS.keys())
             flat = [text for key in labels for text in _SEEDS[key]]
             label_of = [key for key in labels for _ in _SEEDS[key]]
-            vectors = await self._embedder.embed(flat)
+            try:
+                vectors = await self._embedder.embed(flat)
+            except Exception as exc:  # noqa: BLE001 - 建索引失败只能降级, 不能卡住意图层
+                self._seeds_failed_at = time.monotonic()
+                logger.warning(
+                    "意图种子向量建索引失败, %d 秒内不再重试(其间下沉 LLM): %s",
+                    int(self._SEEDS_RETRY_AFTER), exc,
+                )
+                return
             index: dict[tuple[IntentType, str | None], list[list[float]]] = {}
             for key, vec in zip(label_of, vectors):
                 index.setdefault(key, []).append(_l2_normalize(vec))
             self._seed_index = index
+            self._seeds_failed_at = 0.0
             logger.info("intent seed index built: %d groups, %d vectors", len(index), len(flat))
 
     def _semantic_classify_sync(self, query_vec: list[float]) -> IntentResult | None:

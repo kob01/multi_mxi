@@ -6,14 +6,17 @@
 - 角色×工具白名单矩阵 (app.security.auth.ANALYTICS_TOOL_WHITELIST) 决定每个角色
   可见的工具 (硬控制); analytics 域可跨全员查数据, 属敏感能力, 普通员工被网关层
   (AGENT_WHITELIST)拦截, 到这里的基本都是管理角色。
-- System Prompt 按角色声明能力边界 (软控制), 并注入跨域表结构供 Text2SQL 参考。
-- 身份只信 A2A Message.metadata (编排层从可信 ChatRequest.role 写入), 不从文本解析。
+- System Prompt 按角色声明能力边界 (软控制), 并注入多域表结构供 Text2SQL 参考。
+- 身份只取 A2A Message.metadata(编排层从 ChatRequest 写入)。注意这是"可信上游假设":
+  ChatRequest 的 user_id/role 仍由客户端自报, 本系统尚未接统一身份系统(口径见
+  README 与 docs-interview 里的已记录欠债); 接 JWT/OIDC 后只需换 metadata 的来源。
 
 分析产物(图表/报告)以 URL 形式回给用户, 由网关的 /api/files/reports 静态提供。
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -29,6 +32,7 @@ from app.llm import get_chat_model
 from app.schemas import Role
 from app.security.audit import get_audit_logger
 from app.security.auth import filter_tools_for_role
+from app.security.caller import Caller, bind_caller_tools, reset_caller, set_caller
 
 _ROLE_LABELS: dict[Role, str] = {
     Role.EMPLOYEE: "普通员工",
@@ -108,31 +112,48 @@ class AnalystAgent:
         self._settings = settings
         self._llm = get_chat_model(settings.llm_model, temperature=0)
         self._tools: list[Any] | None = None
+        self._tools_at = 0.0
         self._agents: dict[Role, Any] = {}
 
+    def _ttl(self) -> float:
+        return max(1.0, float(self._settings.mcp_tools_ttl))
+
     async def _ensure_agent(self, role: Role = Role.MANAGER) -> Any:
-        """Lazily connect to the analytics MCP server and build a per-role ReAct graph."""
+        """Lazily connect to the analytics MCP server and build a per-role ReAct graph.
+
+        工具清单按 ``mcp_tools_ttl`` 过期重发(与编排层同一口径): 原先一次发现后永不
+        刷新, MCP server 重启或新增工具后本智能体永远看不到变化。
+        """
+        if self._tools is None or time.monotonic() - self._tools_at > self._ttl():
+            client = MultiServerMCPClient(
+                {"analytics": {"url": self._settings.analytics_mcp_url, "transport": "streamable_http"}}
+            )
+            self._tools = await client.get_tools()
+            self._tools_at = time.monotonic()
+            self._agents.clear()
         if role not in self._agents:
-            if self._tools is None:
-                client = MultiServerMCPClient(
-                    {"analytics": {"url": self._settings.analytics_mcp_url, "transport": "streamable_http"}}
-                )
-                self._tools = await client.get_tools()
             # 权限Mask: 与编排层共用同一张角色×工具白名单矩阵 (硬控制)。
             tools = filter_tools_for_role(role, "analytics", self._tools)
+            # analytics 工具不接单据归属校验(只读统计), 但统一走一次包装: 参数表里
+            # 没有 caller_user_id 的工具会原样返回, 将来新增需要辨认调用者的工具时不会漏注入。
+            tools = bind_caller_tools(tools)
             self._agents[role] = create_agent(self._llm, tools, system_prompt=_build_role_prompt(role))
         return self._agents[role]
 
     async def invoke(self, user_text: str, user_id: str, role: Role) -> str:
-        """Run one delegated analysis task under the given (trusted) identity."""
+        """Run one delegated analysis task under the given protocol-level identity."""
         agent = await self._ensure_agent(role)
         system_context = (
             f"系统上下文(仅供调用工具时使用, 不要向用户复述): "
-            f"当前登录操作者 employee_id={user_id or 'anonymous'}。"
+            f"当前登录操作者 employee_id={user_id or 'anonymous'}; 当前角色 role={role.value}。"
         )
-        result = await agent.ainvoke(
-            {"messages": [("system", system_context), ("user", user_text)]}
-        )
+        token = set_caller(Caller(user_id=user_id or "", role=role.value))
+        try:
+            result = await agent.ainvoke(
+                {"messages": [("system", system_context), ("user", user_text)]}
+            )
+        finally:
+            reset_caller(token)
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
                 return str(msg.content)
@@ -171,4 +192,7 @@ class AnalystAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(new_agent_text_message(answer))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise NotImplementedError("Analyst_Agent does not support cancellation")
+        """取消未实现: 正在跑的 ReAct 循环没有可中断点(委派靠 a2a_timeout 兑底)。"""
+        raise NotImplementedError(
+            "Analyst_Agent 不支持 A2A cancel: 编排层不得依赖取消来回收资源"
+        )

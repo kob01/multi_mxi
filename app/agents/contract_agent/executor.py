@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -36,6 +37,7 @@ from app.llm import get_chat_model
 from app.schemas import Role
 from app.security.audit import get_audit_logger
 from app.security.auth import filter_tools_for_role
+from app.security.caller import Caller, bind_caller_tools, reset_caller, set_caller
 
 _EMPLOYEE_TAG_RE = re.compile(r"\[employee_id=([A-Za-z0-9_\-]+)\]")
 
@@ -122,36 +124,52 @@ class ContractAgent:
         self._settings = settings
         self._llm = get_chat_model(settings.llm_model, temperature=0)
         self._tools: list[Any] | None = None
+        self._tools_at = 0.0
         self._agents: dict[Role, Any] = {}
 
+    def _ttl(self) -> float:
+        return max(1.0, float(self._settings.mcp_tools_ttl))
+
     async def _ensure_agent(self, role: Role = Role.EMPLOYEE) -> Any:
-        """Lazily connect to the procurement MCP server and build a per-role ReAct graph."""
+        """Lazily connect to the procurement MCP server and build a per-role ReAct graph.
+
+        工具清单按 ``mcp_tools_ttl`` 过期重发(与编排层同一口径), 清单变了就连 agent 一
+        起重建; 原先一次发现后永不刷新。本域工具全部带归属校验(单据/合同台账只能
+        碰自己送审的), 所以身份必须逐请求注入。
+        """
+        if self._tools is None or time.monotonic() - self._tools_at > self._ttl():
+            client = MultiServerMCPClient(
+                {"procurement": {"url": self._settings.procurement_mcp_url, "transport": "streamable_http"}}
+            )
+            self._tools = await client.get_tools()
+            self._tools_at = time.monotonic()
+            self._agents.clear()
         if role not in self._agents:
-            if self._tools is None:
-                client = MultiServerMCPClient(
-                    {"procurement": {"url": self._settings.procurement_mcp_url, "transport": "streamable_http"}}
-                )
-                self._tools = await client.get_tools()
             # 权限Mask: 与编排层共用同一张角色×工具白名单矩阵 (硬控制)。
             tools = filter_tools_for_role(role, "procurement", self._tools)
-            # 跨域基础解析能力(姓名->工号)注入。
+            # 各域共用的"姓名->工号"基础解析能力注入。
             tools = [*tools, lookup_employee_by_name]
+            tools = bind_caller_tools(tools)
             self._agents[role] = create_agent(self._llm, tools, system_prompt=_build_role_prompt(role))
         return self._agents[role]
 
     async def invoke(self, user_text: str, user_id: str, role: Role) -> str:
-        """Run one delegated procurement/contract task under the given (trusted) identity."""
+        """Run one delegated procurement/contract task under the given protocol-level identity."""
         agent = await self._ensure_agent(role)
         system_context = (
             f"系统上下文(仅供调用工具时使用, 不要向用户复述): "
-            f"当前登录操作者 employee_id={user_id or 'anonymous'}。"
+            f"当前登录操作者 employee_id={user_id or 'anonymous'}; 当前角色 role={role.value}。"
             "操作者身份仅代表登录态, 不等于业务目标用户: 若用户消息中指定了申请人(工号/姓名),"
             " 以消息指定的为准; 仅当代办\"我/本人\"的采购/送审且未指定他人时, 才默认使用操作者"
-            " employee_id。"
+            " employee_id。caller_* 字段由系统注入且会覆盖你填的值, 无需也不要在工具参数里传它们。"
         )
-        result = await agent.ainvoke(
-            {"messages": [("system", system_context), ("user", user_text)]}
-        )
+        token = set_caller(Caller(user_id=user_id or "", role=role.value))
+        try:
+            result = await agent.ainvoke(
+                {"messages": [("system", system_context), ("user", user_text)]}
+            )
+        finally:
+            reset_caller(token)
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
                 return str(msg.content)
@@ -192,4 +210,7 @@ class ContractAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(new_agent_text_message(answer))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise NotImplementedError("Contract_Agent does not support cancellation")
+        """取消未实现: 正在跑的 ReAct 循环没有可中断点(委派靠 a2a_timeout 兑底)。"""
+        raise NotImplementedError(
+            "Contract_Agent 不支持 A2A cancel: 编排层不得依赖取消来回收资源"
+        )

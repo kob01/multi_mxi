@@ -161,13 +161,15 @@ async def get_report_file(name: str) -> FileResponse:
     且只在 report_dir 目录内解析后的绝对路径才回文件; 不做目录列表。
     扩展名不在 ``analytics.store._EXT_KIND`` 里的文件根本进不了台账/下载
     (原网页创作工坊下线的 HTML 已不在该白名单内, 不可回取)。
+    Content-Type 由 ``analytics.store.media_type`` 按后缀给出(与台账白名单同源),
+    映射外的类型一律 415 —— 不能回落到 markdown, 否则 PNG/CSV 带着错 MIME 出网。
 
     下面对 HTML 的 CSP sandbox 分支是那道产物还在时的护栏, 现处于休眠状态:
     保留是为了"若将来又开静态页入口, 不会忘了同源隔离" —— 新接入可下发 HTML 的
     产物时必须带上那段 sandbox(成品页与业务系统同源, 不加这道头一段恶意脚本就能
     读本域 cookie/localStorage 并调内网 API; sandbox 不带 allow-same-origin)。
     """
-    from app.analytics.store import is_safe_name
+    from app.analytics.store import is_safe_name, media_type
 
     if not is_safe_name(name):
         raise HTTPException(status_code=400, detail="invalid artifact name")
@@ -176,7 +178,7 @@ async def get_report_file(name: str) -> FileResponse:
     # resolve 后再确认仍在 report_dir 内: 双保险挡符号链接/相对路径穿越。
     if path.parent != directory or not path.is_file():
         raise HTTPException(status_code=404, detail="artifact not found")
-    media = "image/svg+xml" if path.suffix == ".svg" else "text/markdown; charset=utf-8"
+    media = media_type(path.name)
     headers: dict[str, str] | None = None
     if path.suffix.lower() == ".html":
         media = "text/html; charset=utf-8"
@@ -184,4 +186,6 @@ async def get_report_file(name: str) -> FileResponse:
             "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-modals",
             "X-Content-Type-Options": "nosniff",
         }
+    elif media is None:
+        raise HTTPException(status_code=415, detail="unsupported artifact type")
     return FileResponse(path, media_type=media, headers=headers)

@@ -10,7 +10,8 @@
      三类键(观测/修正/多值)各自的语义、观测数封顶、老行自愈;
   3. profile_store.render_summary: 只有用户明说时间才渲染"（自 YYYY-MM）", 历史值不进 prompt;
   4. extraction._parse: profile 的 at 落到 valid_at/explicit, 键名去时间修饰, 关系带 valid_at;
-  5. vector_store 的观测窗口判定与 occurred_at 不回退(纯函数部分, 不连库)。
+  5. extraction._parse_episodes: 本轮对话产物(让助手生成文件/导出报告/一次问答)不入情节;
+  6. vector_store 的观测窗口判定与 occurred_at 不回退(纯函数部分, 不连库)。
 
 端到端(真提取 + 真落库 + 召回)在 docker 容器里走整栈验证, 见 README 记忆层小节。
 """
@@ -21,7 +22,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 
-from app.memory.extraction import _parse
+from app.memory.extraction import _parse, _parse_episodes
 from app.memory.profile_store import merge_attributes, render_summary
 from app.memory.temporal import parse_embedded_date, parse_event_time
 from app.memory.vector_store import _is_same_observation, _later
@@ -242,6 +243,29 @@ def test_extraction_time_fields() -> None:
     check("只出现在关系里的实体不会被丢", len(orphan.relations) == 1 and len(orphan.entities) == 2, str(orphan.entities))
 
 
+def test_episode_bucket_rejects_conversation_products() -> None:
+    """情节只装现实经历: 让助手生成文件/导出报告/一次问答的结果都不算。"""
+    episodes = _parse_episodes(
+        [
+            # 四类对话产物: 生成表格 / 导出报告 / 搭页面 / 问答未命中。
+            {"title": "生成百米历史前十表格", "what": "用户要求把男子100米历史前10好成绩生成Excel表格下载", "outcome": "助手生成了《男子100米历史前10好成绩》.xlsx 文件并提供下载链接"},
+            {"title": "生成Agent技术调研报告", "what": "要求调研6-8月Agent实用技术发展并导出PDF报告", "outcome": "助手生成了《智能体实用技术进展》PDF"},
+            {"title": "搭建报销看板骨架", "what": "要求把研发部本季度报销情况做成一页数据看板页面", "outcome": "生成了看板骨架页面, 产物编号 web_123"},
+            {"title": "咨询工资增减", "what": "用户询问上月请一天事假且有出差补助时工资会多还是少", "outcome": "助手未找到相关文档, 未能回答"},
+            # 真实经历: 必须保留。
+            {"title": "完成100km骑行", "what": "周末完成了100km骑行", "outcome": "完成挑战", "occurred_at": "2026-09-26"},
+            {"title": "参加行业发布会", "what": "我去参加了公司的秋季新品发布会", "outcome": "认识了两位同行"},
+        ]
+    )
+    titles = [e.title for e in episodes]
+    check("生成文件类对话产物不入情节", "生成百米历史前十表格" not in titles, str(titles))
+    check("导出报告类对话产物不入情节", "生成Agent技术调研报告" not in titles, str(titles))
+    check("搭页面类对话产物不入情节", "搭建报销看板骨架" not in titles, str(titles))
+    check("问答未命中不入情节", "咨询工资增减" not in titles, str(titles))
+    check("现实经历仍然入情节", titles == ["完成100km骑行", "参加行业发布会"], str(titles))
+    check("保留的时间锚点不受影响", episodes and episodes[0].occurred_at is not None, str(episodes))
+
+
 def test_observation_window_and_no_time_regression() -> None:
     """记忆条目侧: 不同时刻的观测各存一条, 合并时 occurred_at 不回退。"""
     check("相隔超出窗口算不同观测", not _is_same_observation(NOW, NOW - timedelta(days=400), 7))
@@ -265,6 +289,7 @@ def main() -> int:
     test_legacy_row_self_heals()
     test_render_summary()
     test_extraction_time_fields()
+    test_episode_bucket_rejects_conversation_products()
     test_observation_window_and_no_time_regression()
     failed = [r for r in _results if not r[0]]
     print(f"\n合计 {len(_results)} 项: 通过 {len(_results) - len(failed)} / 失败 {len(failed)}")

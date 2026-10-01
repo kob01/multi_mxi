@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import html
 import io
+import logging
 import math
+import xml.etree.ElementTree as ET
 from typing import Any, Sequence
+
+_logger = logging.getLogger(__name__)
 
 # 画布与留白: 左边界要容纳 y 轴刻度, 下边界要容纳可能旋转的 x 轴标签。
 _WIDTH = 720
@@ -32,6 +36,11 @@ _PALETTE = ("#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#AF7AA1", "#
 # 字体栈只允许单引号: 它会被写进双引号包裹的 font-family 属性里, 出现双引号会直接
 # 把整张 SVG 的属性截断(浏览器渲染出一堆裸文本)。
 _FONT = "system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
+
+# 引号在这里固化: SVG 按 XML 解析, XML 1.0 的 AttValue 强制带引号, 而 _FONT 含空格与
+# 单引号 —— 裸写 font-family={_FONT} 会让整张图变成非良构 XML(浏览器直接报解析错,
+# 图打不开)。所有写 font-family 的地方一律复用这个常量, 不要再手抄属性。
+_FONT_ATTR = f'font-family="{_FONT}"'
 
 
 def _text_width(label: str) -> float:
@@ -146,13 +155,13 @@ def _axis(chart: dict[str, Any], title: str) -> list[str]:
         )
         parts.append(
             f'<text x="{x0 - 8}" y="{y + 4:.1f}" text-anchor="end" font-size="12" '
-            f'fill="#6B7280" font-family={_FONT}>{html.escape(fmt(value, 1))}</text>'
+            f'fill="#6B7280" {_FONT_ATTR}>{html.escape(fmt(value, 1))}</text>'
         )
         value += step
         ticks += 1
     parts.append(
         f'<text x="{x0}" y="{_MARGIN["top"] - 18}" font-size="15" fill="#111827" '
-        f'font-weight="600" font-family={_FONT}>{html.escape(title)}</text>'
+        f'font-weight="600" {_FONT_ATTR}>{html.escape(title)}</text>'
     )
     parts.append(
         f'<line x1="{x0}" y1="{y1}" x2="{x1}" y2="{y1}" stroke="#9AA4B2" stroke-width="1"/>'
@@ -173,13 +182,13 @@ def _category_labels(chart: dict[str, Any]) -> list[str]:
         if need_rotate:
             parts.append(
                 f'<text x="{cx:.1f}" y="{y1 + 16}" font-size="12" fill="#4B5563" '
-                f'text-anchor="end" font-family={_FONT} '
+                f'text-anchor="end" {_FONT_ATTR} '
                 f'transform="rotate(-35 {cx:.1f} {y1 + 16})">{html.escape(label)}</text>'
             )
         else:
             parts.append(
                 f'<text x="{cx:.1f}" y="{y1 + 20}" font-size="12" fill="#4B5563" '
-                f'text-anchor="middle" font-family={_FONT}>{html.escape(label)}</text>'
+                f'text-anchor="middle" {_FONT_ATTR}>{html.escape(label)}</text>'
             )
     return parts
 
@@ -198,7 +207,7 @@ def _legend(chart: dict[str, Any]) -> list[str]:
         label = s["name"] if len(s["name"]) <= 12 else s["name"][:11] + "…"
         parts.append(
             f'<text x="{x + 17}" y="{y + 1}" font-size="12" fill="#4B5563" '
-            f'font-family={_FONT}>{html.escape(label)}</text>'
+            f'{_FONT_ATTR}>{html.escape(label)}</text>'
         )
         x += 24 + _text_width(label)
     return parts
@@ -207,7 +216,7 @@ def _legend(chart: dict[str, Any]) -> list[str]:
 def _wrap(parts: list[str]) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{_WIDTH}" height="{_HEIGHT}" '
-        f'viewBox="0 0 {_WIDTH} {_HEIGHT}" font-family="{_FONT}" role="img">'
+        f'viewBox="0 0 {_WIDTH} {_HEIGHT}" {_FONT_ATTR} role="img">'
         f'<rect width="{_WIDTH}" height="{_HEIGHT}" fill="#FFFFFF"/>'
         + "".join(parts)
         + "</svg>"
@@ -255,7 +264,7 @@ def bar_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -
             if si == 0 or len(chart["series"]) == 1:
                 parts.append(
                     f'<text x="{x + (bar_w - 2) / 2:.1f}" y="{y - 5:.1f}" font-size="11" '
-                    f'fill="#374151" text-anchor="middle" font-family={_FONT}>'
+                    f'fill="#374151" text-anchor="middle" {_FONT_ATTR}>'
                     f"{html.escape(fmt(value, 1))}</text>"
                 )
     parts += _legend(chart)
@@ -289,7 +298,7 @@ def line_chart(title: str, categories: list[str], series: list[dict[str, Any]]) 
             if i % label_every == 0:
                 parts.append(
                     f'<text x="{x:.1f}" y="{y - 9:.1f}" font-size="11" fill="#374151" '
-                    f'text-anchor="middle" font-family={_FONT}>'
+                    f'text-anchor="middle" {_FONT_ATTR}>'
                     f"{html.escape(fmt(s['data'][i], 1))}</text>"
                 )
     parts += _legend(chart)
@@ -308,7 +317,7 @@ def pie_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -
     cx, cy, r = _MARGIN["left"] + 150, _HEIGHT / 2 + 6, 128
     parts = [
         f'<text x="{_MARGIN["left"]}" y="{_MARGIN["top"] - 18}" font-size="15" '
-        f'fill="#111827" font-weight="600" font-family={_FONT}>{html.escape(title)}</text>'
+        f'fill="#111827" font-weight="600" {_FONT_ATTR}>{html.escape(title)}</text>'
     ]
     angle = -math.pi / 2
     for i, (cat, value) in enumerate(pairs):
@@ -334,7 +343,7 @@ def pie_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -
             ly = cy + (r * 0.62) * math.sin(mid)
             parts.append(
                 f'<text x="{lx:.1f}" y="{ly:.1f}" font-size="12" fill="#FFFFFF" '
-                f'text-anchor="middle" font-family={_FONT}>{share * 100:.1f}%</text>'
+                f'text-anchor="middle" {_FONT_ATTR}>{share * 100:.1f}%</text>'
             )
         angle += sweep
     # 右侧图例: 类目名 + 金额, 饼图不放图例等于只画了半张图
@@ -346,10 +355,24 @@ def pie_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -
         label = cat if len(cat) <= 10 else cat[:9] + "…"
         parts.append(
             f'<text x="{x + 16}" y="{ly}" font-size="12" fill="#4B5563" '
-            f'font-family={_FONT}>{html.escape(label)} · {html.escape(fmt(value, 1))}</text>'
+            f'{_FONT_ATTR}>{html.escape(label)} · {html.escape(fmt(value, 1))}</text>'
         )
         ly += 20
     return _wrap(parts)
+
+
+def _well_formed(svg: str) -> str | None:
+    """出图前的良构 XML 自检; 有问题返回错因, 干净返回 None。
+
+    这层不是可有可无的装饰: SVG 以 ``image/svg+xml`` 下发时浏览器按 XML 解析,
+    一个未加引号的属性就会让整张图变成解析错误页(而工具返回值里仍写着"已生成")。
+    手拼字符串没有编译器兜底, 只能用进出的这一道把这类回归顶出来。
+    """
+    try:
+        ET.fromstring(svg)
+    except ET.ParseError as exc:
+        return f"SVG 非良构 XML({exc})"
+    return None
 
 
 def render(
@@ -377,6 +400,11 @@ def render(
         svg = line_chart(title or "趋势", cats, ser)
     else:
         svg = bar_chart(title or "对比", cats, ser)
+    bad = _well_formed(svg)
+    if bad:
+        # 到这里只能是本模块的拼接 bug(不是用户传参问题), 记日志后让调用方自行降级。
+        _logger.error("chart svg rejected: %s | kind=%s title=%s", bad, kind, title)
+        return {"error": f"图表生成异常, 已拦截: {bad}"}
     return {
         "svg": svg,
         "chart_type": kind,

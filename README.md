@@ -220,6 +220,26 @@ RAG:  Query → Embedding
   `episodic_window_days` 时间窗过滤, 模型猜错年份会让整条记忆被误杀; 画像的 `valid_at`
   只参与排序(猜错最多沉进历史), 所以放到 1900 年(`temporal.MIN_VALID_AT_YEAR`)。
 
+### 什么才配被记住: 情节与个人图谱的写入口径
+
+"本轮让助手干的活"不是记忆: 用户说"把男子100米历史前10做成 Excel 下载", 助手生成
+了文件 —— 这件事已经躺在会话记录里, 跨会话记住没有价值。旧口径下这类轮次会往情节桶
+灌进"生成百米历史前十表格"一条, 同时往图上挂"男子100米历史前10好成绩.xlsx"、
+`docgen-20260930-234924` 这种产物节点。现行口径两条:
+
+| 桶           | 只装                                     | 拦掉                                                              | 口径位置                                                            |
+| ------------ | ---------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------- |
+| 情节 episode | 用户现实/工作里真实发生过的经历         | 本轮对话产物("用户要求…/助手生成…/产物编号/下载链接")          | `MEMORY_EXTRACTION_PROMPT` + `taxonomy.is_conversation_product`        |
+| 个人图谱     | 以用户为中心的关系网                     | 提到即建点、第三方世界知识、文件名/报告标题/单号、词表外关系词 | `app/memory/graph_vocab.py`(纯函数) → `graph_store.upsert_entities`   |
+
+图侧四条硬口径(与 `app/kg/vocab.py` 对称, 枚举只定义一份, 提示词、落库、清理脚本、
+前端标签都仍从这里取): **实体类型白名单**(person/department/organization/system/position/place,
+明确标成 topic·document 的不入库) · **关系词受控**(表外宁可不写, 不做"归到兜底词") ·
+**产物名不进图** · **边必须锚定在用户身上**(至少一端是"我"或该用户图里已有的节点,
+且只为保留的边建点 —— 孤立节点是旧版污染主因)。姓名/工号在写入前折叠成"我"这个
+中心节点, 避免同一个人裂成两点。存量脏数据用 `python -m scripts.clean_personal_graph`
+(默认 dry-run, 同一份口径)清理; 离线自检 `python -m scripts.test_graph_vocab_offline`。
+
 ## 目录结构
 
 ```
@@ -245,6 +265,7 @@ mxi/
 │   │   ├── profile_store.py      #   画像(user_profiles 表, 当前值派生 + 有界历史)
 │   │   ├── vector_store.py       #   情节/知识(向量召回)与偏好/习惯(标量直读)的 pgvector 长表
 │   │   ├── graph_store.py        #   个人图谱(Neo4j, :MemoryUser 锚点, REL 边带生效/失效时间)
+│   │   ├── graph_vocab.py        #   图谱写入口径(实体类型/关系词表/产物拦截/用户锚定)
 │   │   ├── extraction.py         #   一次 LLM 调用产出全部桶(画像/关系带生效时间)
 │   │   └── router.py             #   /api/memory 自服务(查看/删除/整理)
 │   ├── rag/                      # ★ RAG 知识底座
@@ -303,6 +324,7 @@ mxi/
 │   ├── ingest_knowledge.py       # 知识库构建脚本
 │   ├── init_db.py                # PostgreSQL + pgvector 建表/自检
 │   ├── migrate_doc_stores.py     # 存量迁移与校验: 正文入 Mongo + 父子拆双表
+│   ├── migrate_kg_edges.py      #   文档图谱边迁移: 补溯源 docs + 关系词归一 + 清孤儿实体
 │   ├── bench_doc_stores.py       # 父子双表规模基准(只写独立评测库)
 │   ├── test_sse_resume.py        # SSE 断点续流端到端用例(可走 vite 代理 MXI_BASE)
 │   ├── smoke_tools.py            # web/docgen 能力域离线冒烟(SSRF 面/构建器/路由回归)
@@ -379,6 +401,11 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.mig
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.migrate_doc_stores --drop-legacy
 # 构建知识库(可选; 现在也可通过 Web 上传)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.ingest_knowledge --dir /data/knowledge
+# 文档知识图谱边的存量迁移(升级后必跑一次): 查询出口现在按 KG_REL.docs 做边级 ACL,
+# 没溯源的历史边会隐身, 所以顺序必须是 迁移 → 重抽 → 再看图。
+docker compose -f docker/docker-compose.yml exec assistant python -m scripts.migrate_kg_edges --dry-run
+docker compose -f docker/docker-compose.yml exec assistant python -m scripts.migrate_kg_edges --apply
+docker compose -f docker/docker-compose.yml exec assistant python -m scripts.build_doc_kg
 # 重刷业务数据(可选)
 docker compose -f docker/docker-compose.yml exec assistant python -m scripts.seed_business_data --force
 # Web 聊天: http://localhost:18000   文档管理: http://localhost:18000/upload

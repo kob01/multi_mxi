@@ -104,10 +104,39 @@ MEMORY_ITEM_KINDS = tuple(
 # 允许被"清空"的桶: 五个记忆桶 + 遗留的 fact(前端要能清掉历史记录)。
 CLEARABLE_KINDS = (MemoryBucket.PROFILE.value, *MEMORY_ITEM_KINDS)
 
-# 写入来源: 对话轮提取 / 会话摘要折叠 / 情节蒸馏。
+# 写入来源: 对话轮提取 / 会话摘要折叠; reflection(情节蒸馏)已停写, 常量保留给存量行展示。
 SOURCE_TURN = "turn"
 SOURCE_SESSION_SUMMARY = "session_summary"
 SOURCE_REFLECTION = "reflection"
+
+
+# ---------- 什么不是记忆内容: 本轮对话产物 ----------
+# "用户要求生成 Excel 表格/导出 PDF 报告/搭一个看板页面""助手生成了 X 文件并提供
+# 下载""助手未找到相关文档" 这类内容只是**本轮让助手干的活**: 会话记录里本来就有,
+# 既不是用户的经历(情节桶), 也不是用户的关系网(图谱)。口径同时给提取侧与图侧用,
+# 写在一处避免两个桶各维护一份黑名单而漂移。
+CONVERSATION_PRODUCT_MARKERS = (
+    "用户要求",
+    "用户询问",
+    "用户希望",
+    "要求助手",
+    "让助手",
+    "请助手",
+    "助手生成",
+    "助手已生成",
+    "助手提供",
+    "助手回答",
+    "助手未能",
+    "助手未找到",
+    "产物编号",
+    "下载链接",
+)
+
+
+def is_conversation_product(*texts: object) -> bool:
+    """这些拼起来的文本是否只在描述"本轮助手做了什么"。"""
+    joined = "".join(str(t or "") for t in texts)
+    return any(marker in joined for marker in CONVERSATION_PRODUCT_MARKERS)
 
 
 def spec_of(bucket: MemoryBucket | str) -> BucketSpec:

@@ -31,8 +31,23 @@ _CST = timezone(timedelta(hours=8))
 # (.png 是分析图表给 office 文档内嵌用的位图; SVG 已不再服务于网页工坊。)
 _EXT_KIND = {".svg": "chart", ".md": "report", ".csv": "table", ".png": "chart"}
 
+# 扩展名 -> 下发 Content-Type。与 _EXT_KIND 同源维护: 网关那边只按 ".svg" 二分、
+# 其余一律回落 text/markdown 的话, 位图与 CSV 就带着错的 MIME 出网 —— <img> 引用
+# PNG 在严格 MIME/禁嗅探的浏览器与所有 WebView 下不显示, CSV 下载拿到 .md 类型。
+_EXT_MEDIA = {
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".csv": "text/csv; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+}
+
 # 文件名硬约束: 只允许本模块生成的字符集, 挡掉 ../ 与绝对路径等一切穿越写法。
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+
+
+def media_type(name: str) -> str | None:
+    """按扩展名给出下发用的 Content-Type; 不在映射里返回 None(调用方据此拒下发)。"""
+    return _EXT_MEDIA.get(Path(name).suffix.lower())
 
 
 def reports_dir() -> Path:

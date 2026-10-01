@@ -89,6 +89,43 @@ def _log_dependency_endpoints() -> None:
     )
 
 
+# 能力开关清单(启动摘要与告警的唯一来源): 名字取 settings 字段, 第二个元素是人在
+# 日志里该看到的中文能力名。这些开关关掉后都只表现为"功能不存在"而不是报错
+# (降级优先), 没拷 .env 时整站能力会静默少一大片, 仅看页面无法区分"坏了"与"没开"。
+_CAPABILITY_FLAGS: tuple[tuple[str, str], ...] = (
+    ("long_term_memory_enabled", "长期记忆(Vector 通道)"),
+    ("graph_memory_enabled", "长期记忆(Graph 通道)"),
+    ("personal_memory_enabled", "个人级六桶记忆"),
+    ("doc_kg_enabled", "文档知识图谱"),
+    ("cache_enabled", "三类缓存"),
+    ("mongo_enabled", "正文外置存储(父块上下文)"),
+    ("multi_task_enabled", "复合问法多任务拆分"),
+    ("checkpoint_enabled", "LangGraph Checkpointer"),
+)
+
+
+def _log_capability_summary() -> None:
+    """启动时打一行能力开关摘要, 并对每个关闭的能力记 WARNING。
+
+    能力开关在代码里取保守默认值(与 .env.example 的建议值不同), 因此
+    "忘拷 .env" 的后果是静默降级: 父块上下文、长期记忆、文档图谱全部不存在,
+    但对话仍然正常返回 —— 只看结果与日志都分不出"坏了"还是"没开"。这一行把现场
+    展开成可对照的快照(与依赖地址快照同位同时打)。
+    """
+    s = get_settings()
+    on: list[str] = []
+    off: list[str] = []
+    for field_name, label in _CAPABILITY_FLAGS:
+        (on if getattr(s, field_name, False) else off).append(label)
+    logger.info("能力开关摘要 on=[%s] off=[%s]", ", ".join(on) or "-", ", ".join(off) or "-")
+    if off:
+        logger.warning(
+            "以下能力未开启(表现为功能缺失而不报错): %s —— 若这不是预期, 检查是否漏了 .env "
+            "或 compose 侧对应键(容器轨看 docker/.env)",
+            ", ".join(off),
+        )
+
+
 def _configure_thread_pools() -> None:
     """抬两个默认线程池的上限(不抬就是百人并发下最先生效的全局串行点)。
 
@@ -124,6 +161,7 @@ async def lifespan(app: FastAPI):
 
     _configure_thread_pools()
     _log_dependency_endpoints()
+    _log_capability_summary()
     if init_tracing():
         logger.info("LangSmith tracing active for this gateway process")
     if init_langfuse():

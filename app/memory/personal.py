@@ -6,11 +6,13 @@
              ├── Session Memory      app/assistant/memory.py (Redis, 本模块不碰)
              ├── User Memory         profile(user_profiles 表) + preference/habit
              ├── Episodic Memory     episode 桶(带时间锚点的经历)
-             ├── Personal Knowledge  knowledge 桶(由情节蒸馏或对话直接沉淀)
+             ├── Personal Knowledge  knowledge 桶(只由显式"记一下"指令写入)
              └── Personal Graph      Neo4j :MemoryUser 锚点 + 实体关系
 
 两个入口对应读/写两条链路: ``build()`` 在 build_context 节点并行拉各桶拼成
-Business Context, ``write()`` 在 persist_memory 节点把一次提取的结果分桶落盘。
+Business Context, ``write()`` 在 persist_memory 节点把一次提取的结果分桶落盘;
+知识桶另有唯一写入口 ``remember_knowledge()`` —— 用户显式说"记一下"这类指令
+才写(同话题同视角更新既有行, 否则新增), 每轮自动提取与情节蒸馏双通道已下线。
 架构图里 Session -> Episodic 那条边由 ``add_session_episode()`` 承担: 会话窗口
 溢出折叠出摘要时, 摘要本身作为一条情节沉淀下来。
 
@@ -28,7 +30,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from app.assistant.prompts import EPISODE_REFLECT_PROMPT, MEMORY_CONSOLIDATE_PROMPT
+from app.assistant.prompts import (
+    MEMORY_CONSOLIDATE_PROMPT,
+    MEMORY_RECORD_MERGE_PROMPT,
+    MEMORY_RECORD_PROMPT,
+)
 from app.config import get_settings
 from app.llm import get_chat_model
 from app.memory import graph_store
@@ -36,7 +42,6 @@ from app.memory.extraction import MemoryExtraction
 from app.memory.profile_store import get_profile_store
 from app.memory.taxonomy import (
     LEGACY_KIND_FACT,
-    SOURCE_REFLECTION,
     SOURCE_SESSION_SUMMARY,
     SOURCE_TURN,
     MemoryBucket,
@@ -48,8 +53,6 @@ from app.memory.vector_store import MemoryHit, get_long_term_store
 
 logger = logging.getLogger(__name__)
 
-# 蒸馏输入最多看最近几条情节: 再多既撑 prompt 也没必要(蒸馏要的是近期规律)。
-_REFLECT_EPISODE_LIMIT = 8
 # 记忆管理页一次拉的每桶条数(情节长得最快, 不做分页只做硬上限)。
 _OVERVIEW_LIMIT = 100
 # 喂给提取器判重的已存偏好/习惯上限: 比召回 Top-K 大得多, 目标是一次看全整桶。
@@ -59,19 +62,38 @@ _CONSOLIDATE_SCAN_LIMIT = 50
 # 读路径的 Graph 邻居展开跳数与实体起点上限。
 _GRAPH_HOPS = 2
 
-_reflector_llm = None
+_record_llm = None
 
 
-def _reflector():
-    """惰性建情节蒸馏专用的 json_mode 模型实例(进程级单例)。"""
-    global _reflector_llm
-    if _reflector_llm is None:
-        _reflector_llm = get_chat_model(get_settings().llm_model, temperature=0, json_mode=True)
-    return _reflector_llm
+def _record_model():
+    """惰性建显式记录链路(提炼/归位判定)共用的 json_mode 模型实例(进程级单例)。"""
+    global _record_llm
+    if _record_llm is None:
+        _record_llm = get_chat_model(get_settings().llm_model, temperature=0, json_mode=True)
+    return _record_llm
 
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat() if value else ""
+
+
+def _same_topic(existing_title: str, topic: str) -> bool:
+    """确定性话题候选: 规范化后全等/互含, 或字符 bigram 重合度达标即算"可能同话题"。
+
+    这一步只做粗筛把候选交给归位 LLM, 不替代它下结论。纯子串太脆: 提炼模型常把
+    同话题的承接句起成新主题词("崇礼滑雪板预订" vs "崇礼滑雪板头盔预订"), 互不含
+    就永远不进候选; bigram 重合度能兜住这类同源主题词。阈值 0.5 偏保守: 中文主题
+    词短, 不同话题("报销审批"/"住宿预订")重合度自然落在阈值下; 空主题不进候选。
+    """
+    a = (existing_title or "").strip().lower()
+    b = (topic or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    grams = lambda s: {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else {s}
+    ga, gb = grams(a), grams(b)
+    return len(ga & gb) / max(1, len(ga | gb)) >= 0.5
 
 
 def _item_dict(hit: MemoryHit) -> dict[str, Any]:
@@ -334,6 +356,25 @@ class PersonalMemoryAgent:
 
     # ------------------------------------------------------------ 写路径
 
+    async def _user_self_aliases(self, user_id: str) -> list[str]:
+        """该用户在图里的自称集合: 工号 + 画像里的姓名。
+
+        图谱锚定判定要回答"这条边是不是连着用户自己", 而模型既可能写"我"也可能
+        直接写姓名(提示词两种都允许); 不折叠就会让同一个人裂成两个中心节点, 而
+        且"朱斌-毕业于-X"这种本该保留的自述边会被当成第三方关系误删。
+        """
+        names = [user_id] if user_id else []
+        try:
+            profile = await get_profile_store().get(user_id)
+            raw = (profile.get("attributes") or {}).get("姓名")
+            for value in raw if isinstance(raw, list) else [raw]:
+                text = str(value.get("value") if isinstance(value, dict) else value).strip()
+                if text and text not in names:
+                    names.append(text)
+        except Exception as exc:  # noqa: BLE001 - 拿不到姓名只是少一个别名, "我"仍然可用
+            logger.debug("读画像姓名失败(按仅\"我\"可用处理): %s", exc)
+        return names
+
     async def write(
         self,
         user_id: str,
@@ -341,10 +382,14 @@ class PersonalMemoryAgent:
         extraction: MemoryExtraction,
         *,
         source: str = SOURCE_TURN,
-    ) -> dict[str, int]:
-        """把一次提取的结果分桶落盘, 返回各桶写入条数(供审计)。"""
+    ) -> dict[str, Any]:
+        """把一次提取的结果分桶落盘, 返回各桶写入条数(供审计)。
+
+        值的类型不齐一: 各桶是条数, ``graph`` 是 ``{nodes, edges, dropped}`` 一个子结
+        构(图侧拦了多少、为何拦要能审计), 所以返回类型是 ``Any`` 而不是 ``int``。
+        """
         settings = get_settings()
-        stats: dict[str, int] = {}
+        stats: dict[str, Any] = {}
         if not user_id or extraction.is_empty or not settings.long_term_memory_enabled:
             return stats
         store = get_long_term_store()
@@ -356,8 +401,12 @@ class PersonalMemoryAgent:
                 )
                 written += 1
             stats[LEGACY_KIND_FACT] = written
-            await graph_store.upsert_entities(
-                user_id, extraction.entities, extraction.relations, source=source
+            stats["graph"] = await graph_store.upsert_entities(
+                user_id,
+                extraction.entities,
+                extraction.relations,
+                source=source,
+                user_aliases=await self._user_self_aliases(user_id),
             )
             return stats
 
@@ -366,6 +415,8 @@ class PersonalMemoryAgent:
         stats["profile_updated"] = int(profile_result.get("updated", 0))
         # 被拦下的历史陈述单独计数: "过去的事只入历史不改当前值"这个行为得可观测。
         stats["profile_superseded"] = int(profile_result.get("superseded", 0))
+        # 知识桶不在这里写: 唯一入口是 remember_knowledge(显式"记一下"指令),
+        # 情节 -> 知识的自动蒸馏也已下线。
         for bucket, items in (
             (MemoryBucket.PREFERENCE, [("", text) for text in extraction.preferences]),
             (MemoryBucket.HABIT, [("", text) for text in extraction.habits]),
@@ -373,15 +424,17 @@ class PersonalMemoryAgent:
                 MemoryBucket.EPISODE,
                 [(episode.title, episode.content, episode.occurred_at) for episode in extraction.episodes],
             ),
-            (MemoryBucket.KNOWLEDGE, [(item.topic, item.content) for item in extraction.knowledge]),
         ):
             stats[bucket.value] = await self._upsert_bucket(
                 store, user_id, session_id, bucket, items, source=source
             )
-        await graph_store.upsert_entities(
-            user_id, extraction.entities, extraction.relations, source=source
+        stats["graph"] = await graph_store.upsert_entities(
+            user_id,
+            extraction.entities,
+            extraction.relations,
+            source=source,
+            user_aliases=await self._user_self_aliases(user_id),
         )
-        stats["reflected"] = await self.reflect(user_id)
         return stats
 
     async def _upsert_bucket(
@@ -444,57 +497,6 @@ class PersonalMemoryAgent:
             logger.warning("会话摘要沉淀为情节失败, 本轮跳过: %s", exc)
             return False
 
-    async def reflect(self, user_id: str, *, force: bool = False) -> int:
-        """情节 -> 个人知识蒸馏: 攒够门槛条数才调一次 LLM, 返回新增知识条数。
-
-        不做门槛就会每轮都拿近期情节再跑一次蒸馏, 既烧 token 又会把同一条经验
-        反复写回(查重相似度不到阈值时就是重复行)。水位线存在画像行上, 画像行不
-        存在时 ``mark_reflected`` 会补一行, 不需要额外的状态表。
-        """
-        settings = get_settings()
-        if not user_id or not settings.long_term_memory_enabled:
-            return 0
-        store = get_long_term_store()
-        profile_store = get_profile_store()
-        try:
-            since = None if force else await profile_store.get_last_reflected_at(user_id)
-            pending = await store.count_since(user_id, MemoryBucket.EPISODE.value, since)
-            if not force and pending < settings.memory_reflect_min_episodes:
-                return 0
-            episodes = await store.list_recent(
-                user_id,
-                [MemoryBucket.EPISODE.value],
-                limit=_REFLECT_EPISODE_LIMIT,
-                order_by="created_at",
-            )
-            if not episodes:
-                await profile_store.mark_reflected(user_id)
-                return 0
-            lines = [
-                f"- {(_iso(hit.occurred_at or hit.created_at) or '')[:10]} {hit.title}: {hit.content}"
-                for hit in episodes
-            ]
-            resp = await _reflector().ainvoke(EPISODE_REFLECT_PROMPT.format(episodes="\n".join(lines)))
-            data = json.loads(str(resp.content))
-            items = data.get("knowledge") if isinstance(data, dict) else None
-            added = await self._upsert_bucket(
-                store,
-                user_id,
-                "",
-                MemoryBucket.KNOWLEDGE,
-                [
-                    (str(entry.get("topic") or "")[:60], str(entry.get("content") or "").strip())
-                    for entry in (items or [])
-                    if isinstance(entry, dict) and str(entry.get("content") or "").strip()
-                ],
-                source=SOURCE_REFLECTION,
-            )
-            await profile_store.mark_reflected(user_id)
-            return added
-        except Exception as exc:  # noqa: BLE001 - 蒸馏失败下次攒够情节再试
-            logger.warning("情节蒸馏失败, 本轮跳过: %s", exc)
-            return 0
-
     async def consolidate_stable_buckets(self, user_id: str) -> int:
         """偏好/习惯桶语义归并: 把存量重复条目合并成更完整的一条, 返回删除条数。
 
@@ -522,7 +524,7 @@ class PersonalMemoryAgent:
         """对一个桶的条目调一次 LLM 分组, 按组归并; 返回删除条数。"""
         by_id = {hit.id: hit for hit in hits}
         numbered = "\n".join(f"{i}. {hit.content}" for i, hit in enumerate(hits, start=1))
-        resp = await _reflector().ainvoke(MEMORY_CONSOLIDATE_PROMPT.format(items=numbered))
+        resp = await _record_model().ainvoke(MEMORY_CONSOLIDATE_PROMPT.format(items=numbered))
         data = json.loads(str(resp.content))
         groups = data.get("groups") if isinstance(data, dict) else None
         merged = 0
@@ -552,10 +554,130 @@ class PersonalMemoryAgent:
         return merged
 
     async def tidy(self, user_id: str) -> dict[str, int]:
-        """手动"整理记忆": 情节蒸馏 + 偏好/习惯归并, 一次把两件事都做了。"""
-        knowledge_added = await self.reflect(user_id, force=True)
+        """手动"整理记忆": 只做偏好/习惯语义归并。
+
+        情节 -> 知识的蒸馏已下线(知识桶只由显式"记一下"写入), 这里不再产生
+        任何新知识条目。
+        """
         merged = await self.consolidate_stable_buckets(user_id)
-        return {"knowledge_added": knowledge_added, "merged": merged}
+        return {"merged": merged}
+
+    # ------------------------------------------------------ 显式知识记录
+
+    async def remember_knowledge(
+        self, user_id: str, session_id: str, message: str, answer: str
+    ) -> dict[str, int]:
+        """显式"记一下"指令的唯一写入口: 提炼 -> 整桶判同话题 -> 落盘。
+
+        同话题且同视角才更新既有行(融合改写 + 重算 embedding), 其余一律新增;
+        全新话题自然无候选, 不送归位 LLM。insert 仍过 ``upsert_memory`` 的 cosine
+        查重, 近乎逐字的重复被免费兑掉。返回 ``{"inserted": a, "updated": b}``,
+        任何失败只 warning 不抛出(与全层降级口径一致)。
+        """
+        stats = {"inserted": 0, "updated": 0}
+        settings = get_settings()
+        if (
+            not user_id
+            or not settings.long_term_memory_enabled
+            or not settings.personal_memory_enabled
+            or not settings.memory_record_enabled
+        ):
+            return stats
+        store = get_long_term_store()
+        try:
+            existing = await store.list_recent(
+                user_id, [MemoryBucket.KNOWLEDGE.value],
+                limit=_DEDUP_CONTEXT_LIMIT, order_by="created_at",
+            )
+            items = await self._record_items(message, answer)
+            for topic, content in items:
+                candidates = [hit for hit in existing if _same_topic(hit.title, topic)]
+                hit, merged_content = (
+                    await self._decide_placement(candidates, topic, content) if candidates else (None, "")
+                )
+                if hit is not None:
+                    merged_content = merged_content or self._fallback_merge(hit.content, content)
+                    try:
+                        if await store.update_memory_content(user_id, hit.id, merged_content, title=topic):
+                            stats["updated"] += 1
+                            # 整桶快照同步: 同轮多条新记录不能都去撞同一条旧行。
+                            hit.content = merged_content
+                            if topic.strip():
+                                hit.title = topic.strip()
+                            continue
+                    except Exception as exc:  # noqa: BLE001 - 更新没落上就退化为新增一条
+                        logger.warning("知识同话题更新失败, 退化为新增: id=%s err=%s", hit.id, exc)
+                await store.upsert_memory(
+                    user_id,
+                    content,
+                    kind=MemoryBucket.KNOWLEDGE.value,
+                    source_session_id=session_id,
+                    title=topic,
+                    source=SOURCE_TURN,
+                )
+                stats["inserted"] += 1
+            return stats
+        except Exception as exc:  # noqa: BLE001 - 记录失败只是这轮没记上, 不阻断对话
+            logger.warning("显式知识记录失败, 本轮跳过: %s", exc)
+            return stats
+
+    async def _record_items(self, message: str, answer: str) -> list[tuple[str, str]]:
+        """一次 LLM 调用把"用户要我记的"提炼成 (topic, content) 列表; 失败返回空。"""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            resp = await _record_model().ainvoke(
+                MEMORY_RECORD_PROMPT.format(message=message, answer=answer, today=today)
+            )
+            data = json.loads(str(resp.content))
+            raw = data.get("items") if isinstance(data, dict) else None
+            return [
+                (str(entry.get("topic") or "")[:60].strip(), str(entry.get("content") or "").strip())
+                for entry in (raw or [])
+                if isinstance(entry, dict) and str(entry.get("content") or "").strip()
+            ]
+        except Exception as exc:  # noqa: BLE001 - 提炼失败即本轮无显式记录
+            logger.warning("显式记录提炼失败, 本轮跳过: %s", exc)
+            return []
+
+    async def _decide_placement(
+        self, candidates: list[MemoryHit], topic: str, content: str
+    ) -> tuple[MemoryHit | None, str]:
+        """话题候选送归位 LLM 判 update/insert; 一次调用同时拿融合文本。
+
+        只在明确 update 且编号有效时返回 (候选行, 融合后 content); 其余一律
+        (None, "") 走新增 —— 判不了就新增, 宁可多一条不可错改既有知识。
+        """
+        numbered = "\n".join(
+            f"{i}. {hit.title or '(无主题)'}: {hit.content}" for i, hit in enumerate(candidates, start=1)
+        )
+        try:
+            resp = await _record_model().ainvoke(
+                MEMORY_RECORD_MERGE_PROMPT.format(
+                    existing=numbered, topic=topic or "(无主题)", content=content
+                )
+            )
+            data = json.loads(str(resp.content))
+            if not isinstance(data, dict) or str(data.get("action") or "") != "update":
+                return None, ""
+            idx = data.get("id")
+            if not isinstance(idx, int) or not 1 <= idx <= len(candidates):
+                return None, ""
+            # 模型没给融合文本(或长到异常, 防它把整桶拄进来)时退回确定性拼接。
+            merged = str(data.get("content") or "").strip()
+            hit = candidates[idx - 1]
+            if not merged or len(merged) > max(len(hit.content), len(content)) * 3:
+                merged = self._fallback_merge(hit.content, content)
+            return hit, merged
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("知识归位判定失败, 按新增处理: %s", exc)
+            return None, ""
+
+    @staticmethod
+    def _fallback_merge(old_content: str, new_content: str) -> str:
+        """融合兑底: 新陈述已被旧文本涵盖就原样保留, 否则分号拼接, 信息不丢。"""
+        if new_content in old_content:
+            return old_content
+        return f"{old_content}; {new_content}"
 
     # ------------------------------------------------------------ 管理视图
 

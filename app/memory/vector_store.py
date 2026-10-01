@@ -378,6 +378,35 @@ class LongTermMemoryStore:
             await session.commit()
         return int(result.rowcount or 0)
 
+    async def update_memory_content(
+        self, user_id: str, memory_id: int, content: str, title: str = ""
+    ) -> bool:
+        """原地刷新一条记忆: 换文本、重算 embedding, 返回是否命中该行。
+
+        显式"记一下"的同话题更新走这里 —— 文本变了不重算向量, 后续查重/召回
+        会对新文本失准(与 ``merge_group`` 保留行同一口径)。限定 ``user_id``
+        防越权改别人的行; ``title`` 非空才覆盖(本轮没给主题就留原主题)。
+        """
+        memory_id = int(memory_id)
+        if not user_id or not memory_id or not content.strip():
+            return False
+        vec = await self.embedder.embed_query(content)
+        values: dict[str, object] = {
+            "content": content.strip(),
+            "embedding": list(vec),
+            "last_accessed_at": datetime.now(timezone.utc),
+        }
+        if title.strip():
+            values["title"] = title.strip()[:60]
+        async with self._sessions()() as session:
+            result = await session.execute(
+                update(LongTermMemoryRow)
+                .where(LongTermMemoryRow.user_id == user_id, LongTermMemoryRow.id == memory_id)
+                .values(**values)
+            )
+            await session.commit()
+        return int(result.rowcount or 0) > 0
+
     async def clear_bucket(self, user_id: str, kind: str) -> int:
         """清空某用户某个桶, 返回删除条数。"""
         if not user_id or not kind:

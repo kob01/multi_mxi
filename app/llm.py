@@ -127,6 +127,11 @@ def get_chat_model(
         "model": name,
         "base_url": settings.ollama_base_url,
         "temperature": temperature,
+        # 回退分支同样必须有墙钟上限: 上面的在线分支写了"没有 timeout 时一个挂住的
+        # 供应商会永久占住一个并发闸门", 本地模型长时间不返回(冷加载大模型、显存换入)
+        # 就是同一个故障, 不能因为"是本机的"就例外。ChatOllama 没有 max_retries
+        # 参数, 重试交给 httpx 默认; timeout 走 client_kwargs 直达 httpx 客户端。
+        "client_kwargs": {"timeout": settings.ollama_request_timeout},
     }
     if json_mode:
         ollama_kwargs["format"] = "json"

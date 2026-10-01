@@ -92,7 +92,7 @@ RISKY_TERMS: list[tuple[str, tuple[str, ...], str]] = [
     (
         "自动续约未设退出条件",
         ("自动续约", "自动续期", "顺延"),
-        "含自动续约但未同时约定提前通知退出的时限",
+        "含自动续约但未同时约定提前通知退出的时限(已约定则降为 info)",
     ),
     (
         "先开票后付款且无付款保障",
@@ -119,12 +119,22 @@ MINE_RED_LINES: list[tuple[str, tuple[str, ...], str]] = [
     ("管辖地约定在对方所在地", ("乙方所在地仲裁", "乙方所在地法院"), "争议解决地不利于我方应诉"),
 ]
 
+# "自动续约"只在**没同时约定退出通道**时才算红线: 合同里写了"提前 60 日书面通知可
+# 不续约"就不是风险项。原先只要命中"自动续约/自动续期/顺延"就出 critical, 而"顺延"
+# 在期限条款里极常见, 与模块开头"宁给 warning 不误报 critical"的口径相反。
+# 只要求"提前 N 日/天/个月 + 通知"同句共现(或"通知…不续约"这种反向表述)。
+_AUTO_RENEWAL_EXIT_RE = re.compile(
+    r"提前\s*\d+\s*(?:个?工作日|日|天|个月)[^。;\n]{0,24}(?:通知|告知|书面)"
+    r"|(?:通知|告知)[^。;\n]{0,24}(?:不续约|不再续约|不再续期|终止续期)"
+)
+
 # 法务要求的"必须走人工"底线: 命中即升级 risk_level 到 高, 并在结论里点名。
+# 注意: **金额型升级不在本表里**, 它必须按数值判(`_hit` 遍历空元组恒返回 None,
+# 原先挂在那里的 ("金额重大", ()) 因此从未生效过), 见 precheck_contract 的第6段。
 LEGAL_ESCALATION: list[tuple[str, tuple[str, ...]]] = [
     ("涉及个人信息处理", ("个人信息", "人脸", "生物识别", "用户数据")),
     ("涉及关联交易或利益冲突", ("关联交易", "关联方")),
     ("涉外主体或境外支付", ("境外", "跨境", "美元", "USD", "新加坡公司")),
-    ("金额重大", ()),  # 由 amount 判定, 关键词留空
 ]
 
 SINGLE_SIGN_LIMIT = Decimal("50000")   # 超此金额必须走集体决策/招标
@@ -251,8 +261,21 @@ def precheck_contract(
     # --- 3. 高风险表述 ---
     for item, keywords, why in RISKY_TERMS:
         kw = _hit(text, keywords)
-        if kw:
-            findings.append(Finding(item, "critical", f"命中表述「{kw}」: {why}", "修订该条款或删除该表述"))
+        if not kw:
+            continue
+        if item == "自动续约未设退出条件":
+            # 写了退出时限就不再是红线(降为 info 提醒复核期限), 没写才 critical。
+            if _AUTO_RENEWAL_EXIT_RE.search(text):
+                findings.append(Finding(
+                    item, "info", f"命中表述「{kw}」, 但已约定提前通知退出的通道", "复核通知期限是否足够(制度建议 ≥ 30 日)"
+                ))
+                continue
+            findings.append(Finding(
+                item, "critical", f"命中表述「{kw}」: {why}",
+                "补充「提前 N 日书面通知可不续约」条款, 或删除自动续约"
+            ))
+            continue
+        findings.append(Finding(item, "critical", f"命中表述「{kw}」: {why}", "修订该条款或删除该表述"))
     for item, keywords, why in MINE_RED_LINES:
         kw = _hit(text, keywords)
         if kw:
@@ -315,11 +338,14 @@ def precheck_contract(
                 ))
 
     # --- 6. 金额分级与法务升级 ---
-    if amt > SINGLE_SIGN_LIMIT:
+    # 金额型升级按数值判: 达/超单笔审批权限就是"必须走人工"的制度底线, 必须是
+    # critical(风险等级到"高"), 不能停在"有条件通过"的 warning —— 这正是原先
+    # LEGAL_ESCALATION 里 ("金额重大", ()) 那条永不相中的死代码应该做的事。
+    if amt >= SINGLE_SIGN_LIMIT:
         findings.append(Finding(
-            "超单笔审批权限", "warning",
-            f"金额 {amt:,.2f} 元 > {SINGLE_SIGN_LIMIT:,.0f} 元",
-            "需走集体决策/招标并附比价记录, 不能由单人口头确认",
+            "金额重大需人工升级", "critical",
+            f"金额 {amt:,.2f} 元 达/超单笔审批权限 {SINGLE_SIGN_LIMIT:,.0f} 元",
+            "走集体决策/招标并附比价记录, 初审不替代最终审批",
         ))
     for item, keywords in LEGAL_ESCALATION:
         kw = _hit(f"{title}\n{text}", keywords)
@@ -396,9 +422,10 @@ def precheck_purchase_order(
             "人工确认预算口径后再提交",
         ))
 
-    if amt > SINGLE_SIGN_LIMIT:
+    if amt >= SINGLE_SIGN_LIMIT:
+        # 与合同侧同一口径: 达/超单笔上限是"必须人工"的底线, 风险等级要到"高"。
         findings.append(Finding(
-            "需集体决策", "warning", f"金额 {amt:,.2f} 元 > {SINGLE_SIGN_LIMIT:,.0f} 元",
+            "需集体决策", "critical", f"金额 {amt:,.2f} 元 达/超 {SINGLE_SIGN_LIMIT:,.0f} 元",
             "附三方比价表与选商说明, 提交采购委员会",
         ))
 
