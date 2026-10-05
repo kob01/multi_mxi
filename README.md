@@ -9,7 +9,7 @@ MCP 工具调用、A2A 专业智能体委派。
 ```
                 ┌──────────────────────── Web / API ─────────────────────────┐
                 │                      Assistant (统一入口)                   │
-                │  FastAPI + LangGraph 编排: 消解/拆分 → 意图三层漏斗 → 分层路由    │
+                │  FastAPI + LangGraph 编排: 消解 → 意图三层漏斗 → 分层路由/并发委派  │
                 └───┬───────────────┬───────────────────┬────────────────────┘
                     │               │                   │
             a. 简单查询      b. 复杂操作(MCP)      c. 专业任务(A2A)
@@ -71,13 +71,16 @@ resolve_time ──────────── 问题含相对时间时预取
 rewrite_query ─────────── 多轮指代消解: 把"那它的劣势呢"改写为独立查询
   │                        (首轮/无历史/自包含长问题跳过; 输出清洗+校验,
   │                        LLM 失败或结果不可信时回退原话)
-  ▼
-plan_tasks ────────────── 复合问法拆分(可选分支): 只拆问题不出意图,
-  │                        拆出的子问题逐条走下面的意图漏斗; 短于阈值或无
-  │                        并列标记直接跳过(MULTI_TASK_ENABLED=false 即整体回退单意图)
+  │
+  ├─(调用方显式点选智能体) ► multi_agent_execute ── 同一个(已消解的)问题并发下发给
+  │                        点选的每个 A2A 专业智能体(hr/finance/analytics/procurement),
+  │                        并发上限 Semaphore + 逐位超时 + 异常隔离, 一个智能体挂了只
+  │                        降级它自己那一节; 程序化拼成"一节一个智能体"的 Markdown
+  │                        (不再过 LLM); 本轮不走意图漏斗(MULTI_AGENT_ENABLED=false
+  │                        即忽略点选, 回到下面的单意图分派)
   ▼
 classify_intent ───────── 三层漏斗(规则快筛 → bge-m3 语义 → deepseek 兜底,
-  │                        终端关键词保底; 多任务轮逐条子问题各跑一次)
+  │                        终端关键词保底)
   │
   ├── knowledge_qa ──► kb_retrieve ──► judge ──┬─ 有相关块 ──► kb_generate
   │                     ▲                └─ 空集且预算内 ─► kb_requery(换写法重检)
@@ -87,11 +90,8 @@ classify_intent ───────── 三层漏斗(规则快筛 → bge-m3
   │                       │                角色×工具白名单过滤) + 进程内能力域:
   │                       │                web=联网检索/抓取, docgen=生成 Word/Excel/PPT/PDF/MD/图片
   │                       │                (纯进程内 tool, 无容器/端口)
-  ├── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
-  │                       │                作为当前请求, metadata 传身份)
-  └── (多个子任务) ──► multi_execute ─── 只读子任务(knowledge_qa / web / docgen)并发,
-                          │                业务域 tool_call 与 agent_delegate 串行尾随
-                        merge_results ── 程序化拼成"一节一件事"的 Markdown(不再过 LLM)
+  └── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
+                          │                作为当前请求, metadata 传身份)
                           ▼
                     persist_memory ────── 脱敏后写会话记忆 + 一次 LLM 提取,
                           │                分桶沉淀为个人记忆(溢出摘要另存情节)
@@ -111,8 +111,10 @@ classify_intent ───────── 三层漏斗(规则快筛 → bge-m3
   LLM** 直接给出拒答文案(不给参考来源),避免把噪声写成事实;
 - 出口还有第二道**发布态门禁**(`docs_not_ready`):`status != ready` 或未注册元数据的
   文档视同无权,防"正在入库的半篇文档"被检索到;
-- 多任务分支只并发**只读通道**(知识库 / web / docgen 能力域);业务域 `tool_call` 与
-  `agent_delegate` 可能被 ReAct 选到写操作工具,一律串行尾随;
+- **多智能体并发委派靠显式点选触发**(`agent_targets`),系统不推断"该问谁": 复合问法的
+  LLM 自动拆分已下线(想拆准要靠不断加提示词, 收益与成本不成比例); 一个委派是一整轮
+  ReAct, 比一次检索贵得多, 所以并发上限默认只放 2, 逐位超时与异常隔离一个智能体;
+  权限不够/域键非法/超出可点选上限都只降级那一节并明写原因, 不静默吞掉用户的点选;
 - 身份与用户请求文本分离:工具调用经 System 消息、A2A 经协议级 metadata
   下发操作者身份,并显式区分"当前操作者"与"任务目标用户";
 - 每个节点均写审计记录,同一 `trace_id` 串联全链路。
@@ -184,12 +186,13 @@ RAG:  Query → Embedding
 
 | 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                       |
 | ------------------------------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/拆分/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)     |
+| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)     |
 | Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名;文档重入库时 `refresh_knowledge()` 调 `invalidate_all()`(SCAN 而非 KEYS)     |
 | Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入 |
 
 两个刻意保留的"不优化":流式闲聊不读 Prompt Cache(命中的重放没有思考过程, 收益小于
-体验损失);多任务合并不再过一次 LLM(各节已是事实, 再过一次只会引入改写与编造风险)。
+体验损失);多智能体分节合并不再过一次 LLM(各节已是智能体产出的事实, 再过一次只会
+引入改写与编造风险)。
 
 ### 个人级记忆的双时态(会随时间波动的属性)
 
@@ -249,15 +252,14 @@ mxi/
 │   ├── schemas.py                # 共享数据模型(意图/角色/知识块)
 │   ├── main.py                   # FastAPI 网关入口(有 web/dist 才托管 SPA, 否则提示走 vite dev)
 │   ├── assistant/                # ★ Assistant 调度核心
-│   │   ├── graph.py              #   LangGraph 编排:消解→拆分→三层意图→分层路由→记忆
+│   │   ├── graph.py              #   LangGraph 编排:消解→三层意图→分层路由(可点选多智能体并发)→记忆
 │   │   ├── intent.py             #   意图三层漏斗(规则 → bge-m3 语义 → LLM → 关键词保底)
-│   │   ├── planner.py            #   复合问法拆分(只拆问题不出意图)
 │   │   ├── memory.py             #   短期窗口 + LLM 摘要长期记忆
 │   │   ├── stream.py             #   SSE 事件缓冲区(RunBuffer/StreamHub, 断点重放)
 │   │   ├── mcp_client.py         #   MCP Client(langchain-mcp-adapters)
 │   │   ├── a2a_client.py         #   A2A Client(Agent Card 发现/message.send)
-│   │   ├── prompts.py            #   五类路由/改写/拆分/提取 Prompt
-│   │   └── router.py             #   /api/chat 与 /api/chat/stream 统一入口
+│   │   ├── prompts.py            #   四类路由/改写/记忆提取 Prompt
+│   │   └── router.py             #   /api/chat 与 /api/chat/stream 统一入口(含 /api/agents 点选清单)
 │   ├── memory/                   # ★ 个人级记忆层(按 user_id 隔离)
 │   │   ├── taxonomy.py           #   分桶语义单一事实源(kind/注入方式/标签)
 │   │   ├── temporal.py           #   双时态口径单一事实源(生效轴/录入轴/历史判定)

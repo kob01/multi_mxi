@@ -99,7 +99,7 @@ _CAPABILITY_FLAGS: tuple[tuple[str, str], ...] = (
     ("doc_kg_enabled", "文档知识图谱"),
     ("cache_enabled", "三类缓存"),
     ("mongo_enabled", "正文外置存储(父块上下文)"),
-    ("multi_task_enabled", "复合问法多任务拆分"),
+    ("multi_agent_enabled", "多智能体并发委派"),
     ("checkpoint_enabled", "LangGraph Checkpointer"),
 )
 

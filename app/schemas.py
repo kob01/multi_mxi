@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Role(str, Enum):
@@ -62,6 +62,28 @@ class ChatRequest(BaseModel):
         default=None,
         description="本轮是否开启深度思考; None 时取全局默认 LLM_THINKING_ENABLED。",
     )
+    agent_targets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "显式指定本轮要并发委派的专业智能体业务域(hr/finance/analytics/procurement)。"
+            "非空时本轮不走意图漏斗, 直接把同一个问题下发给这些智能体并分节合并。"
+        ),
+    )
+
+    @field_validator("agent_targets")
+    @classmethod
+    def _normalize_agent_targets(cls, v: list[str]) -> list[str]:
+        """清洗到可比较的形状: 去空白/转小写/去重且保序(前端多选顺序就是分节顺序)。
+
+        只洗形状, 不在这里判域是否合法也不判权限: 合法域集在 a2a_client, 角色白名单在
+        security/auth —— 都靠编排层单一事实源处理, 避免入参模型反过来依赖那两个模块。
+        """
+        out: list[str] = []
+        for item in v:
+            domain = str(item or "").strip().lower()
+            if domain and domain not in out:
+                out.append(domain)
+        return out
 
 
 class ChatResponse(BaseModel):
@@ -70,9 +92,9 @@ class ChatResponse(BaseModel):
     session_id: str
     answer: str
     intent: IntentType
-    # multi_task: 本轮是复合问法拆出的多件子任务(见 graph.merge_results), 此时
-    # metadata.subtasks 携带逐项路由与成败, answer 是"一节一件事"的拼接正文。
-    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct", "multi_task"]
+    # multi_agent: 本轮是用户显式点选多个专业智能体的并发委派(见 graph.multi_agent_execute),
+    # 此时 metadata.agents 携带逐个智能体的成败与耗时, answer 是"一节一个智能体"的拼接正文。
+    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct", "multi_agent"]
     target: Optional[str] = None
     trace_id: str
     # 会话记录落库后的助手消息 id(供前端历史对齐; DB 降级时为 None)

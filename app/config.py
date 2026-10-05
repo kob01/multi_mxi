@@ -134,28 +134,25 @@ class Settings(BaseSettings):
     # 最优意图需领先次优意图的最小差距, 防止边界样本在两类间摇摆。
     intent_margin: float = 0.05
 
-    # ---------- 多任务并行(复合问法拆分) ----------
-    # 一句话问多件事("查我年假还剩几天, 明天北京天气咋样")时, 单个 intent 必然丢一半。
-    # 链路: rewrite -> plan_tasks(LLM 只拆问题) -> 各子问题各跑一次上面的三层漏斗
-    # -> 只读类子任务并发执行, 办理/写操作类串行尾随 -> 分节合并。
-    # 总开关: 关闭即完全回退"一句一个意图一条路由"的旧行为。
-    multi_task_enabled: bool = True
-    # 短于该字数的消息不触发拆分: 寒暄与单一指令不可能是复合诉求, 省一次 LLM 调用。
-    multi_task_min_chars: int = 8
-    # 拆分上限, 超出部分不执行(回答里说明未处理项), 防止一句话拆出十个分支打爆下游。
-    multi_task_max_subtasks: int = 3
-    # 并发上限: 并行集只放只读通道(知识库检索 / web / docgen 进程内工具), 仍设上限
-    # 以免一次问十件事时同时压满 embedding/ES/联网检索三条下游。
-    multi_task_parallelism: int = 3
-    # 单子任务超时秒数: 超时只把该节降级为"未完成", 不整轮报错(部分成功优于整轮失败)。
-    multi_task_subtask_timeout: float = 45.0
-    # Layer3 校验器"同工具同实体无依赖自动合并"开关: 关掉则只保留解析/环检测/截断,
-    # 不再把 LLM 误拆的近重复子任务收敛回单任务(用于排查合并是否误伤真实并列)。
-    multi_task_merge_enabled: bool = True
-    # 合并判定用的 goal 归一化核心重叠阈值(Dice 系数, 0~1): 越高越保守, 只有近乎
-    # 同实体同问法才合并。默认 0.75 可把"升旗是哪天/升旗时间几点"收敛, 又不吞掉
-    # "查年假/查社保"这类同工具不同实体。
-    multi_task_core_overlap_threshold: float = 0.75
+    # ---------- 多智能体并发委派(用户显式点选) ----------
+    # 复合问法自动拆分已下线(提示词口径难控), 改为调用方在 ChatRequest.agent_targets 里
+    # 显式指定要并发委派的智能体域: 同一个问题下发给 N 个 A2A 专业智能体, 程序化拼成
+    # "一节一个智能体"的 Markdown。哪些智能体参与由用户决定, 系统不做任何推断。
+    # 总开关: 关闭即忽略 agent_targets, 回到"一句一个意图一条路由"。
+    multi_agent_enabled: bool = True
+    # 单次请求可点选的智能体上限, 超出部分不执行(正文末尾说明未处理项), 挡住
+    # "一次选十个"把四个下游 ReAct 循环全打满。
+    multi_agent_max_targets: int = 3
+    # 并发上限: 一个委派是一整轮 ReAct(多轮 LLM + 多次工具调用), 比一次检索贵得多,
+    # 默认只同时对两个智能体; 抬高前先确认各智能体进程与其 MCP 下游扛得住。
+    multi_agent_parallelism: int = 2
+    # 单智能体超时秒数: 超时只把那一节降级为"未完成", 不整轮报错(部分成功优于整轮失败)。
+    # 取 150 > a2a_timeout(120): 让 send_guarded 那道内层超时先触发, 它回的降级文案比
+    # 外层 TimeoutError 对用户更可读; 外层只做"内层也拦不住"兼顶。
+    multi_agent_timeout: float = 150.0
+    # 单个智能体答复进分节正文的截断长度: 并发 N 份长文本会把回答长度乘以 N,
+    # 超上限部分截掉并给出提示(需要全文时改为只点选一个智能体)。
+    multi_agent_answer_chars: int = 4000
 
     # 统一下沉到线程池的并发上限(同时受两个池约束, 见 app/main.py::_configure_thread_pools)。
     # 为何要显式抬: ``asyncio.to_thread`` 用事件循环默认线程池(上限

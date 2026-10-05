@@ -38,70 +38,34 @@ const ROUTE_LABELS = {
   mcp_tool: 'MCP工具',
   a2a_agent: '专业智能体',
   direct: '直答',
-  multi_task: '多任务并行',
+  multi_agent: '多智能体协作',
 }
 const ROUTE_TAG_TYPES = {
   assistant_kb: 'success',
   mcp_tool: 'warning',
   a2a_agent: 'primary',
   direct: 'info',
-  multi_task: 'primary',
+  multi_agent: 'primary',
 }
 
-// ---------- 多任务逐项进度的解析 ----------
-// 后端 subtask 阶段事件文本形状: ``[i/n] 子问题 → 路由标签…`` 开头,
-// ``... → 路由标签已完成/未完成/待确认…`` 结尾; planning 阶段给总件数。
-// "待确认…"(写操作降级)必须排在裸"…"前, 否则会被裸省略号抢先匹配成 running。
-const SUBTASK_RE = /^\[(\d+)\/(\d+)\]\s*(.+?)\s*→\s*(.+?)(已完成|未完成|待确认…|…)$/
-const SUBTASK_STATE_ICONS = { waiting: '○', running: '◐', done: '✔', failed: '✖', deferred: '⊘' }
+// ---------- 多智能体并发委派(显式点选) ----------
+// 可委派清单由后端 /api/agents 按角色白名单给出(不在前端硬编智能体名字);
+// 点选后本轮不走意图分类, 同一个问题并发下发给这些智能体(契约见
+// app/schemas.ChatRequest.agent_targets 与 graph.multi_agent_execute)。
+// 权限靠后端委派时再拦一道, 这里只决定“菜单上摆哪几项”。
+const agents = ref([])
+const selectedAgents = ref([])
 
-function subtaskLabel(route, target) {
-  const base = ROUTE_LABELS[route] || route || ''
-  return target && (route === 'mcp_tool' || route === 'a2a_agent') ? `${base}·${target}` : base
-}
-
-// 子任务清单只是进度的第二双眼睛(正文已含分节结果), 解不了就退回单行 status 文本。
-function trackSubTasks(msg, ev) {
-  if (ev.stage === 'planning') {
-    const m = /识别到 (\d+) 件事/.exec(ev.text || '')
-    if (m && !(msg.subTasks && msg.subTasks.length)) {
-      msg.subTasks = Array.from({ length: Number(m[1]) }, (_, i) => ({
-        index: i + 1, query: '', label: '', state: 'waiting',
-      }))
-    }
-    return
+async function loadAgents() {
+  try {
+    const resp = await fetch(`/api/agents?role=${encodeURIComponent(current.role)}`)
+    agents.value = resp.ok ? await resp.json() : []
+  } catch {
+    agents.value = []
   }
-  if (ev.stage !== 'subtask') return
-  const m = SUBTASK_RE.exec(ev.text || '')
-  if (!m) return
-  if (!msg.subTasks) msg.subTasks = []
-  const idx = Number(m[1]) - 1
-  if (!msg.subTasks[idx]) {
-    msg.subTasks[idx] = { index: idx + 1, query: '', label: '', state: 'waiting' }
-  }
-  msg.subTasks[idx] = {
-    index: idx + 1,
-    query: m[2] || msg.subTasks[idx].query,
-    label: m[3] || msg.subTasks[idx].label,
-    state: m[4] === '已完成' ? 'done' : m[4] === '未完成' ? 'failed' : m[4] === '待确认…' ? 'deferred' : 'running',
-  }
-}
-
-// result 事件里的 metadata.subtasks 是成败的单一事实源, 用它覆盖 SSE 期间推进的状态。
-function applySubTaskResults(msg, ev) {
-  const list = (ev.metadata && ev.metadata.subtasks) || []
-  if (ev.route !== 'multi_task' || !list.length) {
-    if (ev.route !== 'multi_task') msg.subTasks = []
-    return
-  }
-  msg.subTasks = list.map((s) => ({
-    index: Number(s.index || 0) + 1,
-    query: s.query || '',
-    label: subtaskLabel(s.route, s.target),
-    // status=deferred 是写操作待确认(未自动执行), 既非成功也非失败, 单独标灰黄。
-    state: s.status === 'deferred' ? 'deferred' : s.ok ? 'done' : 'failed',
-    error: s.error || '',
-  }))
+  // 换员工/换角色后原本点选的可能已无权, 只保留仍然可选的项
+  const allowed = new Set(agents.value.map((a) => a.domain))
+  selectedAgents.value = selectedAgents.value.filter((d) => allowed.has(d))
 }
 
 const senderRef = ref()
@@ -190,19 +154,6 @@ function makeAiPending() {
     status: '',
     thinking: '',
     thinkingOpen: true,
-    subTasks: [],
-    headerTag: { text: '马小i', type: 'info' },
-  })
-}
-
-function pushWelcome() {
-  pushMessage({
-    role: 'ai',
-    placement: 'start',
-    variant: 'filled',
-    shape: 'corner',
-    content:
-      '你好，我是企业智能助手马小i。可以问我制度政策（如"年假有几天"），也可以直接说"我要报销""帮我开在职证明"；管理角色还能让我"生成本周经营周报""帮我审一下这份合同"。说"把这份数据导出成 Word/Excel/PDF"，我会生成可下载的文件。',
     headerTag: { text: '马小i', type: 'info' },
   })
 }
@@ -270,7 +221,6 @@ function handleEvent(ev, msg) {
       break
     case 'status':
       msg.status = ev.text || ''
-      trackSubTasks(msg, ev)
       break
     case 'think':
       msg.loading = false
@@ -287,7 +237,6 @@ function handleEvent(ev, msg) {
       msg.status = ''
       if (!msg.content) msg.content = ev.answer || '' // 降级路径: 一次性全文补渲染
       if (ev.thinking_text && !msg.thinking) msg.thinking = ev.thinking_text
-      applySubTaskResults(msg, ev)
       applyRouteTag(msg, ev)
       break
     case 'error':
@@ -355,7 +304,6 @@ function historyToMessage(m) {
         content: m.content,
         thinking: m.thinking || '',
         thinkingOpen: false,
-        subTasks: [],
         headerTag: { text: '马小i', type: 'info' },
       }
   if (m.role !== 'user') {
@@ -381,8 +329,6 @@ async function renderSession(id) {
   const history = await loadHistory(id)
   if (history.length) {
     history.forEach((m) => pushMessage(historyToMessage(m)))
-  } else {
-    pushWelcome()
   }
   nextTick(() => listRef.value?.scrollToBottom(true))
 }
@@ -418,6 +364,7 @@ async function resumeIfNeeded() {
 
 onMounted(async () => {
   await loadSessions()
+  await loadAgents()
   await renderSession(sessionId.value)
   await resumeIfNeeded()
 })
@@ -427,6 +374,7 @@ watch(
   () => current.empId,
   async () => {
     await loadSessions()
+    await loadAgents()
     const owns = sessions.value.some((s) => s.session_id === sessionId.value)
     if (!owns && sessions.value.length) {
       sessionId.value = sessions.value[0].session_id
@@ -460,6 +408,8 @@ async function sendText(text) {
     department: current.department,
     message: text,
     thinking: thinkingOn.value,
+    // 点选了智能体就开本轮的并发委派; 没点选则是原来的单意图路由
+    agent_targets: selectedAgents.value.slice(),
   }, msg)
 }
 
@@ -509,17 +459,6 @@ const currentSessionId = computed(() => sessionId.value)
               </div>
               <div v-show="item.thinkingOpen" class="thinking-body">{{ item.thinking }}</div>
             </div>
-            <!-- 多任务并行: 逐项进度清单(后端 status 事件推进, result 事件定稿) -->
-            <div v-if="item.subTasks && item.subTasks.length" class="subtask-list">
-              <div v-for="t in item.subTasks" :key="t.index" class="subtask-item">
-                <span class="subtask-state" :class="'st-' + t.state">
-                  {{ SUBTASK_STATE_ICONS[t.state] || '○' }}
-                </span>
-                <span class="subtask-query">{{ t.query || '第 ' + t.index + ' 项' }}</span>
-                <span v-if="t.label" class="subtask-label">{{ t.label }}</span>
-                <span v-if="t.error" class="subtask-error">{{ t.error }}</span>
-              </div>
-            </div>
             <div v-if="item.status" class="status-line">{{ item.status }}</div>
             <div v-if="item.cites && item.cites.length" class="cites">
               📎 参考来源：{{ item.cites.join(' ; ') }}
@@ -530,11 +469,28 @@ const currentSessionId = computed(() => sessionId.value)
         <div class="sender-wrap">
           <div class="sender-toolbar">
             <el-switch v-model="thinkingOn" size="small" active-text="深度思考" />
+            <!-- 多智能体并发委派: 点选后本轮同一个问题并发下发给这些智能体 -->
+            <el-select
+              v-model="selectedAgents"
+              class="agent-select"
+              size="small"
+              multiple
+              collapse-tags
+              collapse-tags-tooltip
+              clearable
+              placeholder="点选专业智能体并发办理（可多选）"
+              :disabled="sending || !agents.length"
+            >
+              <el-option v-for="a in agents" :key="a.domain" :value="a.domain" :label="a.name">
+                <span class="agent-opt-name">{{ a.name }}</span>
+                <span class="agent-blurb">{{ a.description }}</span>
+              </el-option>
+            </el-select>
           </div>
           <XSender ref="senderRef" placeholder="请输入消息，回车发送…" :loading="sending" clearable @submit="handleSubmit" />
         </div>
       </div>
-      <div class="hint">Assistant 统一入口 · SSE 流式输出支持刷新断点续传</div>
+      <div class="hint">Assistant 统一入口 · SSE 流式输出支持刷新断点续传 · 需要多个专业智能体同时办理时在下方点选它们</div>
     </div>
   </div>
 </template>
@@ -684,59 +640,17 @@ const currentSessionId = computed(() => sessionId.value)
   margin-top: 6px;
 }
 
-.subtask-list {
-  margin-top: 6px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  background: #f7f9fc;
+.agent-select {
+  width: 300px;
+}
+
+.agent-opt-name {
+  margin-right: 8px;
+}
+
+.agent-blurb {
   font-size: 12px;
-  line-height: 1.7;
-  color: #5b6479;
-}
-
-.subtask-item {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.subtask-state {
-  width: 14px;
-  flex-shrink: 0;
-}
-
-.st-done {
-  color: #67c23a;
-}
-
-.st-failed {
-  color: #f56c6c;
-}
-
-.st-running {
-  color: #409eff;
-}
-
-.st-deferred {
-  color: #e6a23c;
-}
-
-.subtask-query {
-  color: #303133;
-}
-
-.subtask-label {
-  padding: 0 6px;
-  border-radius: 6px;
-  background: #eef1f6;
-  color: #8892a6;
-  font-size: 11px;
-}
-
-.subtask-error {
-  color: #f56c6c;
-  font-size: 11px;
+  color: #98a0b3;
 }
 
 .cites {

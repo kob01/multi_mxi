@@ -1,7 +1,7 @@
 """Assistant orchestration graph (LangGraph).
 
 Routing policy (single-entry multi-agent):
-    user -> [build_context] -> [resolve_time] -> [rewrite_query] -> [plan_tasks]
+    user -> [build_context] -> [resolve_time] -> [rewrite_query]
          -> [classify_intent] -> one of:
         knowledge_qa    -> kb_retrieve -> judge -> kb_generate   (confident hits)
                                             |-> kb_requery -> kb_retrieve (no-result retry)
@@ -9,26 +9,25 @@ Routing policy (single-entry multi-agent):
         chitchat        -> chitchat
         tool_call       -> tool_execute   (Assistant -> MCP business tools / 能力域进程内工具)
         agent_delegate  -> agent_delegate (Assistant -> A2A specialist)
-        (多子任务)      -> multi_execute -> merge_results  (并行只读 + 串行尾随 + 分节合并)
+    或(调用方显式点选智能体时) -> multi_agent_execute (同一问题并发委派 N 个智能体 + 分节合并)
     -> [persist_memory] -> END
 
-多任务并行(plan_tasks / multi_execute / merge_results): 一句话问多件事
-("查查我年假还剩几天, 明天北京天气怎么样")在单意图链路上必然丢一半 —— 整句只
-产出一个 IntentResult, 而 hr 与 web 两组种子互相把对方的 margin 压下去, 沉到 LLM
-层后 INTENT_PROMPT 又只允许回答一个 intent/target。四处刻意的设计:
-- 拆分器(app/assistant/planner.py)只拆问题、不出意图: 意图口径的单一事实源留在
-  intent.py 的三层漏斗, 每条子问题各跑一次 classify, 不养第二套会漂移的分类器;
-- 扇出用节点内 asyncio.gather 而非 LangGraph Send: KB 分支自带 retrieve-judge 重检
-  循环、tool 分支是 ReAct 循环, Send 的分支体照样得写成 Python helper, 换不到收益,
-  而 gather 能在一个地方控住并发上限/单任务超时/部分失败隔离与分节顺序;
-- 并行集默认拒: 只有 knowledge_qa 与 target 属于纯只读能力域(web/docgen)的 tool_call
-  进并行集; 业务域 tool_call 由 ReAct 自主选工具、分派前无法保证不调 create_*/
-  submit_*, 与 agent_delegate 一律串行尾随(同"A2A 委派整体不缓存"的口径), 也因此
-  不会并发打同一条 MCP session;
-- 合并不调 LLM 且不逐 token 流式: 各节内容已是工具/检索到的事实, 再过一次 LLM 只会
-  引入改写与编造风险; 两分支 token 流交错会糊在一段文本里, 故整篇按任务顺序下发。
-单任务路径(未拆分/关闭开关)行为与改动前完全一致: 四个单意图路由节点(kb_retrieve/
-tool_execute/agent_delegate/chitchat)只是薄壳, 与并行路径共用同一套 helper 实现。
+多智能体并发委派(multi_agent_execute): 复合问法的 LLM 自动拆分已下线 —— 想拆得准要靠
+不断加提示词, 控住误拆的成本与得到的收益不成比例。改由调用方(ChatRequest.agent_targets,
+前端多选)显式指定本轮要问哪几个专业智能体: 同一个(已消解指代的)问题原样下发给每个智能体,
+并发跑、各自成节、程序化拼接。四处刻意的设计:
+- 触发口径零推断: 只有点选了智能体才走这条路, 未点选与改动前行为完全一致; 这一轮也不再
+  跑意图漏斗(分派给谁已由用户决定, 省一次分类开销);
+- 委派走同一份 helper(:meth:`_delegate_task`): 可信身份 metadata / Agent Card 地址覆盖 /
+  角色闸门 / 审计都与单智能体委派路径同源, 不会漂出第二套委派语义;
+- 并发上限与逐位隔离: Semaphore(multi_agent_parallelism) + 每个智能体 asyncio.wait_for 上限
+  + 异常隔离, 一个智能体挂了/超时/无权/域键不合法都只降级它自己那一节, 不连坐整轮;
+- 合并不调 LLM 且不逐 token 流式: 各节内容已是智能体产出的事实, 再过一次 LLM 只会引入
+  改写与编造风险; N 路 token 流交错会糊在一段文本里, 故整篇按点选顺序一次性下发。
+本轮仍产出一个合成的 IntentResult(AGENT_DELEGATE + 首个智能体 + layer=explicit), 目的是让
+落库/审计/前端路由标签的字段形状与单意图路径一致, 不是为了再养一套分类口径。
+四个单意图路由节点(kb_retrieve/tool_execute/agent_delegate/chitchat)只是薄壳, 与并发分支
+共用同一套 helper 实现。
 
 build_context 是架构图里 "Business Context" 的汇聚点: 并行拉
 Session Memory(Redis) + 个人级记忆各桶(User Memory 的 profile/preference/habit、
@@ -75,11 +74,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.common_tools import lookup_employee_by_name
-from app.assistant.a2a_client import get_a2a_pool
+from app.assistant.a2a_client import AGENT_PROFILES, get_a2a_pool, is_agent_domain
 from app.assistant.intent import IntentRecognizer, needs_current_time
 from app.assistant.mcp_client import get_mcp_pool
 from app.assistant.memory import get_memory_store
-from app.assistant.planner import get_planner
 from app.assistant.prompts import (
     DIRECT_PROMPT,
     KB_ANSWER_PROMPT,
@@ -151,18 +149,6 @@ _CONTEXT_DEPENDENT = re.compile(
     r"(它|他|她|这个|那个|这些|那些|上面说的|刚才说的|前面说|刚才说|呢$|呢[?？])"
 )
 
-# 并行集白名单(默认拒): 只有纯只读的能力域 tool_call 能与 knowledge_qa 并发执行。
-# 业务域(finance/hr/analytics/procurement)的 tool_call 由 ReAct 自主选工具, 分派前无法
-# 保证不调到 create_*/submit_*/cancel_*, 一律串行尾随; agent_delegate 同(语义即办理)。
-_PARALLEL_SAFE_TARGETS = frozenset({"web", "docgen"})
-# 分节标题里的路由可读名(与 web-ui ChatView 的 ROUTE_LABELS 保持同一措辞)。
-_ROUTE_LABELS = {
-    "assistant_kb": "知识库",
-    "mcp_tool": "MCP工具",
-    "a2a_agent": "专业智能体",
-    "direct": "直答",
-}
-
 # 能力域(tool_execute 的进程内工具分支, 计划 D2)的域内提示: 追加进 system_context,
 # 把"怎么交付"钉死 —— web 要带来源 URL; docgen 要先检索后成文(禁编造)并把 download_url 输出为 Markdown 链接。
 CAPABILITY_HINTS: dict[str, str] = {
@@ -215,15 +201,14 @@ class AssistantState(TypedDict):
     intent: IntentResult | None
     rewritten_query: str
     answer: str
-    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct", "multi_task"]
+    route: Literal["assistant_kb", "mcp_tool", "a2a_agent", "direct", "multi_agent"]
     target: str | None
     docs_meta: list[dict[str, Any]]
-    # --- 多任务并行 state (plan_tasks / multi_execute / merge_results) ---
-    # subtasks: [{index, query, intent, target}]; task_results: 同序的
-    # [{index, query, intent, route, target, answer, docs_meta, artifacts, ok, error, elapsed_ms}]
-    subtasks: list[dict[str, Any]]
-    subtask_dropped: int  # 超出 multi_task_max_subtasks 被截断的条数(分节末尾说明未处理项)
-    task_results: list[dict[str, Any]]
+    # --- 多智能体并发委派 state (multi_agent_execute) ---
+    # agent_targets: 调用方显式点选的智能体域(已清洗去重保序); agent_results: 同序的
+    # [{index, domain, agent, route, answer, ok, status, error, elapsed_ms}]
+    agent_targets: list[str]
+    agent_results: list[dict[str, Any]]
     # --- Retrieve-Judge Loop state (knowledge_qa path) ---
     kb_query: str  # query used for the current retrieval attempt
     kb_chunks: list[Any]  # ACL-cleared parent blocks for the current attempt
@@ -247,7 +232,7 @@ class AssistantOrchestrator:
         self._memory = get_memory_store()
         self._audit = get_audit_logger()
         self._retriever: HybridRetriever | None = None
-        # 并发多 run / 多子任务同时首建检索器会各自跑一遍 rebuild_bm25(ES 全量重建),
+        # 并发多 run 同时首建检索器会各自跑一遍 rebuild_bm25(ES 全量重建),
         # 用锁把首建收敛成一次。
         self._retriever_lock: asyncio.Lock | None = None
         # 图不再在 __init__ 里直接编译: Checkpointer 需要 await setup() 建索引,
@@ -415,87 +400,7 @@ class AssistantOrchestrator:
         )
         return {"current_time": current_time}
 
-    async def plan_tasks(self, state: AssistantState) -> dict[str, Any]:
-        """复合问法拆分 + 逐条跑意图漏斗(拆分器本身不出意图)。
-
-        与整句分类同一口径: 每条子问题都走 ``IntentRecognizer.classify``, 因此子任
-        务的 ``layer``/``confidence`` 与单意图路径一样可审计。子问题的分类互不依赖,
-        用 gather 并发跑(漏斗内部已逐层降级, 不会抛出)。
-        """
-        message = state.get("rewritten_query") or state["message"]
-        planner = get_planner()
-        empty = {"subtasks": [], "subtask_dropped": 0}
-        # Layer1 规则门: 只有 ``plan`` 才进 LLM 拆分; ``single``/``skip`` 直接走单意图。
-        if planner.triage(message) != "plan":
-            return empty
-        tasks, dropped = await planner.split(message, state.get("history") or "")
-        if len(tasks) < 2:
-            return empty
-        history = state.get("history", "")
-        try:
-            intents = await asyncio.gather(
-                *(self._intent.classify(t["goal"], history) for t in tasks)
-            )
-        except Exception as exc:  # noqa: BLE001 - 拆不出意图就按单意图走, 不阻断
-            logger.warning("子任务意图分类失败, 本轮退回单意图路由: %s", exc)
-            return empty
-        subtasks = [
-            {
-                "index": i,
-                "id": t.get("id") or f"t{i + 1}",
-                "query": t["goal"],
-                "intent": intent,
-                "target": intent.target,
-                "route": self._subtask_route(intent),
-                "tool_hint": t.get("tool_hint") or "",
-                "readonly": bool(t.get("readonly", True)),
-                "depends_on": list(t.get("depends_on") or []),
-                "deferred": bool(t.get("deferred")),
-            }
-            for i, (t, intent) in enumerate(zip(tasks, intents))
-        ]
-        parallel_count = sum(1 for s in subtasks if self._is_parallel_safe(s["intent"], s))
-        self._audit.log(
-            state.get("trace_id") or "", "assistant", "multi_task_planned",
-            {
-                "count": len(subtasks), "parallel": parallel_count,
-                "serial": len(subtasks) - parallel_count, "dropped": dropped,
-                "tasks": [
-                    {
-                        "index": s["index"], "query": s["query"],
-                        "intent": s["intent"].intent.value,
-                        "target": s["intent"].target,
-                        "layer": s["intent"].layer,
-                        "confidence": s["intent"].confidence,
-                        "tool_hint": s["tool_hint"], "readonly": s["readonly"],
-                        "depends_on": s["depends_on"], "deferred": s["deferred"],
-                    }
-                    for s in subtasks
-                ],
-            },
-            state.get("session_id"),
-        )
-        await self._emit_status(
-            state, "planning",
-            f"识别到 {len(subtasks)} 件事, 其中 {parallel_count} 件可并行处理…",
-        )
-        return {"subtasks": subtasks, "subtask_dropped": dropped}
-
     async def classify_intent(self, state: AssistantState) -> dict[str, Any]:
-        # 多子任务轮: 整句分类没有意义(两个意图本就要各走各的路由), 直接取首条
-        # 子任务的意图作为 primary —— 它仍是 IntentResult, 下游审计/落库字段不变。
-        subtasks = state.get("subtasks") or []
-        if len(subtasks) > 1:
-            primary: IntentResult = subtasks[0]["intent"]
-            await self._emit_status(
-                state, "routed", f"多任务并行: {len(subtasks)} 件事"
-            )
-            self._audit.log(
-                state.get("trace_id") or new_trace_id(), "assistant", "intent_classified",
-                {**primary.model_dump(), "multi_task": True, "count": len(subtasks)},
-                state.get("session_id"),
-            )
-            return {"intent": primary, "target": primary.target}
         # 用改写后的独立问题分类: "那帮我查一下它的余额" 消解为
         # "查一下 XX 的余额" 后才能正确判出 tool_call 而非 knowledge_qa。
         query = state.get("rewritten_query") or state["message"]
@@ -610,9 +515,9 @@ class AssistantOrchestrator:
     ) -> dict[str, Any]:
         """One retrieval pass with rerank thresholding + ACL trim.
 
-        图节点与多任务并行分支共用这一份实现(不会出现两条码路漂移)。query 与
-        attempt 都由参数传入, 因此不读 ``kb_*`` state。返回 ``{chunks, meta_map,
-        acl_blocked, attempt}``。
+        图节点只薄壳地组装与回写 ``kb_*`` state, 真正的检索一次走这一份实现。
+        query 与 attempt 都由参数传入, 因此本 helper 不读 ``kb_*`` state。返回
+        ``{chunks, meta_map, acl_blocked, attempt}``。
 
         The query comes from ``kb_query`` (set by ``rewrite_query`` on the
         first pass, or by ``kb_requery`` on a retry). Retrieval channels and
@@ -725,7 +630,7 @@ class AssistantOrchestrator:
     def _judge(
         self, chunks: list[Any], acl_blocked: bool, attempt: int
     ) -> Literal["generate", "retry", "refuse"]:
-        """判定口径的唯一实现: 图条件边与并行分支的 Python 循环共用。"""
+        """判定口径的唯一实现: 图条件边按它决定生成/重检/拒答。"""
         if chunks:
             return "generate"
         if acl_blocked:
@@ -741,16 +646,14 @@ class AssistantOrchestrator:
         query = state.get("kb_query") or state.get("rewritten_query") or state["message"]
         return {"kb_query": await self._kb_requery_query(state, query)}
 
-    async def _kb_requery_query(
-        self, state: AssistantState, query: str, attempt: int | None = None
-    ) -> str:
+    async def _kb_requery_query(self, state: AssistantState, query: str) -> str:
         """Rewrite the failing query with a different retrieval strategy.
 
         Falls back to keyword-stripping when the LLM is unavailable or
         echoes the same query, so the retry is never a no-op loop.
 
-        ``attempt`` 由并行分支显式传入(它不写 ``kb_attempt`` state), 单意图路径留空
-        则从 state 取 —— 否则审计里的 attempt 会永远是 0。
+        审计里的 ``attempt`` 从 state 取: 上一道 ``kb_retrieve`` 已把递增后的尝试次数
+        写回 ``kb_attempt``。真正重检那一轮是它后面的下一次 ``kb_retrieve``。
         """
         rewritten = ""
         try:
@@ -769,8 +672,7 @@ class AssistantOrchestrator:
             rewritten = self._keyword_fallback(query)
         self._audit.log(
             state.get("trace_id") or "", "assistant", "kb_requery",
-            {"from": query, "to": rewritten,
-             "attempt": attempt if attempt is not None else state.get("kb_attempt")},
+            {"from": query, "to": rewritten, "attempt": state.get("kb_attempt")},
             state.get("session_id"),
         )
         return rewritten
@@ -797,23 +699,6 @@ class AssistantOrchestrator:
             state, query, kb, stream=self._stream_enabled(state), original=state["message"]
         )
 
-    async def _answer_kb_query(self, state: AssistantState, query: str) -> dict[str, Any]:
-        """知识库问答的 **Python 版 retrieve-judge 循环**(仅供并行分支调)。
-
-        图路径靠条件边重进 ``kb_retrieve`` 实现重检; Send/gather 的分支体里不能反过来
-        走图, 故这里用同一套 :meth:`_judge` 判定与 ``retrieval_max_retries`` 预算把循环
-        写在函数内 —— 两条码路共用三个 helper, 阈值/ACL/拒答文案不会漂移。
-        不逐 token 流式(多分支 token 交错会糊成一团)。
-        """
-        current = query
-        kb = await self._kb_retrieve_once(state, current, 1)
-        while self._judge(kb["chunks"], kb["acl_blocked"], kb["attempt"]) == "retry":
-            current = await self._kb_requery_query(state, current, kb["attempt"])
-            kb = await self._kb_retrieve_once(state, current, kb["attempt"] + 1)
-        return await self._kb_generate_answer(
-            state, current, kb, stream=False, original=current
-        )
-
     async def _kb_generate_answer(
         self,
         state: AssistantState,
@@ -826,8 +711,7 @@ class AssistantOrchestrator:
         """Answer from confident chunks; refuse explicitly when there are none.
 
         ``original`` 是写进 prompt 的"用户原话": 单意图路径传原始消息(资料是按改写后
-        的问题检的, 附上原话避免偏离用户真实问法); 并行分支传子问题本身, 否则 LLM 看到
-        整句复合问法会把两件事一起答了。
+        的问题检的, 附上原话避免偏离用户真实问法); 非流式内部调用可传同一个问题。
         """
         chunks = kb["chunks"]
         meta_map = kb["meta_map"]
@@ -900,8 +784,7 @@ class AssistantOrchestrator:
         docgen 文件生成)直接取进程内工具集 —— 跳过 MCP 连接池与 ``check_mcp_permission``
         (那是 MCP 专用, 会对未知 server 默认拒); 其余 target 维持原有 MCP 分派路径不变。
         两路在此之后共用同一套: 权限 Mask -> 注入 lookup_employee_by_name -> Tool Cache
-        包装 -> ReAct 循环, 热路径其余不动。query/target 由参数传入, 因此单意图节点与
-        多任务并行分支跑的是同一份代码。
+        包装 -> ReAct 循环, 热路径其余不动。query/target 由参数传入, 节点只是薄壳。
 
         工具集与编译好的 ReAct 图按 (target, role, 工具清单版本) 缓存: 一次工具调用
         在旧写法里要付"重新包一层 Tool Cache + 重新编译一张图"的代价, 而这两件事的
@@ -1075,16 +958,24 @@ class AssistantOrchestrator:
         return await self._delegate_task(state, query, target)
 
     async def _delegate_task(
-        self, state: AssistantState, query: str, target: str
+        self, state: AssistantState, query: str, target: str, *, timeout: float | None = None
     ) -> dict[str, Any]:
         """Delegate to a specialist agent over the A2A protocol.
+
+        单意图委派与多智能体并发分支共用这一份实现: 可信身份 metadata / Agent Card
+        地址覆盖 / 角色闸门 / 审计只此一处, 不会漂出第二套委派语义。两个只有并发分支
+        需要的东西:
+        - ``status``(ok/denied): 并发分支靠它区分"办成了"与"被拒了", 不能只看
+          answer 非空(被拒时也带着一段拒答文本回来); 它不是 AssistantState 的键,
+          单意图节点顺路带回也不影响图(LangGraph 只取声明过的键);
+        - ``timeout``: 逐位上限只由并发分支传入, 单意图维持全局 ``a2a_timeout`` 口径。
 
         故意不接入 Tool Cache(对原方案的一处修正): AGENT_DELEGATE 按
         INTENT_PROMPT 的定义就是"需要专业系统多步办理的复杂业务"(如"我要报销"
         "帮我开在职证明"), 属于写/办理类操作, 缓存会把一次"提交成功"的响应
         复用给下一次本应真实发生的提交, 造成业务数据不一致; 而且下方构造的
         task 文本里含 `[当前时间=...]`, 天然每一轮都不同, 即使去接入缓存几乎
-        也不会命中。多任务并行时本路由也**不进并行集**, 只串行尾随。
+        也不会命中。多智能体并发分支同样不缓存(与这口径一致)。
         """
         agent_name = f"{target}_agent"
         role = self._role_of(state)
@@ -1097,7 +988,10 @@ class AssistantOrchestrator:
                 {"role": role.value, "agent": agent_name, "reason": str(exc)},
                 state.get("session_id"),
             )
-            return {"answer": f"权限不足:{exc}", "route": "a2a_agent", "target": target}
+            return {
+                "answer": f"权限不足:{exc}", "status": "denied",
+                "route": "a2a_agent", "target": target,
+            }
 
         # 任务文本不含操作者工号: 身份经协议级 metadata 结构化下发(见下方 send,
         # 专业智能体只信 metadata), 由下游自行注入。文本中避免出现裸工号标签,
@@ -1115,8 +1009,9 @@ class AssistantOrchestrator:
             target,
             task,
             metadata={"user_id": state.get("user_id") or "", "role": role.value},
+            timeout=timeout,
         )
-        return {"answer": answer, "route": "a2a_agent", "target": target}
+        return {"answer": answer, "status": "ok", "route": "a2a_agent", "target": target}
 
     async def chitchat(self, state: AssistantState) -> dict[str, Any]:
         """单意图路径的直答(薄壳)。"""
@@ -1137,7 +1032,6 @@ class AssistantOrchestrator:
         if history.strip():
             parts.append(f"对话历史:\n{history}")
         # 改写节点已把指代消解成独立问题; 若与原话不同则附上, 帮助模型理解上下文。
-        # 并行分支传的是子问题且 rewritten 置空, 不会把整句复合问法当"原话"贴回去。
         if rewritten and rewritten != message:
             parts.append(
                 f"用户: {message}\n(结合对话历史, 该问题指的是: {rewritten})"
@@ -1270,339 +1164,246 @@ class AssistantOrchestrator:
         except Exception as exc:  # noqa: BLE001 - 记忆写失败只是少一条记忆
             logger.warning("个人记忆写入失败, 本轮跳过: %s", exc)
 
-    # ---------------- 多任务并行(复合问法) ----------------
+    # ---------------- 多智能体并发委派(显式点选) ----------------
 
     @staticmethod
-    def _is_parallel_safe(intent: IntentResult, sub: dict[str, Any] | None = None) -> bool:
-        """子任务能否与兄弟任务并发执行(默认拒, 口径见模块 docstring)。
+    def _agent_display(domain: str) -> str:
+        """分节标题/状态提示用的可读智能体名; 未注册域退回裸域名(不抛异常)。"""
+        return (AGENT_PROFILES.get(domain) or (domain, ""))[0]
 
-        只读通道(知识库检索 / web / docgen 能力域)才能并发; 业务域 tool_call 与
-        agent_delegate 一律串行尾随 —— 它们可能产生真实写入, 且不会并发打同一条
-        MCP session。Layer2 的 ``readonly`` 与漏斗口径取"与"(更保守): 任一判为写
-        (readonly=false)一律非并行。要放开更多 target 前需先复核 MCP session 的并发语义。
+    @staticmethod
+    def normalize_agent_targets(
+        domains: list[str], max_targets: int
+    ) -> tuple[list[str], list[str], list[str]]:
+        """把点选列表清洗成 ``(可执行域, 非法域键, 超上限被截断的项)``(纯函数, 可离线单测)。
+
+        只做两件事: 剥掉未注册的域键(不在 ``AGENT_URLS`` 里的一律不执行, 也不发网络
+        请求), 以及按 ``multi_agent_max_targets`` 截掉尾部。权限判定不在这里 —— 那是
+        ``check_agent_permission`` 的单一职责(见 :meth:`_delegate_task`), 在这抢判会
+        多出第二套权限口径。入参形状(去空白/转小写/去重保序)已由 ``ChatRequest`` 洗过。
+        上限取 ``max(1, ...)``: 配成 0 会让"点了却没反响"变成难以报修的行为。
         """
-        if sub is not None and not sub.get("readonly", True):
-            return False
-        if intent.intent is IntentType.KNOWLEDGE_QA:
-            return True
-        return (
-            intent.intent is IntentType.TOOL_CALL
-            and (intent.target or "") in _PARALLEL_SAFE_TARGETS
-        )
+        limit = max(1, max_targets)
+        valid = [d for d in domains if is_agent_domain(d)]
+        invalid = [d for d in domains if not is_agent_domain(d)]
+        return valid[:limit], invalid, valid[limit:]
 
-    @staticmethod
-    def _subtask_route(intent: IntentResult) -> str:
-        """意图 -> 该子任务实际会走的路由名(分节标题/状态提示/落库都读它)。"""
-        return {
-            IntentType.KNOWLEDGE_QA: "assistant_kb",
-            IntentType.TOOL_CALL: "mcp_tool",
-            IntentType.AGENT_DELEGATE: "a2a_agent",
-            IntentType.CHITCHAT: "direct",
-        }[intent.intent]
-
-    @classmethod
-    def _subtask_label(cls, intent: IntentResult) -> str:
-        """分节标题里的可读路由名, 如 ``MCP工具·hr`` / ``知识库``。"""
-        route = cls._subtask_route(intent)
-        base = _ROUTE_LABELS.get(route, route)
-        if intent.target and route in {"mcp_tool", "a2a_agent"}:
-            return f"{base}·{intent.target}"
-        return base
-
-    async def _run_subtask(
-        self, state: AssistantState, sub: dict[str, Any]
+    async def _run_one_agent(
+        self, state: AssistantState, domain: str, index: int, total: int, sem: asyncio.Semaphore
     ) -> dict[str, Any]:
-        """执行一个子任务: 与单意图路径同一份 helper, 只把 query/target 换成子任务的。"""
-        intent: IntentResult = sub["intent"]
-        query = sub["query"]
-        if intent.intent is IntentType.KNOWLEDGE_QA:
-            return await self._answer_kb_query(state, query)
-        if intent.intent is IntentType.TOOL_CALL:
-            return await self._tool_react(state, query, intent.target or "hr")
-        if intent.intent is IntentType.AGENT_DELEGATE:
-            return await self._delegate_task(state, query, intent.target or "hr")
-        return await self._chitchat_answer(state, query, stream=False)
+        """一个智能体的一次委派: 并发闸门 + 逐位超时 + 异常隔离, 产出完整的一节结果。
 
-    async def _run_subtask_guarded(
-        self, state: AssistantState, sub: dict[str, Any], sem: asyncio.Semaphore, total: int
-    ) -> dict[str, Any]:
-        """并发上限 + 单任务超时 + 异常隔离: 一个子任务失败只降级它自己那一节。"""
-        index = int(sub.get("index") or 0)
-        intent: IntentResult = sub["intent"]
+        超时两道故意不同值: 内层 ``send_guarded`` 用全局 ``a2a_timeout``(默认 120s), 它
+        回的是一段可读的降级文本(该节仍算"有内容"); 外层 ``wait_for`` 用
+        ``multi_agent_timeout``(默认 150s), 只在内层也拦不住时才把这一节判为超时。
+        """
+        label = self._agent_display(domain)
         trace_id = state.get("trace_id") or ""
         session_id = state.get("session_id") or ""
-        await self._emit_status(
-            state, "subtask",
-            f"[{index + 1}/{total}] {str(sub['query'])[:16]} → {self._subtask_label(intent)}…",
-        )
+        query = state.get("rewritten_query") or state["message"]
         outcome: dict[str, Any] = {
-            "index": index, "query": sub["query"], "intent": intent,
-            "route": sub.get("route") or self._subtask_route(intent),
-            "target": sub.get("target"), "answer": "", "docs_meta": [],
-            "artifacts": [], "ok": False, "status": "pending", "error": "",
+            "index": index, "domain": domain, "agent": label, "route": "a2a_agent",
+            "target": domain, "answer": "", "ok": False, "status": "pending",
+            "error": "", "elapsed_ms": 0,
         }
+        await self._emit_status(state, "delegate", f"[{index + 1}/{total}] {label} 处理中…")
         started = time.perf_counter()
         try:
             async with sem:
                 result = await asyncio.wait_for(
-                    self._run_subtask(state, sub),
-                    timeout=self._settings.multi_task_subtask_timeout,
+                    self._delegate_task(state, query, domain),
+                    timeout=self._settings.multi_agent_timeout,
                 )
-            # 成败看 status 而不是"answer 非空": 权限/配额被拒时 tool_execute 也带着一段
-            # 拒答文本回来, 按 answer 判成败会把"被拒"当成"办完", 合并时既不标失败也不
-            # 提示用户少办了哪几件事(只能在长结里混着一句权限不足)。
+            # 成败看 status 而不是"answer 非空": 权限被拒时也会带着一段拒答文本回来。
             status = str(result.get("status") or "")
             if status not in ("ok", "denied"):
                 status = "ok" if (result.get("answer") or "").strip() else "empty"
-            denied = status == "denied"
+            answer = str(result.get("answer") or "")
             outcome.update(
                 {
-                    "answer": result.get("answer") or "",
-                    "route": result.get("route") or outcome["route"],
-                    "target": result.get("target") or outcome["target"],
-                    "docs_meta": result.get("docs_meta") or [],
-                    "artifacts": result.get("artifacts") or [],
-                    "status": status,
-                    "ok": status == "ok",
+                    "answer": answer, "status": status, "ok": status == "ok",
                     "error": ""
                     if status == "ok"
-                    else (
-                        str(result.get("answer") or "权限不足")[:160]
-                        if denied
-                        else "未产生回答"
-                    ),
+                    else (answer[:160] if status == "denied" else "未产生回答"),
                 }
             )
         except asyncio.TimeoutError:
             outcome["status"] = "timeout"
-            outcome["error"] = f"超过 {self._settings.multi_task_subtask_timeout:.0f}s 未完成"
-        except Exception as exc:  # noqa: BLE001 - 单子任务异常不连坐其他节
-            logger.warning("子任务执行失败(index=%s): %s", index, exc)
+            outcome["error"] = f"超过 {self._settings.multi_agent_timeout:.0f}s 未返回"
+        except Exception as exc:  # noqa: BLE001 - 单个智能体失败不连坐其他节
+            logger.warning("多智能体委派失败(domain=%s): %s", domain, exc)
             outcome["status"] = "error"
             outcome["error"] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
         outcome["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
-        # 开始与**完成**都发 status: 前端逐项清单靠这两个事件把状态从"处理中"推到
-        # "已完成/未完成"(并行段与串行尾随段的完成顺序不等于 index 顺序, 不能靠推)。
+        # 完成也发一条 status: 前端进度靠它从"处理中"推到"已完成/未完成"(并发下
+        # 完成顺序不等于点选顺序, 所以每条都自带序号与智能体名)。
         await self._emit_status(
-            state, "subtask",
-            f"[{index + 1}/{total}] {str(sub['query'])[:16]} → "
-            f"{self._subtask_label(intent)}{'已完成' if outcome['ok'] else '未完成'}",
+            state, "delegate",
+            f"[{index + 1}/{total}] {label}{'已完成' if outcome['ok'] else '未完成'}",
         )
         self._audit.log(
             trace_id, "assistant",
-            "subtask_completed" if outcome["ok"] else "subtask_failed",
+            "agent_task_completed" if outcome["ok"] else "agent_task_failed",
             {
-                "index": index, "query": outcome["query"], "route": outcome["route"],
-                "target": outcome["target"], "intent": intent.intent.value,
-                "elapsed_ms": outcome["elapsed_ms"], "answer_len": len(outcome["answer"]),
-                "error": outcome["error"],
+                "index": index, "domain": domain, "agent": label, "route": outcome["route"],
+                "status": outcome["status"], "elapsed_ms": outcome["elapsed_ms"],
+                "answer_len": len(outcome["answer"]), "error": outcome["error"],
             },
             session_id,
         )
         return outcome
 
-    async def multi_execute(self, state: AssistantState) -> dict[str, Any]:
-        """按 ``depends_on`` 拓扑分层执行: 层内只读且并行安全的并发跑, 写操作
-        (readonly=false / deferred)降级为待确认不自动执行, 其余串行尾随; 下游节点
-        执行前注入上游结果。结果按子任务原序归位。
-
-        并发上限由 ``multi_task_parallelism`` 的 Semaphore 控制(串行段共用同一个
-        信号量, 因为上限要的是"同时在跑的总量"而不是只限并行段)。单子任务的
-        隔离已由 :meth:`_run_subtask_guarded` 做完, 这里的 ``return_exceptions`` 只是
-        兼顶意外。若出现环/悬空(Layer3 本应拦住)导致无可执行节点, 退化为按 index
-        原序放行队首, 保证调度永不死锁(回退永远安全)。
-        """
-        subtasks = state.get("subtasks") or []
-        if not subtasks:
-            return {"task_results": []}
-        sem = asyncio.Semaphore(max(1, self._settings.multi_task_parallelism))
-        total = len(subtasks)
-        id_to_index = {str(s.get("id")): int(s["index"]) for s in subtasks}
-        outcomes: dict[int, dict[str, Any]] = {}
-        remaining = list(subtasks)
-        while remaining:
-            ready = [
-                s for s in remaining
-                if all(
-                    (idx := id_to_index.get(str(d))) is not None and idx in outcomes
-                    for d in (s.get("depends_on") or [])
-                )
-            ]
-            if not ready:  # 环/悬空兜底: 按 index 原序放行队首, 不死锁
-                ready = [min(remaining, key=lambda s: int(s["index"]))]
-            parallel = [
-                s for s in ready
-                if not s.get("deferred") and self._is_parallel_safe(s["intent"], s)
-            ]
-            serial = [
-                s for s in ready
-                if not s.get("deferred") and not self._is_parallel_safe(s["intent"], s)
-            ]
-            deferred = [s for s in ready if s.get("deferred")]
-            if parallel:
-                raw = await asyncio.gather(
-                    *(
-                        self._run_subtask_guarded(
-                            state, self._with_upstream_context(s, outcomes, id_to_index), sem, total
-                        )
-                        for s in parallel
-                    ),
-                    return_exceptions=True,
-                )
-                for s, res in zip(parallel, raw):
-                    outcomes[int(s["index"])] = (
-                        self._fallback_outcome(s, res) if isinstance(res, BaseException) else res
-                    )
-            for s in serial:
-                outcomes[int(s["index"])] = await self._run_subtask_guarded(
-                    state, self._with_upstream_context(s, outcomes, id_to_index), sem, total
-                )
-            for s in deferred:
-                outcomes[int(s["index"])] = await self._run_deferred(state, s, total)
-            done_idx = {int(s["index"]) for s in ready}
-            remaining = [s for s in remaining if int(s["index"]) not in done_idx]
-        return {"task_results": [outcomes[i] for i in sorted(outcomes)]}
-
-    @staticmethod
-    def _with_upstream_context(
-        sub: dict[str, Any],
-        outcomes: dict[int, dict[str, Any]],
-        id_to_index: dict[str, int],
+    def _fallback_agent_outcome(
+        self, domain: str, index: int, exc: BaseException
     ) -> dict[str, Any]:
-        """有依赖的下游节点: 把已完成的依赖结果拼进其 query(数据流)。无依赖直接返回。"""
-        deps = sub.get("depends_on") or []
-        if not deps:
-            return sub
-        lines: list[str] = []
-        for d in deps:
-            idx = id_to_index.get(str(d))
-            out = outcomes.get(idx) if idx is not None else None
-            if out and (out.get("answer") or "").strip():
-                lines.append(f"- {str(out.get('query') or '').strip()}: {str(out['answer']).strip()}")
-        if not lines:
-            return sub
-        aug = f"{sub['query']}\n\n已知前序结果(供参考, 不要重复执行):\n" + "\n".join(lines)
-        return {**sub, "query": aug}
-
-    async def _run_deferred(
-        self, state: AssistantState, sub: dict[str, Any], total: int
-    ) -> dict[str, Any]:
-        """写操作(readonly=false)不自动执行: 产出一个"待确认"节, 由用户确认后再办。"""
-        index = int(sub.get("index") or 0)
-        intent: IntentResult = sub["intent"]
-        await self._emit_status(
-            state, "subtask",
-            f"[{index + 1}/{total}] {str(sub['query'])[:16]} → {self._subtask_label(intent)}待确认…",
-        )
-        self._audit.log(
-            state.get("trace_id") or "", "assistant", "subtask_deferred",
-            {
-                "index": index, "query": sub["query"], "route": sub.get("route"),
-                "target": sub.get("target"), "intent": intent.intent.value,
-            },
-            state.get("session_id"),
-        )
+        """gather 兼顶路径: 分支连 _run_one_agent 的隔离都走不到时也要凑出一节。"""
         return {
-            "index": index, "query": sub["query"], "intent": intent,
-            "route": sub.get("route") or self._subtask_route(intent),
-            "target": sub.get("target"), "answer": "", "docs_meta": [],
-            "artifacts": [], "ok": False, "status": "deferred",
-            "error": "写操作需你确认后办理", "elapsed_ms": 0,
-        }
-
-    def _fallback_outcome(self, sub: dict[str, Any], exc: BaseException) -> dict[str, Any]:
-        """gather 兼顶路径: 分支连隔离都走不到时也要凑出一个完整节。"""
-        intent: IntentResult = sub["intent"]
-        return {
-            "index": int(sub.get("index") or 0), "query": sub.get("query") or "",
-            "intent": intent, "route": self._subtask_route(intent),
-            "target": sub.get("target"), "answer": "", "docs_meta": [], "artifacts": [],
-            "ok": False, "status": "error",
-            "error": f"{exc.__class__.__name__}: {str(exc)[:160]}",
+            "index": index, "domain": domain, "agent": self._agent_display(domain),
+            "route": "a2a_agent", "target": domain, "answer": "", "ok": False,
+            "status": "error", "error": f"{exc.__class__.__name__}: {str(exc)[:160]}",
             "elapsed_ms": 0,
         }
 
-    @classmethod
-    def _merge_task_answers(
-        cls, results: list[dict[str, Any]], dropped: int = 0
-    ) -> str:
-        """把各子任务结果拼成"一节一件事"的 Markdown(纯函数, 不调 LLM、可离线单测)。
+    async def multi_agent_execute(self, state: AssistantState) -> dict[str, Any]:
+        """把同一个问题并发下发给用户点选的每个专业智能体, 分节合并成一条回答。
 
-        刻意不再过一道 LLM 综合: 各节内容已是工具/检索到的事实, 重写只会带来改写
-        与编造风险; 同一段也不会因两分支 token 交错而糊在一起。
+        点选是本轮唯一的调度依据(系统不推断"该问谁"), 所以这一轮不需要意图漏斗:
+        ``IntentResult`` 是合成出来的(AGENT_DELEGATE + 首个可执行域 + layer=explicit),
+        只为让落库/审计/前端路由标签的字段形状与单意图路径一致。非法域与超限项也各
+        占一节: 用户点的每一项都有交代, 不会被静默吞掉。
         """
-        if not results:
-            return "多任务处理未产生任何结果。"
-        deferred = [r for r in results if str(r.get("status") or "") == "deferred"]
-        succeeded = [r for r in results if r.get("ok")]
-        if not succeeded and not deferred:
-            reasons = "; ".join(str(r.get("error") or "未知错误") for r in results)
-            return f"这次的 {len(results)} 件事都没能完成: {reasons}"
-        denied = [r for r in results if str(r.get("status") or "") == "denied"]
-        parts: list[str] = []
-        if len(results) > 1:
-            parts.append(f"你把 {len(results)} 件事放在一句话里问, 已分开处理(只读项并行、办理项串行):")
-        for pos, r in enumerate(results, start=1):
-            query = str(r.get("query") or "").strip() or f"第 {pos} 项"
-            intent = r.get("intent")
-            label = cls._subtask_label(intent) if isinstance(intent, IntentResult) else ""
-            head = f"## {pos}. {query}"
-            if label:
-                head += f"({label})"
-            body = str(r.get("answer") or "").strip()
-            status = str(r.get("status") or "")
-            if status == "deferred":
-                body = "> 该项是办理类操作, 需你确认后我再执行。"
-            elif not r.get("ok"):
-                prefix = "权限或额度不够" if status == "denied" else "未完成"
-                body = f"> 该项{prefix}: {r.get('error') or '未知错误'}"
-            parts.append(f"{head}\n\n{body}")
-        if deferred:
-            parts.append(f"> 有 {len(deferred)} 项是办理类操作, 为安全起见未自动执行; 需要的话回复“确认”, 我再逐项办理。")
-        if denied:
-            parts.append(f"> 另有 {len(denied)} 项因权限或当日额度被拒, 需要相应角色或次日再试。")
-        if dropped > 0:
-            parts.append(f"> 另有 {dropped} 项已超出单次并行上限, 本次未处理, 请再问我一次。")
-        return "\n\n".join(parts)
-
-    async def merge_results(self, state: AssistantState) -> dict[str, Any]:
-        """分节合并并写回单一 ``answer``/``route``/``target``/``docs_meta``/``artifacts``。
-
-        流式时整篇作为一条 ``token`` 事件下发(而不是逐 token): 并行分支各自生成
-        完成时间交错, 逐 token 推会把两件事的正文掉换顺序。前端在 ``result`` 事件
-        里还能拿到 ``metadata.subtasks`` 的逐项路由与成败。
-        """
-        results = state.get("task_results") or []
-        dropped = int(state.get("subtask_dropped") or 0)
-        answer = self._merge_task_answers(results, dropped)
-        docs_meta: list[dict[str, Any]] = []
-        seen_docs: set[str] = set()
-        artifacts: list[dict[str, Any]] = []
-        for r in results:
-            for d in r.get("docs_meta") or []:
-                key = str(d.get("doc_key") or d.get("title") or "")
-                if key and key not in seen_docs:
-                    seen_docs.add(key)
-                    docs_meta.append(d)
-            artifacts.extend(r.get("artifacts") or [])
-        primary = results[0] if results else {}
+        targets = list(state.get("agent_targets") or [])
+        domains, invalid, overflow = self.normalize_agent_targets(
+            targets, self._settings.multi_agent_max_targets
+        )
+        total = len(domains)
+        self._audit.log(
+            state.get("trace_id") or "", "assistant", "multi_agent_planned",
+            {
+                "requested": targets, "domains": domains, "invalid": invalid,
+                "dropped": overflow, "parallelism": max(1, self._settings.multi_agent_parallelism),
+                "timeout": self._settings.multi_agent_timeout,
+            },
+            state.get("session_id"),
+        )
+        await self._emit_status(
+            state, "delegate",
+            f"正在并发委派 {total} 个专业智能体…" if total else "点选的智能体都不可执行…",
+        )
+        results: list[dict[str, Any]] = []
+        if domains:
+            sem = asyncio.Semaphore(max(1, self._settings.multi_agent_parallelism))
+            raw = await asyncio.gather(
+                *(self._run_one_agent(state, d, i, total, sem) for i, d in enumerate(domains)),
+                return_exceptions=True,
+            )
+            results.extend(
+                self._fallback_agent_outcome(d, i, res) if isinstance(res, BaseException) else res
+                for i, (d, res) in enumerate(zip(domains, raw))
+            )
+        # 非法域/超上限项补成独立小节(不参与并发, 只负责"有交代")。
+        for pos, d in enumerate(invalid):
+            results.append(
+                {
+                    "index": len(domains) + pos, "domain": d, "agent": self._agent_display(d),
+                    "route": "a2a_agent", "target": d, "answer": "", "ok": False,
+                    "status": "invalid", "error": "未注册的专业智能体域", "elapsed_ms": 0,
+                }
+            )
+        for pos, d in enumerate(overflow):
+            results.append(
+                {
+                    "index": len(domains) + len(invalid) + pos, "domain": d,
+                    "agent": self._agent_display(d), "route": "a2a_agent", "target": d,
+                    "answer": "", "ok": False, "status": "dropped",
+                    "error": f"超出单次可点选上限({self._settings.multi_agent_max_targets})",
+                    "elapsed_ms": 0,
+                }
+            )
+        answer = self._merge_agent_answers(
+            results, max_chars=self._settings.multi_agent_answer_chars
+        )
+        primary = domains[0] if domains else (targets[0] if targets else "")
+        intent = IntentResult(
+            intent=IntentType.AGENT_DELEGATE, target=primary or None, confidence=1.0,
+            reason=f"用户显式点选 {total} 个专业智能体并发委派", layer="explicit",
+        )
         if self._stream_enabled(state) and answer:
+            # 整篇一条 token 下发(不逐 token): N 路生成的 token 交错会糊成一团。
             await self._emit(state, {"type": "token", "delta": answer})
         self._audit.log(
-            state.get("trace_id") or "", "assistant", "multi_task_merged",
+            state.get("trace_id") or "", "assistant", "multi_agent_merged",
             {
                 "sections": len(results),
                 "ok": sum(1 for r in results if r.get("ok")),
-                "dropped": dropped,
-                "routes": [r.get("route") for r in results],
+                "invalid": len(invalid), "dropped": len(overflow), "domains": domains,
             },
             state.get("session_id"),
         )
         return {
-            "answer": answer, "route": "multi_task",
-            "target": primary.get("target"), "docs_meta": docs_meta, "artifacts": artifacts,
+            "answer": answer, "route": "multi_agent", "target": primary or None,
+            "intent": intent, "agent_results": results,
         }
 
+    @classmethod
+    def _merge_agent_answers(
+        cls, results: list[dict[str, Any]], *, max_chars: int = 0
+    ) -> str:
+        """把各智能体的结果拼成"一节一个智能体"的 Markdown(纯函数, 不调 LLM、可离线单测)。
+    
+        刻意不再过一道 LLM 综合: 各节内容已是智能体产出的事实, 重写只会带来改写与编造
+        风险。被拒/超时/非法域/超限都单独成节并在末尾汇总一句, 用户点的每一项都能对上号。
+        """
+        if not results:
+            return "本轮没有可执行的专业智能体。"
+        succeeded = [r for r in results if r.get("ok")]
+        if not succeeded:
+            reasons = "; ".join(
+                f"{r.get('agent') or r.get('domain')}: {r.get('error') or '未知错误'}"
+                for r in results
+            )
+            return f"点选的 {len(results)} 个专业智能体这次都没能给出结果: {reasons}"
+        denied = [r for r in results if str(r.get("status") or "") == "denied"]
+        invalid = [r for r in results if str(r.get("status") or "") == "invalid"]
+        dropped = [r for r in results if str(r.get("status") or "") == "dropped"]
+        failed = [
+            r for r in results
+            if not r.get("ok")
+            and str(r.get("status") or "") not in ("denied", "invalid", "dropped")
+        ]
+        parts: list[str] = []
+        if len(results) > 1:
+            parts.append(f"你点了 {len(results)} 个专业智能体, 同一个问题已并发下发, 各自结果如下:")
+        for pos, r in enumerate(results, start=1):
+            agent = str(r.get("agent") or r.get("domain") or "").strip() or f"第 {pos} 项"
+            domain = str(r.get("domain") or "").strip()
+            head = f"## {pos}. {agent}"
+            if domain and domain != agent:
+                head += f"（{domain}）"
+            status = str(r.get("status") or "")
+            if status in ("invalid", "dropped", "denied"):
+                body = f"> 未执行: {r.get('error') or '未知原因'}"
+            elif not r.get("ok"):
+                body = f"> 未完成: {r.get('error') or '未知错误'}"
+            else:
+                body = str(r.get("answer") or "").strip()
+                # 并发 N 份长文本会把回答长度乘以 N, 截断优于把整页掉进历史消息里。
+                if max_chars > 0 and len(body) > max_chars:
+                    body = (
+                        f"{body[:max_chars]}\n\n"
+                        f"> 本节内容已截断(超出 {max_chars} 字), 需要完整结果请单独点选该智能体。"
+                    )
+            parts.append(f"{head}\n\n{body}")
+        if denied:
+            parts.append(f"> 有 {len(denied)} 个智能体当前角色无权访问, 需要相应角色后才能委派。")
+        if failed:
+            parts.append(f"> 有 {len(failed)} 个智能体未能给出结果, 可稍后单独重试。")
+        if invalid:
+            parts.append(f"> 有 {len(invalid)} 项不是已注册的专业智能体域, 未执行。")
+        if dropped:
+            parts.append(f"> 有 {len(dropped)} 项超出单次可点选上限, 未执行, 请分次询问。")
+        return "\n\n".join(parts)
+    
     # ---------------- SSE 流式推送 ----------------
 
     @staticmethod
@@ -1680,10 +1481,19 @@ class AssistantOrchestrator:
         return state.get("current_time") or "(未获取)"
 
     @staticmethod
+    def _route_after_rewrite(state: AssistantState) -> str:
+        """点选了智能体就走并发委派分支, 否则走原来的意图分类分派。
+
+        总开关 ``multi_agent_enabled`` 在入图前就把 ``agent_targets`` 洗空(见
+        :meth:`_run_graph`), 所以这里不重复判开关: 否则"关着开关但 state 里还有值"
+        这种不一致状态得靠两处口径同步才能不出现。
+        """
+        if state.get("agent_targets"):
+            return "multi_agent_execute"
+        return "classify_intent"
+
+    @staticmethod
     def _route_by_intent(state: AssistantState) -> str:
-        # 多子任务轮优先: 拆分成功后不再按"整句一个意图"分派。
-        if len(state.get("subtasks") or []) > 1:
-            return "multi_execute"
         intent = state["intent"]
         if intent is None:
             return "kb_retrieve"
@@ -1699,7 +1509,6 @@ class AssistantOrchestrator:
         g.add_node("build_context", self.build_context)
         g.add_node("resolve_time", self.resolve_time)
         g.add_node("rewrite_query", self.rewrite_query)
-        g.add_node("plan_tasks", self.plan_tasks)
         g.add_node("classify_intent", self.classify_intent)
         g.add_node("kb_retrieve", self.kb_retrieve)
         g.add_node("kb_requery", self.kb_requery)
@@ -1707,19 +1516,23 @@ class AssistantOrchestrator:
         g.add_node("tool_execute", self.tool_execute)
         g.add_node("agent_delegate", self.agent_delegate)
         g.add_node("chitchat", self.chitchat)
-        g.add_node("multi_execute", self.multi_execute)
-        g.add_node("merge_results", self.merge_results)
+        g.add_node("multi_agent_execute", self.multi_agent_execute)
         g.add_node("persist_memory", self.persist_memory)
 
-        # rewrite_query 前置于意图识别: 分类器与全部分派路由(含多任务分支)共享消解后的
-        # 独立问题, 避免"那帮我查一下它的余额"因指代未消解而误分类。
-        # plan_tasks 在 rewrite 之后、classify 之前: 拆分器拿到的已是消解完指代的
-        # 整句, 拆出的子问题因此不需要再各自做一轮消解。
+        # rewrite_query 前置于意图识别: 分类器与全部分派路由(含多智能体并发分支)
+        # 共享消解后的独立问题, 避免"那帮我查一下它的余额"因指代未消解而误分类;
+        # 并发委派拿到的也是同一个消解后的问题, 下游智能体不需再做消解。
         g.add_edge(START, "build_context")
         g.add_edge("build_context", "resolve_time")
         g.add_edge("resolve_time", "rewrite_query")
-        g.add_edge("rewrite_query", "plan_tasks")
-        g.add_edge("plan_tasks", "classify_intent")
+        g.add_conditional_edges(
+            "rewrite_query",
+            self._route_after_rewrite,
+            {
+                "classify_intent": "classify_intent",
+                "multi_agent_execute": "multi_agent_execute",
+            },
+        )
         g.add_conditional_edges(
             "classify_intent",
             self._route_by_intent,
@@ -1728,7 +1541,6 @@ class AssistantOrchestrator:
                 "tool_execute": "tool_execute",
                 "agent_delegate": "agent_delegate",
                 "chitchat": "chitchat",
-                "multi_execute": "multi_execute",
             },
         )
         # Retrieve-Judge Loop: 检索后按结果判定 —— 有相关文档直接生成;
@@ -1743,11 +1555,9 @@ class AssistantOrchestrator:
             },
         )
         g.add_edge("kb_requery", "kb_retrieve")
-        # 多任务分支: 并行/串行执行完再分节合并, 同样汇入 persist_memory。
-        g.add_edge("multi_execute", "merge_results")
-        for node in ("kb_generate", "tool_execute", "agent_delegate", "chitchat"):
+        # 多智能体并发分支: 执行与分节合并在同一节点内完成, 同样汇入 persist_memory。
+        for node in ("kb_generate", "tool_execute", "agent_delegate", "chitchat", "multi_agent_execute"):
             g.add_edge(node, "persist_memory")
-        g.add_edge("merge_results", "persist_memory")
         g.add_edge("persist_memory", END)
         return g.compile(checkpointer=checkpointer)
 
@@ -1757,7 +1567,7 @@ class AssistantOrchestrator:
         if self._retriever is None:
             if self._retriever_lock is None:
                 self._retriever_lock = asyncio.Lock()
-            # 双检锁: 多个并发 run / 多个并行子任务同时首建时, ES BM25 全量重建只跑一次。
+            # 双检锁: 多个并发 run 同时首建时, ES BM25 全量重建只跑一次。
             async with self._retriever_lock:
                 if self._retriever is None:
                     retriever = HybridRetriever()
@@ -1926,6 +1736,16 @@ class AssistantOrchestrator:
         task.add_done_callback(self._stream_tasks.discard)
         return run_id
 
+    def _entry_agent_targets(self, req: ChatRequest) -> list[str]:
+        """总开关与入参点选在此一处合流: 关了就把点选洗空。
+
+        图内条件路由(:meth:`_route_after_rewrite`)只看 ``agent_targets``, 不需要在两个
+        地方保持"开关 + 点选"的同步口径; 抽成方法也让开关行为能离线断言(不起整栈)。
+        """
+        if not self._settings.multi_agent_enabled:
+            return []
+        return list(req.agent_targets or [])
+
     async def _run_graph(
         self, req: ChatRequest, trace_id: str, *, run_id: str, thinking: bool
     ) -> AssistantState:
@@ -1933,7 +1753,7 @@ class AssistantOrchestrator:
 
         进图前先把调用者绑到当前上下文(app/security/caller.py): 工具包装层在真正
         发起调用前从这里取 ``caller_*`` 注入参数, 与 LLM 填的同名字段冲突时一律覆盖。
-        asyncio 任务创建时复制当前上下文, 所以图节点、并行子任务与 ReAct 工具调用
+        asyncio 任务创建时复制当前上下文, 所以图节点、并发的多路委派与 ReAct 工具调用
         看的都是这一份; 离开本轮时必须复位, 否则同一个任务上下文里的下一轮会读到
         上一个工号。
         """
@@ -1946,6 +1766,8 @@ class AssistantOrchestrator:
                 department=(req.department or "").strip(),
             )
         )
+        # 总开关在一处生效(见 :meth:`_entry_agent_targets`), 关了就直接忽略点选。
+        agent_targets = self._entry_agent_targets(req)
         try:
             return await self._graph.ainvoke(
                 {
@@ -1974,9 +1796,8 @@ class AssistantOrchestrator:
                     "kb_meta_map": {},
                     "kb_attempt": 0,
                     "kb_acl_blocked": False,
-                    "subtasks": [],
-                    "subtask_dropped": 0,
-                    "task_results": [],
+                    "agent_targets": agent_targets,
+                    "agent_results": [],
                 },
                 # Working State Checkpoint: thread_id 用 session_id, 每轮对话都完整
                 # 传入上方所有 AssistantState 字段, 不会与上一轮残留的 checkpoint
@@ -2003,25 +1824,22 @@ class AssistantOrchestrator:
             "reason": intent.reason,
             "docs": final.get("docs_meta", []),
         }
-        # 多任务轮额外携逐项结果: 前端可据此渲染每件事的路由/成败(整句仍是一条回答)。
-        task_results = final.get("task_results") or []
-        if task_results:
-            metadata["subtasks"] = [
+        # 多智能体轮额外携逐个智能体的结果: 前端可据此展示哪个智能体办成了/被拒/超时。
+        agent_results = final.get("agent_results") or []
+        if agent_results:
+            metadata["agents"] = [
                 {
                     "index": r.get("index"),
-                    "query": r.get("query"),
+                    "domain": r.get("domain"),
+                    "agent": r.get("agent"),
                     "route": r.get("route"),
-                    "target": r.get("target"),
                     "status": r.get("status") or "",
                     "ok": bool(r.get("ok")),
                     "error": r.get("error") or "",
                     "elapsed_ms": r.get("elapsed_ms"),
                 }
-                for r in task_results
+                for r in agent_results
             ]
-            dropped = int(final.get("subtask_dropped") or 0)
-            if dropped:
-                metadata["subtask_dropped"] = dropped
         return ChatResponse(
             session_id=req.session_id,
             answer=mask_text(final["answer"]),

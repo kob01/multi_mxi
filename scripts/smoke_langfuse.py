@@ -71,7 +71,7 @@ async def main() -> int:
     print(f"OK 一轮对话已上报: session={session} route={resp.route}")
     print(f"   审计 trace_id        = {resp.trace_id}   (见 logs/audit.jsonl)")
     print(f"   Langfuse trace id    = {derived}")
-    print("   UI 里按该 trace id 应能看到 LangGraph -> build_context/plan_tasks/"
+    print("   UI 里按该 trace id 应能看到 LangGraph -> build_context/rewrite_query/"
           "classify_intent/... -> ChatDeepSeek 的完整层级")
     return 0
 

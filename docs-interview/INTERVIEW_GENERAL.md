@@ -77,7 +77,7 @@
 
 接口设计上我坚持三件事：
 
-- 契约走 Pydantic schema（`ChatRequest`/`ChatResponse`），`route` 是 Literal 枚举，前端按 `route` 决定展示形态（知识库带引用来源、多任务带 `metadata.subtasks` 逐项成败）。
+- 契约走 Pydantic schema（`ChatRequest`/`ChatResponse`），`route` 是 Literal 枚举，前端按 `route` 决定展示形态（知识库带引用来源、多智能体并发带 `metadata.agents` 逐个成败）；能选哪些智能体也不硬编在前端，`GET /api/agents` 按角色白名单给菜单。
 - 会话历史要能完整回填：`/api/sessions` 列会话、`/api/sessions/{id}/messages` 给全部消息（含思考过程、路由、参考来源），这样断点续流的缓冲过期后前端有可降级路径。
 - 交付物一律回**可点的链接**而不是裸路径：网关不把 `/api/...` 当静态路径暴露（否则用户上传的知识库原件会被连带暴露、还绕过权限），下载路由只作用域 `gen/<token>/` 子树并叠四层防护；prompt 里也明确告诉模型"必须真实调用 generate\_\* 拿到 download_url 再输出成 Markdown 链接，不要改写或截断地址"，因为前端不会把裸 `/api/` 文本渲染成可点链接。
 
@@ -112,8 +112,8 @@
 逐字稿：
 我分层验证，按成本从低到高：
 
-1. **离线单测/纯函数测**：拆分结果的清洗（`clean_tasks`）、改写清洗（`_clean_rewrite`）、RRF 融合、SQL 护栏、spec 解析这些纯逻辑都能离线跑；有一支脚本专门在**不启服务**的情况下验 SSRF 面、构建器和路由回归（`smoke_tools`）。
-2. **整栈冒烟**：`test_tools_flow` 走真实链路验检索与生成下载；`demo_reimburse` 跑"我要报销"的端到端委派；`test_sse_resume` 验断点续流的重放语义。
+1. **离线单测/纯函数测**：点选清洗与分节合并（`normalize_agent_targets`/`_merge_agent_answers`）、改写清洗（`_clean_rewrite`）、RRF 融合、SQL 护栏、spec 解析这些纯逻辑都能离线跑；有一支脚本专门在**不启服务**的情况下验 SSRF 面、构建器和路由回归（`smoke_tools`）。
+2. **整栈冒烟**：`test_tools_flow` 走真实链路验检索与生成下载；`demo_reimburse` 跑"我要报销"的端到端委派；`test_multi_agent` 验多智能体并发委派（含用审计区间重叠证明真并发）；`test_sse_resume` 验断点续流的重放语义。
 3. **检索质量回归**：MS MARCO 评测 + 切块 A/B，独立评测库/索引/Mongo 库，指标口径固定（评排序时阈值置 0），改召回逻辑前后能对数字。
 4. **对接自检**：任何配置改动后先 `check`，确认七个依赖都在，而不是打开页面猜。
 
@@ -142,7 +142,7 @@
 | rerank 阈值多少？                | 0.4，全链路唯一阈值，只作用于 rerank 后的 0~1 相关性                                                   |
 | 检索候选与最终条数？             | 每通道 top_k=8，融合后 rerank 取 top_n=4                                                               |
 | 意图语义层参数？                 | Top-3 相似度均值，命中阈值 0.62，margin 0.05                                                           |
-| 多任务参数？                     | 上限 3 条、并发 3、单任务超时 45s、短于 8 字不拆                                                       |
+| 多智能体并发参数？               | 可点选上限 3、并发 2、逐位超时 150s（内层 a2a 120s）、单节正文截断 4000 字                    |
 | 会话记忆窗口？                   | 滚动 10 轮，超 20 条触发 LLM 摘要折叠，Redis TTL 1 小时                                                |
 | 缓存 TTL？                       | Prompt/Retrieval 300s，Tool 30s（web 域 300s）                                                         |
 | 情节召回窗口？                   | 近 30 天，超 90 天排序降权，蒸馏门槛 3 条新增情节                                                      |

@@ -67,7 +67,15 @@
 - 文档级 ACL 的"入库 + 权限变更两表同事务刷新"（`update_acl_by_doc` 两条 UPDATE）与代码一致。
 - 六桶记忆的落库分布（画像独立表、其余四桶同表 `kind` 判别、图谱 Neo4j）与 `taxonomy.py`/`models.py` 一致。
 
-## 五、验证状态
+## 五、后续变更（本报告的局部结论已被实现改动推翻）
+
+| 变更                             | 涉及本报告条目                       | 现在的实现口径                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **复合问法自动拆分已整体下线**   | 一-2、一-4、一-14、二-15、三-2       | 已删 `app/assistant/planner.py`、`MULTI_TASK_SPLIT_PROMPT`、`plan_tasks/multi_execute/merge_results` 节点与 `multi_task_*` 配置。多 Agent 执行改为**显式点选**：`ChatRequest.agent_targets` 非空时走 `graph.py::multi_agent_execute`，同一个（已消解指代的）问题并发下发给若干个 A2A 专业智能体并分节合并（`route=multi_agent`、`metadata.agents`）；classify 的分派目标回到 4 个，本报告的节点链描述不再适用 |
+| 新增可点选清单接口               | 一-2 / 一-4 未覆盖（属新增能力）     | `GET /api/agents` 按 `AGENT_WHITELIST` 过滤返回当前角色可委派智能体；域键与卡片名的单一事实源在 `app/assistant/a2a_client.py::AGENT_PROFILES`                                                                                                                                                                                            |
+| `REPO_MAP.md` 条目已属旧快照     | 三-2                                 | 地图仍列 `app/assistant/planner.py` 与 `scripts/test_multi_task*.py`（两者均已不存在），也未含 `scripts/test_multi_agent*.py`。按规则不手工编辑生成物，需重新生成：`uv run --no-project --with aider-chat python scripts/gen_repo_map.py --map-tokens 16384 -o REPO_MAP.md`                                                              |
+
+## 六、验证状态
 
 - 所有被改动的 Python 文件已通过 `py_compile` 语法校验（17 个文件）。
 - **未做运行时验证**：本次只改注释/docstring/文档，未触碰任何执行路径；按项目规则，若后续要验证行为改动，必须在容器内进行并 `-Build` 重建镜像。

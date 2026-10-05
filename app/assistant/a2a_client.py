@@ -38,6 +38,23 @@ AGENT_URLS = {
     "procurement": lambda: get_settings().contract_agent_url,
 }
 
+# domain 键 -> (卡片可读名, 一句话能力边界); 键集合与 AGENT_URLS 严格一致。
+# 卡片名跟 app/agents/*/agent_card.py 的 AgentCard.name 同源, 这里只摆给
+# 不需要走网络的地方读: GET /api/agents 渲染前端可点选的智能体, 以及多智能体
+# 并发分节标题里的可读名(不拉 agent-card 是为了不给每次渲染依赖下游可用性)。
+# 新增智能体时三处同步: AGENT_URLS + AGENT_PROFILES + security/auth.AGENT_WHITELIST。
+AGENT_PROFILES: dict[str, tuple[str, str]] = {
+    "hr": ("HR_Agent", "入离职/证明/考勤/请假/工单等人事办理与查询"),
+    "finance": ("Finance_Agent", "费用报销全流程: 政策咨询/报销单创建/进度查询"),
+    "analytics": ("Analyst_Agent", "跨域数据统计(Text2SQL)/图表/周期经营报告"),
+    "procurement": ("Contract_Agent", "采购申请发起与合规初审/合同条款风险初审"),
+}
+
+
+def is_agent_domain(domain: str) -> bool:
+    """入参里的域键是否是已注册的可委派智能体(前端传错不应发起网络调用)。"""
+    return bool(domain) and domain in AGENT_URLS
+
 
 def _pin_card_url(card, base_url: str, domain: str):
     """把卡片里的端点地址强制换成配置地址。

@@ -6,6 +6,7 @@
     GET  /api/chat/stream/{run_id} 断点重连: 凭 Last-Event-ID 重放并续流
     GET  /api/sessions             某用户的会话列表
     GET  /api/sessions/{id}/messages  一个会话的完整历史(刷新后回填)
+    GET  /api/agents               当前角色可点选的专业智能体(多智能体并发委派选择器)
     DELETE /api/sessions/{id}      删除会话及其记录
     GET  /api/files/reports/{name} 回取分析产物文件（图表 SVG/PNG / 报告 Markdown / 数据 CSV）
 """
@@ -21,12 +22,14 @@ from pathlib import Path
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from app.assistant.a2a_client import AGENT_PROFILES
 from app.assistant.graph import get_orchestrator
 from app.assistant.stream import RunOverloaded, get_stream_hub, sse_frame
 from app.chat_store import get_chat_store
 from app.config import get_settings
 from app.db.session import db_available
-from app.schemas import ChatRequest, ChatResponse
+from app.schemas import ChatRequest, ChatResponse, Role
+from app.security.auth import AGENT_WHITELIST
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,31 @@ async def delete_session(session_id: str) -> dict[str, str]:
     """删除一个会话及其全部消息记录。"""
     await get_chat_store().delete_session(session_id)
     return {"status": "deleted", "session_id": session_id}
+
+
+@router.get("/agents")
+async def list_agents(role: str = Role.EMPLOYEE.value) -> list[dict]:
+    """当前角色可委派的专业智能体清单, 供前端渲染"多智能体并发点选"。
+
+    单一事实源: 域键与卡片名取自 ``a2a_client.AGENT_PROFILES``(与 ``AGENT_URLS``
+    同集合), 可见性取自 ``security/auth.AGENT_WHITELIST`` —— 不让前端硬编第四个智能体
+    叫什么, 也不把无权访问的智能体摆出来让用户点了才知道拒(与"无权工具对 LLM 完全不
+    可见"同一口径)。这里只摆菜单, 真正的权限闸门仍在委派时执行
+    (见 ``graph._delegate_task``), 不拿前端过滤当安全控制。
+
+    ``role`` 仍由客户端自报(本系统尚未接统一身份系统), 与 ChatRequest 同一可信上游假设;
+    未知角色归一为普通员工(默认拒), 不因为传个乱字就拿到管理员的清单。
+    """
+    try:
+        parsed = Role(role)
+    except ValueError:
+        parsed = Role.EMPLOYEE
+    allowed = AGENT_WHITELIST.get(parsed, set())
+    return [
+        {"domain": domain, "name": name, "description": blurb}
+        for domain, (name, blurb) in sorted(AGENT_PROFILES.items())
+        if f"{domain}_agent" in allowed
+    ]
 
 
 @router.get("/health")
