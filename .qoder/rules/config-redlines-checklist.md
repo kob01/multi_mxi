@@ -40,6 +40,6 @@ description: 动手改配置前的红线预检清单：app/config.py 的 env_fil
 | 容器内地址与 `docker/.env` 写的不一样 / 有人改了 dotenv 地址"没反应"    | 不许做 7：红线键已字面量锁死，改 dotenv 不再生效应改 compose；跑 `env-check` 定位                   |
 | 改了 `app/` 任何后端代码却不生效                                        | 容器跑的是镜像快照，`./scripts/dev.ps1 -Build` 重建（含 assistant，禁止改回宿主直跑验证，不许做 8） |
 | 某层能力莫名失效，原因不明                                              | 跑 `dev_services check`，再读 `config-env-tracks.md` §1                                             |
-| 智能体报"查不到员工"/`RuntimeError: 缺少 PostgreSQL 密码`             | 不许做 9：agent 容器已无凭据，解析要改走 `hr-mcp` 的 `lookup_employee_by_name`，不得回退成直连库 |
-| 写计划能生成但审计查不到（`sql_audit_records` 有行而 JSONL 无行）      | 不许做 9：`analytics-mcp` 的日志卷/`AUDIT_LOG_PATH` 被改掉了                                        |
-| 重建镜像后仍"谁都看得到全库数据"                                    | `RLS_ENABLED` 与角色名：进容器跑 `python -m scripts.init_db --rls-status` 看策略/角色是否真建立        |
+| 智能体报"查不到员工"/`RuntimeError: 缺少 PostgreSQL 密码`               | 不许做 9：agent 容器已无凭据，解析要改走 `hr-mcp` 的 `lookup_employee_by_name`，不得回退成直连库    |
+| 写计划能生成但审计查不到（`sql_audit_records` 有行而 JSONL 无行）       | 不许做 9：`analytics-mcp` 的日志卷/`AUDIT_LOG_PATH` 被改掉了                                        |
+| 重建镜像后仍"谁都看得到全库数据"                                        | `RLS_ENABLED` 与角色名：进容器跑 `python -m scripts.init_db --rls-status` 看策略/角色是否真建立     |
