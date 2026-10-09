@@ -205,7 +205,7 @@ class Settings(BaseSettings):
     pg_sslmode: str = "disable"
     pg_connect_timeout: int = 10
     # Text2SQL 语句级超时, 替代 MySQL 的 MAX_EXECUTION_TIME hint
-    # (由 app/db/sync.py 在执行前 SET LOCAL statement_timeout 注入)。
+    # (由 app/db/sync.py 在执行前以 set_config(..., is_local=true) 注入)。
     pg_statement_timeout_ms: int = 5000
     # ---------- 连接池容量(高并发唯一入口预算, 见下方容量对账注释) ----------
     # SQLAlchemy 默认 pool_size=5 / max_overflow=10 —— 那是"单进程个位数并发"的假设,
@@ -222,6 +222,55 @@ class Settings(BaseSettings):
     # 容量要小 —— 它是"网关 sync + 各 mcp/agent 进程"这份预算里的乘数项。
     pg_sync_pool_size: int = 5
     pg_sync_max_overflow: int = 5
+
+    # ---------- 层 0/1: analytics 域最小权限角色 + 行级安全(RLS) ----------
+    # 两个 NOLOGIN 角色由 app/db/rls.py 创建并授给登录账号(pg_user);
+    # 取数时 SET ROLE 到只读角色, 写执行时切到写角色(只授过白名单表的 UPDATE/INSERT)。
+    # 置空 = 不切角色(退回属主连接), 只供排障, 生产必须给值。
+    pg_role_analytics_read: str = "mxi_analytics_read"
+    pg_role_analytics_write: str = "mxi_analytics_write"
+    # analytics 专用小池: PG 无原生 resource group, 这是"给智能体账号绑独立资源"在
+    # 本仓的等效手段 —— 把分析/写通道能占的连接数封在一个小常数里。
+    pg_analytics_pool_size: int = 3
+    # RLS 总开关: 开启时对策略表 ENABLE + FORCE ROW LEVEL SECURITY(属主也受约束)。
+    # 关掉只会退回"靠代码注域谓词"这一层软控制, 数据库层隔离消失 —— 只用于回滚。
+    rls_enabled: bool = True
+    # 单租户部署的事实默认值; 真正多租户时这两个值由会话作用域覆盖。
+    default_tenant_id: str = "T001"
+    # 不受部门范围限制(可跨全员统计)的角色: 与 app/security/caller.PRIVILEGED_ROLES
+    # 同一口径, 但单独可调 —— "能看全员的业务角色"与"能跨人办单的角色"不必永远一致。
+    analytics_all_dept_roles: str = "hr,finance,admin"
+
+    # ---------- 层 3: AST SQL Guard(仅 analytics 域; 其余三域仍走 sql_guard) ----------
+    sqlguard_max_sql_length: int = 2000
+    sqlguard_max_rows: int = 50
+    # EXPLAIN 成本预估: 关闭时只靠语法校验与行数上限, 不再拦大扫描。
+    sqlguard_explain_enabled: bool = True
+    # 预估扫描行数超阈值直接拒(降级审批留给上层, 本层不做"慢一点也放过")。
+    sqlguard_max_scan_rows: int = 20000
+
+    # ---------- 层 4: 写通道专项护栏(DSL -> 模板 SQL) ----------
+    # 总开关: 关闭时 plan_data_op 一律拒, 已存 pending 也不可执行。
+    dataops_enabled: bool = True
+    # 影响行数梯度(0 / 1~auto / auto+1~approval / >approval): 关键在必须有梯度。
+    dataops_auto_execute_max_rows: int = 50
+    dataops_approval_max_rows: int = 500
+    # 软删保留窗口(天): 到期才允许真删; 变更前镜像同窗口留存。
+    dataops_retention_days: int = 7
+    # 可发起写计划的角色(默认不给 manager: 能看全员不等于能改)。
+    dataops_writable_roles: str = "finance,admin"
+    # 可审批的角色, 且服务端另外要求"审批人 != 发起人"。
+    dataops_approver_roles: str = "hr,finance,admin"
+    # pending 计划的确认令牌有效期(分钟): 超时作废, 防"一周前没确认的计划"飘回来执行。
+    dataops_pending_ttl_minutes: int = 30
+    # 写事务的语句超时(比只读更紧: 写操作卡在锁上不能拖着业务主库陪等)。
+    dataops_statement_timeout_ms: int = 3000
+    # 写意图校验(层 5-C 的计划偏移检测): 用服务端词表判断本轮原句是否真要写。
+    dataops_write_intent_guard: bool = True
+    # 可疑指令样式启发检测(降噪层, 不是唯一依赖)。
+    dataops_suspicious_data_guard: bool = True
+    # 结果出口 DLP 列黑名单(逗号分隔列名): 命中列返回前打码。
+    dlp_mask_columns: str = "bank_account,phone,id_card,email,id_no"
     # bge-m3 稠密向量维度; 换 embedding 模型必须同步改这里并全量重建向量表。
     embedding_dim: int = 1024
     # 单次 ON CONFLICT upsert 的行数 (避免单语句参数过多)。

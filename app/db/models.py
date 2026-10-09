@@ -30,6 +30,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _default_tenant_id() -> str:
+    """新行的租户归属默认取配置的单租户默认值(层 1)。
+
+    只给"服务端插行"这一条路径用; 旧行的回填走 app/db/scope.py 的显式 UPDATE。
+    回填不出的行留在 ``''``: 空租户在 RLS 策略下任何会话都匹配不上, 即"未归属 = 谁都
+    看不到"的默认拒, 而不是"未归属 = 全员可见"。
+    """
+    return get_settings().default_tenant_id
+
+
 class Base(DeclarativeBase):
     """Declarative base for all metadata tables."""
 
@@ -108,6 +118,11 @@ class Employee(Base):
     annual_leave_total: Mapped[int] = mapped_column(Integer, default=10)
     annual_leave_used: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="在职")  # 在职/离职
+    # ---- 层 1 作用域列(RLS 谓词键): tenant_id + dept_id 由会话作用域比对 ----
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
     )
@@ -124,6 +139,14 @@ class HRTicket(Base):
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="OPEN")  # OPEN/PROCESSING/DONE/CANCELLED
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    # 软删除三件套(层 4-3): 写通道里的 DELETE 一律被改写成 SET is_deleted=true。
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )
@@ -144,6 +167,13 @@ class LeaveRecord(Base):
     end_date: Mapped[date] = mapped_column(Date)
     days: Mapped[Decimal] = mapped_column(Numeric(5, 1))
     status: Mapped[str] = mapped_column(String(16), default="审批中")  # 审批中/已批准/已驳回
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )
@@ -165,6 +195,13 @@ class Reimbursement(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="SUBMITTED")  # SUBMITTED/APPROVED/REJECTED/PAID
     current_node: Mapped[str] = mapped_column(String(64), default="部门主管审批")
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )
@@ -181,6 +218,11 @@ class DepartmentBudget(Base):
     year: Mapped[int] = mapped_column(Integer)
     annual_budget: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     used_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    # 预算表是高危表(层 4-6 黑名单): 有作用域列供读隔离, 但写通道永远不命中它。
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +239,11 @@ class Supplier(Base):
     bank_account: Mapped[str] = mapped_column(String(64), default="")   # 收款账号 (合同付款条款一致性核对)
     qualification: Mapped[str] = mapped_column(String(32), default="")  # 一般纳税人/小规模/个体
     risk_status: Mapped[str] = mapped_column(String(16), default="正常")  # 正常/关注/黑名单
+    # 供应商是跨部门共享的主数据: dept_id 保空串(全员作用域), 只按 tenant_id 隔离。
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )
@@ -228,6 +275,13 @@ class PurchaseRequest(Base):
     # 初审结论摘要(人类可读); 结构化风险项落 flags JSON, 仅承载展示与复核信息
     precheck_result: Mapped[str] = mapped_column(Text, default="")
     flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )
@@ -264,11 +318,41 @@ class ContractReview(Base):
     review_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # LLM 抽取的条款/缺失项
     reviewer: Mapped[str] = mapped_column(String(64), default="")
     opinion: Mapped[str] = mapped_column(Text, default="")          # 初审意见(可直接回给用户)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    dept_id: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 层 1: 部门注册表(业务表 dept_id 的单一事实来源)
+# ---------------------------------------------------------------------------
+class Department(Base):
+    """部门注册表: ``dept_id`` <-> 部门名的唯一对应关系。
+
+    为什么新开一表而不是直接拿 ``hr_employees.department`` 当键: 字符串当隔离键会让
+    "市场部"与"市场一部"这类改名/重名变成隔在隔离层里看不见的洞; 业务表里留着
+    department 列供展示与旧 SQL 兼容, 而隔离判定只看 dept_id。
+    """
+
+    __tablename__ = "sys_departments"
+
+    dept_id: Mapped[str] = mapped_column(String(32), primary_key=True)  # D001+
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_tenant_id, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )
 
 
@@ -592,3 +676,136 @@ class ReportArtifact(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
     )
+
+
+# ---------------------------------------------------------------------------
+# 层 2/4/6: 写通道(模型只交结构化 DSL, 服务端模板化生成 SQL)的落库面
+# ---------------------------------------------------------------------------
+class PendingDataOp(Base):
+    """一个待确认/待审批的写计划。
+
+    为什么必须落库而不是在对话里一步执行: Analyst_Agent 的 A2A 卡片是 ``streaming=False``,
+    它的 ReAct 循环无法中途把"是否确认?"抛给用户并等回答。所以写操作分两段:
+    ``plan_data_op`` 只生成计划并回一个 op_id, 真正的执行发生在下一轮干净对话
+    (发起人确认) 或审批台(人工批准) —— 这同时把"读过业务数据的那轮推理"与
+    "执行写"隔成两个上下文(层 5-C 的信息流控制)。
+    """
+
+    __tablename__ = "dataops_pending"
+    __table_args__ = (
+        # 审批台列表的主路径: 按状态取待办 + 按发起人回查自己的计划。
+        Index("ix_dataops_pending_status_created", "status", "created_at"),
+        Index("ix_dataops_pending_actor_created", "actor_user_id", "created_at"),
+    )
+
+    op_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # uuid hex
+    trace_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), default="", index=True)
+    dept_scope: Mapped[str] = mapped_column(String(255), default="")  # 编译时注入的部门集(逗号分隔)
+    actor_user_id: Mapped[str] = mapped_column(String(64), default="")
+    actor_role: Mapped[str] = mapped_column(String(16), default="")
+    action: Mapped[str] = mapped_column(String(16), default="")        # update/delete/insert
+    entity: Mapped[str] = mapped_column(String(64), default="")
+    dsl_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 模型原样输出
+    final_sql: Mapped[str] = mapped_column(Text, default="")            # 服务端模板生成的 SQL
+    params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 绑定的值(永不进 SQL 文本)
+    preview_text: Mapped[str] = mapped_column(Text, default="")         # 给人看的回显
+    nl_question: Mapped[str] = mapped_column(Text, default="")          # 本轮用户原句
+    reason: Mapped[str] = mapped_column(Text, default="")               # 模型填的变更理由
+    est_rows: Mapped[int] = mapped_column(Integer, default=0)           # dry-run 影响行数
+    cost_estimate: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # PENDING_CONFIRM / PENDING_APPROVAL / NEED_REVIEW / DENIED / EXECUTED / EXPIRED / FAILED
+    status: Mapped[str] = mapped_column(String(24), default="PENDING_CONFIRM", index=True)
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    approver_id: Mapped[str] = mapped_column(String(64), default="")
+    approve_note: Mapped[str] = mapped_column(Text, default="")
+    before_image_ref: Mapped[str] = mapped_column(String(64), default="")
+    rows_affected: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SqlAuditRecord(Base):
+    """一次 SQL/写计划执行的不可篡改审计行(层 6)。
+
+    与 ``logs/audit.jsonl`` 双写: JSONL 是给 SIEM 采集的流, 本表是给"回滚/追责/异常
+    检测"做结构化查询的。注意 PG 层只是"逻辑不可变"(角色无 UPDATE/DELETE 权 +
+    RULE 拦写), 真 WORM 需要外部存储。
+    """
+
+    __tablename__ = "sql_audit_records"
+    __table_args__ = (
+        # 异常检测的窗口查询都按"谁 + 何时"走, 不带这个索引会全表扫审计本身。
+        Index("ix_sql_audit_user_ts", "user_id", "ts"),
+        Index("ix_sql_audit_decision_ts", "policy_decision", "ts"),
+    )
+
+    audit_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # uuid hex
+    trace_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), default="")
+    dept_id: Mapped[str] = mapped_column(String(255), default="")
+    user_id: Mapped[str] = mapped_column(String(64), default="")
+    role: Mapped[str] = mapped_column(String(16), default="")
+    nl_question: Mapped[str] = mapped_column(Text, default="")
+    generated_sql: Mapped[str] = mapped_column(Text, default="")  # 模型产出原文(SQL 或 DSL)
+    final_sql: Mapped[str] = mapped_column(Text, default="")      # 注入域谓词后的 SQL
+    policy_decision: Mapped[str] = mapped_column(String(16), default="allow")  # allow/deny/approval
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    approver_id: Mapped[str] = mapped_column(String(64), default="")
+    rows_affected: Mapped[int] = mapped_column(Integer, default=0)
+    before_image_ref: Mapped[str] = mapped_column(String(64), default="")
+    cost_estimate: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    engine: Mapped[str] = mapped_column(String(32), default="postgresql")
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+class DataOpBeforeImage(Base):
+    """变更前镜像: UPDATE/软删命中的整行快照(层 4-4)。
+
+    有了它, 回滚就是"照着镜像写回去", 而不是灾难。存 JSONB 而不是重建同构表:
+    要能容纳未来新加的列, 且不把归档面变成"每表一张影子表"的 DDL 膨胀。
+    """
+
+    __tablename__ = "dataop_before_image"
+    __table_args__ = (
+        Index("ix_dataop_image_op_captured", "op_id", "captured_at"),
+    )
+
+    image_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    op_id: Mapped[str] = mapped_column(String(64), index=True)
+    table_name: Mapped[str] = mapped_column(String(64), default="")
+    pk_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 主键列->值
+    row_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 整行
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+class DataOpArchive(Base):
+    """真删归档: 软删行到期真删前的整行备份(层 4-3 的"必须物理删的场景")。
+
+    与 before_image 的差别: image 服务于"回滚这一次变更", archive 服务于"数据已经
+    不在了但合规要求还能查到"。两个留存窗口各自独立, 不能合并到一个表里混口径。
+    """
+
+    __tablename__ = "dataop_archive"
+    __table_args__ = (
+        Index("ix_dataop_archive_table_purged", "table_name", "purge_after"),
+    )
+
+    archive_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    op_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    table_name: Mapped[str] = mapped_column(String(64), default="")
+    pk_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    row_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    deleted_by: Mapped[str] = mapped_column(String(64), default="")
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    # 到期才允许真删(与软删保留窗口同一口径)。
+    purge_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

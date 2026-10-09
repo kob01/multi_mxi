@@ -8,6 +8,9 @@ Creates all ORM tables if missing (documents + hr_* + fin_*), then inserts
 mock rows into hr_employees / hr_tickets / hr_leave_records /
 fin_reimbursements / fin_department_budgets. Existing document tables are
 never touched; --force only wipes the five business tables.
+
+导入完会补跑一次作用域回填(层 1): mock 行只给部门名, tenant_id/dept_id 由
+app/db/scope.py 从部门注册表算出来。
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from app.db.models import (
     Supplier,
 )
 from app.db.session import get_session_factory, init_schema
+from app.db.scope import ensure_data_scope_backfill
 
 BUSINESS_TABLES = (
     Employee, HRTicket, LeaveRecord, Reimbursement, DepartmentBudget,
@@ -197,6 +201,10 @@ async def seed(force: bool) -> None:
         total = (len(EMPLOYEES) + len(TICKETS) + len(LEAVES) + len(REIMBURSEMENTS) + len(BUDGETS)
                  + len(SUPPLIERS) + len(PURCHASE_ORDERS) + len(CONTRACTS))
         await session.commit()
+    # 层 1: 种子数据只写部门名, tenant_id/dept_id 由回填算出。
+    # (init_schema 里那次回填跑在本脚本插数之前, 对新导入的行等于空转。)
+    await ensure_data_scope_backfill()
+    print("[scope] 已回填 tenant_id/dept_id (部门号见 sys_departments)")
     print(f"[done] 共导入 {total} 行 mock 数据 (员工{len(EMPLOYEES)}/工单{len(TICKETS)}/"
           f"请假{len(LEAVES)}/报销{len(REIMBURSEMENTS)}/预算{len(BUDGETS)}/"
           f"供应商{len(SUPPLIERS)}/采购{len(PURCHASE_ORDERS)}/合同{len(CONTRACTS)})")

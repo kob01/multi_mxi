@@ -23,7 +23,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from app.agents.common_tools import lookup_employee_by_name
+from app.agents.common_tools import take_lookup_tool, with_lookup_tool
 from app.config import get_settings
 from app.db.schema_docs import FINANCE_SCHEMA_DDL
 from app.llm import get_chat_model
@@ -114,6 +114,7 @@ class FinanceAgent:
         self._llm = get_chat_model(settings.llm_model, temperature=0)
         self._tools: list[Any] | None = None
         self._tools_at = 0.0
+        self._lookup: Any | None = None
         self._agents: dict[Role, Any] = {}
 
     def _ttl(self) -> float:
@@ -128,16 +129,23 @@ class FinanceAgent:
         """
         if self._tools is None or time.monotonic() - self._tools_at > self._ttl():
             client = MultiServerMCPClient(
-                {"finance": {"url": self._settings.finance_mcp_url, "transport": "streamable_http"}}
+                {
+                    "finance": {"url": self._settings.finance_mcp_url, "transport": "streamable_http"},
+                    # 层 0(收回跨域凭证): 本进程不再直连库, "姓名->工号"由数据属域
+                    # (HR MCP server)代做; 两个 server 的工具分开取, 避开同名
+                    # execute_sql 合并后重名。
+                    "hr": {"url": self._settings.hr_mcp_url, "transport": "streamable_http"},
+                }
             )
-            self._tools = await client.get_tools()
+            self._tools = await client.get_tools(server_name="finance")
+            self._lookup = take_lookup_tool(await client.get_tools(server_name="hr"))
             self._tools_at = time.monotonic()
             self._agents.clear()
         if role not in self._agents:
             # 权限Mask: 与编排层共用同一张角色×工具白名单矩阵 (硬控制)。
             tools = filter_tools_for_role(role, "finance", self._tools)
             # 各域共用的"姓名->工号"基础解析能力注入: 用户只给姓名时先解析工号。
-            tools = [*tools, lookup_employee_by_name]
+            tools = with_lookup_tool(tools, self._lookup)
             # 调用者身份注入: 报销工具的归属校验只认服务端注入的 caller_*, 这份身份
             # 在 :meth:`invoke` 里逐请求写进上下文, 因此按角色缓存的 agent 可以
             # 安全地服务不同工号(见 app/security/caller.py)。

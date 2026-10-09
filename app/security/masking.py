@@ -57,3 +57,34 @@ def mask_sensitive(data: Any) -> Any:
     if isinstance(data, str):
         return mask_text(data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# 结果出口 DLP(层 5-C 最后一条): 列黑名单 + 行数限制, 防"把所有手机号列出来"这类渗出。
+# 与上面的文本打码不同: 这里按**列名**整列处理, 因为 Text2SQL 的结果里手机号可能是
+# 干净的 11 位数字串(没有上下文就命不中上面的正则)。
+# ---------------------------------------------------------------------------
+def dlp_columns() -> set[str]:
+    """配置里的敏感列名集合(解析不出来 = 不打码, 但启动日志会告警)。"""
+    from app.config import get_settings
+
+    raw = (get_settings().dlp_mask_columns or "").lower()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def mask_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按列黑名单打码行数据(只改值, 不改列集合: 列消失了模型会自己编一个说辞)。"""
+    cols = dlp_columns()
+    if not cols:
+        return rows
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        item = dict(row)
+        for key in list(item.keys()):
+            if key.lower() in cols and item[key] not in (None, ""):
+                item[key] = "[已隐]"
+        out.append(item)
+    return out

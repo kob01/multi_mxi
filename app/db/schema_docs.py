@@ -80,12 +80,19 @@ hr_employees 员工主数据:
 # ---------------------------------------------------------------------------
 # 与 HR/FINANCE 两份 DDL 的区别: 那两份是给"单域智能体"看的, 本份是跨域汇总,
 # 供 analytics 的 run_sql 使用同一张表白名单 (见 app/mcp_servers/analytics_server.py)。
+#
+# tenant_id/dept_id 必须写进来但不是"给模型用的过滤条件": 它们由数据库的行级安全
+# (RLS)自动生效, 说明写在这里是为了让模型知道"为什么我只看到部分行", 而不是
+# 看到空结果就去编一个 WHERE tenant_id='T001' 出来。
 ANALYTICS_SCHEMA_DDL = """\
 -- 数据洞察可查表 (只读, 跨 HR/Finance/Procurement 三域)
+-- 每张业务表都有 tenant_id / dept_id 两列: 它们由服务端行级安全自动限定,
+-- 你不需要也不应该自己写这两个条件。已软删除的行(is_deleted=true)不在分析范围内。
 hr_employees 员工主数据:
   emp_id VARCHAR(32) PK, name VARCHAR(64), department VARCHAR(64),
   position VARCHAR(64), hire_date DATE, annual_leave_total INT,
-  annual_leave_used INT, status VARCHAR(16)  -- 在职/离职
+  annual_leave_used INT, status VARCHAR(16),  -- 在职/离职
+  tenant_id VARCHAR(32), dept_id VARCHAR(32)  -- 作用域列(服务端维护)
 
 hr_tickets HR 工单:
   ticket_no VARCHAR(32) PK, emp_id VARCHAR(32), category VARCHAR(32),

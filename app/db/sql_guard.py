@@ -1,5 +1,10 @@
 """Read-only SQL guard for Text2SQL ``execute_sql`` tools.
 
+**适用范围**: hr/finance/procurement 三个域的 ``execute_sql``。analytics 域已升级到
+基于 AST 的校验(见 app/db/ast_guard.py, 语句数/表引用/恒真谓词/函数黑名单全部
+结构判定), 因为正则黑名单在多层编码、注释穿插、大小写变形面前基本无效 —— 那三个
+域不在本轮改造范围内, 所以本模块保留原样而不是删掉。
+
 Text2SQL 场景下由 LLM 生成 SQL, 这里做硬校验 (方言: PostgreSQL):
 - 仅允许单条 SELECT / WITH ... SELECT 语句
 - 关键字黑名单 (DML/DDL/服务端函数/系统目录; 含 PG 特有的 SELECT INTO / COPY /
@@ -8,7 +13,10 @@ Text2SQL 场景下由 LLM 生成 SQL, 这里做硬校验 (方言: PostgreSQL):
 - 强制行数上限 (MAX_ROWS), 结果集过大时改写 LIMIT
 
 语句级超时不在这里注入: PostgreSQL 没有 MySQL 的 MAX_EXECUTION_TIME hint,
-由 app.db.sync 在执行前 ``SET LOCAL statement_timeout`` 完成。
+由 app.db.sync 在执行前 ``set_config('statement_timeout', ..., true)`` 完成。
+
+已知不足(不在本轮修, 但得记在明处): 黑名单是文本层的, 可以被 ``/**/`` 穿插绕过;
+这三个域的数据隔离目前也只靠本模块 + 工具层的归属校验, 没有 RLS 兜底。
 """
 
 from __future__ import annotations

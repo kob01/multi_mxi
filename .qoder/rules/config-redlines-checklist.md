@@ -9,7 +9,7 @@ description: 动手改配置前的红线预检清单：app/config.py 的 env_fil
 
 本文件只是**预检清单**；展开正文与原因在 `.qoder/rules/config-env-tracks.md`（改上述文件时 glob 自动加载）。同一条规则不要在两处同时改。
 
-## 八条不许做
+## 九条不许做
 
 1. 不许把 `docker/.env` 加进 `app/config.py` 的 `env_file`（现必须是 `(".env", ".env.local")`）。
 2. 不许在 `docker/.env` 里把容器地址写成 `localhost`：`PG_HOST=postgres`、`MONGO_URL=mongodb://mongo:27017`，`ES_URL`/`TEI_RERANK_URL`/`REDIS_URL`/`NEO4J_URI` 同理。
@@ -19,6 +19,7 @@ description: 动手改配置前的红线预检清单：app/config.py 的 env_fil
 6. 不许从 `.dockerignore` 删掉 dotenv 与 `docker/secrets/` 的排除行——这是双轨隔离与镜像不泄密共同的地基。
 7. 不许把 compose `environment:` 里的红线键（地址/卷路径/tracing/ASSISTANT_PORT，名单见 `dev_services.py::COMPOSE_REDLINE_KEYS`）改回 `${VAR:-...}` 插值——那会让 docker/.env 与 shell 残留 export 能悄悄改容器地址（静默降级）；也不许在宿主机 export 同名地址变量后跑脚本。
 8. 不许在宿主机直跑网关/后端服务做代码验证（容器是唯一验证环境，assistant 在 `DEV_SERVICES` 主轨里；见 `container-first-verification.md`）。
+9. 不许给四个 `*-agent` 容器注回 `pg_password` secret 或 `PG_*` 环境键（智能体只讲 MCP/A2A，姓名解析已归 `hr-mcp`；层 0 凭据收回）；也不许把 RLS 策略/最小权限角色只写进 `docker/init/*.sql`（那个目录只在空卷首次初始化时跑，存量库永远不会执行，隔离必须能在已有卷上生效——只能进 `init_schema()` 的幂等尾部）；`analytics-mcp` 必须挂 `../logs:/data/logs` + `AUDIT_LOG_PATH`（写治理的审计在该进程里产生，不挂载就只存进容器文件系统，SIEM 与人都看不到）。
 
 ## 三条必须做
 
@@ -39,3 +40,6 @@ description: 动手改配置前的红线预检清单：app/config.py 的 env_fil
 | 容器内地址与 `docker/.env` 写的不一样 / 有人改了 dotenv 地址"没反应"    | 不许做 7：红线键已字面量锁死，改 dotenv 不再生效应改 compose；跑 `env-check` 定位                   |
 | 改了 `app/` 任何后端代码却不生效                                        | 容器跑的是镜像快照，`./scripts/dev.ps1 -Build` 重建（含 assistant，禁止改回宿主直跑验证，不许做 8） |
 | 某层能力莫名失效，原因不明                                              | 跑 `dev_services check`，再读 `config-env-tracks.md` §1                                             |
+| 智能体报"查不到员工"/`RuntimeError: 缺少 PostgreSQL 密码`             | 不许做 9：agent 容器已无凭据，解析要改走 `hr-mcp` 的 `lookup_employee_by_name`，不得回退成直连库 |
+| 写计划能生成但审计查不到（`sql_audit_records` 有行而 JSONL 无行）      | 不许做 9：`analytics-mcp` 的日志卷/`AUDIT_LOG_PATH` 被改掉了                                        |
+| 重建镜像后仍"谁都看得到全库数据"                                    | `RLS_ENABLED` 与角色名：进容器跑 `python -m scripts.init_db --rls-status` 看策略/角色是否真建立        |

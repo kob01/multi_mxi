@@ -142,14 +142,10 @@ services:
       # 所以这里写容器内服务名不会让宿主直跑的网关连不上。
       HR_AGENT_URL: http://hr-agent:9001
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      # 专业智能体经 common_tools 直连 PG 按姓名查工号: 缺这几项会退回代码默认值
-      # localhost(容器内=自身), 表现为"查不到员工"的静默降级而非启动报错。
-      PG_HOST: postgres
-      PG_PORT: ${PG_PORT:-5432}
-      PG_USER: ${PG_USER:-mxi}
-      PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: disable
-    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
+      # 层 0(收回跨域凭证): agent 进程不再持有任何数据库凭据。原先这里注入 PG_* +
+      # pg_password 是因为 common_tools 在进程内直连库查员工表做"姓名->工号"解析;
+      # 该能力已归到 hr-mcp 的 lookup_employee_by_name, 智能体只讲 MCP/A2A。
+    secrets: [deepseek_api_key, zhipu_api_key]
     volumes:
       - ../logs:/data/logs
     depends_on: [hr-mcp]
@@ -168,17 +164,16 @@ services:
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
+      # "姓名->工号"解析改由 hr-mcp 代做(层 0: 本容器不再有数据库凭据), 缺这行会
+      # 退回代码默认值 localhost:18001(容器内=自身)而静默丢能力。
+      HR_MCP_URL: http://hr-mcp:8001/mcp
       FINANCE_AGENT_URL: http://finance-agent:9002
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: postgres
-      PG_PORT: ${PG_PORT:-5432}
-      PG_USER: ${PG_USER:-mxi}
-      PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: disable
-    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
+      # 层 0(收回跨域凭证): 不再注入 PG_* 与 pg_password, 见 hr-agent 同名注释。
+    secrets: [deepseek_api_key, zhipu_api_key]
     volumes:
       - ../logs:/data/logs
-    depends_on: [finance-mcp]
+    depends_on: [finance-mcp, hr-mcp]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
@@ -200,9 +195,13 @@ services:
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       REPORT_DIR: /data/reports
+      # 审计必须落在共享卷: 写操作的作用域/成本/预演结果是在本进程里算出来的,
+      # 不挂载就会只存到容器文件系统的 logs/ 里, SIEM 与人都看不到(层 6 直接断链)。
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
     secrets: [pg_password, deepseek_api_key, zhipu_api_key]
     volumes:
       - ../data:/data
+      - ../logs:/data/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -242,12 +241,9 @@ services:
       ANALYTICS_MCP_URL: http://analytics-mcp:8005/mcp
       ANALYST_AGENT_URL: http://analyst-agent:9005
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: postgres
-      PG_PORT: ${PG_PORT:-5432}
-      PG_USER: ${PG_USER:-mxi}
-      PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: disable
-    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
+      # 层 0(收回跨域凭证): 本容器原先就注入了 PG_* + pg_password 却根本不直连库
+      # (取数全走 analytics-mcp) —— 闲置的属主凭据也是面, 一律收回。
+    secrets: [deepseek_api_key, zhipu_api_key]
     volumes:
       - ../logs:/data/logs
     depends_on: [analytics-mcp]
@@ -266,17 +262,15 @@ services:
       LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
       INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
       PROCUREMENT_MCP_URL: http://procurement-mcp:8006/mcp
+      # "姓名->工号"解析改由 hr-mcp 代做(层 0: 本容器不再有数据库凭据)。
+      HR_MCP_URL: http://hr-mcp:8001/mcp
       CONTRACT_AGENT_URL: http://contract-agent:9006
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
-      PG_HOST: postgres
-      PG_PORT: ${PG_PORT:-5432}
-      PG_USER: ${PG_USER:-mxi}
-      PG_DATABASE: ${PG_DATABASE:-mxi}
-      PG_SSLMODE: disable
-    secrets: [deepseek_api_key, zhipu_api_key, pg_password]
+      # 层 0(收回跨域凭证): 不再注入 PG_* 与 pg_password, 见 hr-agent 同名注释。
+    secrets: [deepseek_api_key, zhipu_api_key]
     volumes:
       - ../logs:/data/logs
-    depends_on: [procurement-mcp]
+    depends_on: [procurement-mcp, hr-mcp]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [mxi]

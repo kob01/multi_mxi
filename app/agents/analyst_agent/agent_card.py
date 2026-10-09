@@ -19,7 +19,8 @@ def build_agent_card() -> AgentCard:
         name="Analyst_Agent",
         description=(
             "数据洞察专业智能体: 跨 HR/财务/采购业务域做自然语言统计查询(Text2SQL)、"
-            "生成图表与周期经营报告(周报/月报), 所有查询均为只读, 不改动业务数据。"
+            "生成图表与周期经营报告(周报/月报)。取数受服务端行级安全按租户/部门限定;"
+            "数据变更只能提交结构化计划, 经发起人二次确认或人工审批后才执行, 且只软删除。"
         ),
         url=f"{settings.analyst_agent_url}/",
         version="1.0.0",
@@ -54,6 +55,19 @@ def build_agent_card() -> AgentCard:
                 description="按周期取固定口径的经营指标概览(费用/预算/工单/采购/合同)",
                 tags=["analytics", "metrics", "overview"],
                 examples=["这个月整体经营情况怎么样", "看下本季度关键指标"],
+            ),
+            AgentSkill(
+                id="data_change_planning",
+                name="受治理的数据变更(仅白名单角色)",
+                description=(
+                    "把变更意图表达为结构化 JSON 计划(不写 SQL): 服务端查白名单、注入租户/"
+                    "部门谓词、预演影响行数并分档; 自动档需发起人下一轮确认, 大批量转人工审批"
+                ),
+                tags=["analytics", "dataops", "governed-write"],
+                examples=[
+                    "把半年前已取消的采购单标记作废",
+                    "把 HR1004 这张工单的状态改成已完成",
+                ],
             ),
         ],
     )

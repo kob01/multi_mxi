@@ -32,6 +32,18 @@ PRIVILEGED_ROLES = frozenset({"manager", "hr", "finance", "admin"})
 CALLER_ARG_USER_ID = "caller_user_id"
 CALLER_ARG_ROLE = "caller_role"
 CALLER_ARG_DEPT = "caller_department"
+# 本轮用户原句(不是模型复述): 层 5-C 的计划偏移检测要拿它核对"本轮到底要不要写"。
+# 与其余 caller_* 同理: 由编排层注入并覆盖模型填的同名字段, 模型伪造不了自己的话。
+CALLER_ARG_INTENT = "caller_intent_text"
+# 链路号也走同一道服务端注入: 工具要把自己的 allow/deny 归到同一轮对话的审计链上,
+# 而这个值不该由模型编(它编不出来, 也就拿不到别人的链路)。
+CALLER_ARG_TRACE = "trace_id"
+
+
+def _clip(text: str, limit: int = 500) -> str:
+    """上下文里只带得下那么多: 长句子切前一段就够做词表核对了。"""
+    text = (text or "").strip()
+    return text[:limit]
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,8 @@ class Caller:
     user_id: str = ""
     role: str = "employee"
     department: str = ""
+    intent_text: str = ""
+    trace_id: str = ""
 
     @property
     def is_privileged(self) -> bool:
@@ -71,11 +85,14 @@ def caller_tool_args() -> dict[str, str]:
     """编排层注入给 MCP/进程内工具的参数补丁(取当前上下文的调用者)。"""
     caller = _current.get()
     if caller is None:
-        return {CALLER_ARG_USER_ID: "", CALLER_ARG_ROLE: "", CALLER_ARG_DEPT: ""}
+        return {CALLER_ARG_USER_ID: "", CALLER_ARG_ROLE: "", CALLER_ARG_DEPT: "",
+                CALLER_ARG_INTENT: "", CALLER_ARG_TRACE: ""}
     return {
         CALLER_ARG_USER_ID: caller.user_id,
         CALLER_ARG_ROLE: caller.role,
         CALLER_ARG_DEPT: caller.department,
+        CALLER_ARG_INTENT: _clip(caller.intent_text),
+        CALLER_ARG_TRACE: caller.trace_id,
     }
 
 
@@ -100,7 +117,14 @@ def bind_caller(tool):
     from langchain_core.tools import StructuredTool
 
     async def _coro(**kwargs):
-        args = {**kwargs, **caller_tool_args()}
+        # 只填该工具声明过的注入字段: 不同工具带的 caller_* 子集不一样(如只读工具
+        # 没有 caller_department), 多出来的键会在参数校验上报"意料之外"。
+        declared = getattr(tool, "args", {}) or {}
+        patch = {
+            k: v for k, v in caller_tool_args().items()
+            if not declared or k in declared
+        }
+        args = {**kwargs, **patch}
         result = await tool.ainvoke(args)
         if isinstance(result, list):  # MCP 工具可能返回内容块列表, 拼成文本更好读
             result = "".join(
@@ -128,13 +152,20 @@ def bind_caller_tools(tools: list) -> list:
 NO_CALLER = "缺少调用者身份, 已拒绝执行(该工具只能经助手网关以登录态调用)"
 
 
-def resolve_caller(user_id: str = "", role: str = "", department: str = "") -> Caller | None:
+def resolve_caller(
+    user_id: str = "",
+    role: str = "",
+    department: str = "",
+    intent_text: str = "",
+    trace_id: str = "",
+) -> Caller | None:
     """把工具收到的注入参数还原成 :class:`Caller`; 空身份返回 None(调用方须拒执行)。"""
     user_id = (user_id or "").strip()
     if not user_id:
         return None
     return Caller(user_id=user_id, role=(role or "employee").strip().lower() or "employee",
-                  department=(department or "").strip())
+                  department=(department or "").strip(),
+                  intent_text=_clip(intent_text), trace_id=(trace_id or "").strip())
 
 
 def forbidden(reason: str, **extra: object) -> dict[str, object]:

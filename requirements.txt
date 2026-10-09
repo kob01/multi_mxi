@@ -40,6 +40,8 @@ python-multipart>=0.0.9
 sqlalchemy[asyncio]>=2.0.30
 asyncpg>=0.29.0
 psycopg[binary]>=3.1.21
+# 层 3: analytics 域的 AST SQL 校验(见 app/db/ast_guard.py)
+sqlglot>=25.0
 python-pptx>=1.0.0
 pillow>=10.0.0
 

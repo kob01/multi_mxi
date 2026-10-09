@@ -73,7 +73,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from app.agents.common_tools import lookup_employee_by_name
+from app.agents.common_tools import take_lookup_tool, with_lookup_tool
 from app.assistant.a2a_client import AGENT_PROFILES, get_a2a_pool, is_agent_domain
 from app.assistant.intent import IntentRecognizer, needs_current_time
 from app.assistant.mcp_client import get_mcp_pool
@@ -252,6 +252,10 @@ class AssistantOrchestrator:
         # (专业智能体层的同源做法见 app/agents/hr_agent/executor.py 的 _ensure_agent)。
         self._toolset_cache: dict[tuple[str, str, float], list[Any]] = {}
         self._agent_cache: dict[tuple[str, str, float], Any] = {}
+        # "姓名->工号"解析工具(层 0: 改由 HR MCP server 代做, 本进程不再为此直连库)
+        # 的当前份与它属于哪一次 hr 清单发现; 清单变了就重取, 不可用时降级为不注入。
+        self._lookup: Any | None = None
+        self._lookup_at = 0.0
         # ES BM25 全量重建的后台任务强引用(入库路径不陪重建等完)
         self._rebuild_tasks: set[asyncio.Task] = set()
         self._rebuild_running = False
@@ -861,7 +865,7 @@ class AssistantOrchestrator:
 
         # 权限Mask: 按角色×工具白名单矩阵过滤, 隐藏工具对 LLM 不可见、不可调。
         # 能力域未建矩阵 -> 透传全部(app/security/auth.py 的既定语义)。
-        tools = self._tools_for(target, role, all_tools, stamp)
+        tools = self._tools_for(target, role, all_tools, stamp, await self._lookup_tool())
         visible_names = [t.name for t in tools]
         self._audit.log(
             state.get("trace_id") or "", "assistant", "tools_filtered",
@@ -912,8 +916,33 @@ class AssistantOrchestrator:
     # 旧条目无限堆积(每条都是一个编译好的图, 不能当垃圾留着)。
     _TOOLSET_CACHE_MAX = 64
 
+    async def _lookup_tool(self) -> Any | None:
+        """取"姓名->工号"解析工具(由 HR MCP server 提供), 按 hr 清单版本缓存。
+
+        层 0 前这一份是本进程内的 ``@tool`` 直连库实现, 于是每个入口进程都得持有一份
+        能读写全部业务表的凭据; 现在实现归数据属域, 这里只负责发现与降级 —— hr-mcp
+        不可用时少注入一个工具(用户给工号照样能办), 而不是让整轮对话失败。
+        """
+        pool = get_mcp_pool()
+        stamp = pool.cache_stamp("hr")
+        if self._lookup is not None and stamp and self._lookup_at == stamp:
+            return self._lookup
+        try:
+            tools = await pool.get_tools("hr")
+        except Exception as exc:  # noqa: BLE001 - 解析工具不可用只少一项能力
+            logger.warning("姓名解析工具发现失败(hr-mcp 不可用), 本轮不注入: %s", exc)
+            return None
+        lookup = take_lookup_tool(tools)
+        if lookup is None:
+            logger.warning("hr-mcp 未提供 lookup_employee_by_name, 姓名解析不可用")
+            return None
+        self._lookup = lookup
+        self._lookup_at = pool.cache_stamp("hr")
+        return lookup
+
     def _tools_for(
-        self, target: str, role: Role, all_tools: list[Any], stamp: float
+        self, target: str, role: Role, all_tools: list[Any], stamp: float,
+        lookup: Any | None = None,
     ) -> list[Any]:
         """权限 Mask -> 注入跨域解析工具 -> Tool Cache 包装(结果按版本缓存)。"""
         key = (target, role.value, stamp)
@@ -922,7 +951,8 @@ class AssistantOrchestrator:
             return cached
         tools = filter_tools_for_role(role, target, all_tools)
         # 跨域基础解析能力(姓名->工号)注入: 用户只给姓名时先解析工号再调业务工具。
-        tools = [*tools, lookup_employee_by_name]
+        # hr 域自己的清单里已有同名工具, with_lookup_tool 会去重。
+        tools = with_lookup_tool(tools, lookup)
         # 身份注入 + Tool Cache: ReAct 循环里工具由 LLM 自主决定何时以何参数调用,
         # 缓存与"谁在调"都只能在工具本体上做。只读前缀白名单命中的工具额外接 Redis
         # 缓存(注入的 caller_* 已在 key 里, 所以结果按调用者隔离); 写操作工具只注身份、

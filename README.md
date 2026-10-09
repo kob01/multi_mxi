@@ -179,6 +179,38 @@ RAG:  Query → Embedding
   拦截组装/脏数据可能引入的越权块,剔除项写审计(`acl_final_check_dropped`);越权与"知识库没有"
   用同一拒答文案,不泄漏文档存在性。
 
+### 数据洞察智能体的六层数据访问治理
+
+Analyst_Agent 能跨 HR/财务/采购查全员数据, 也能受治理地改数据。"只靠提示词让模型小心"
+不成立, 因此这里是一层往一层下堆叠的硬约束(单一事实源: `app/db/rls.py` /
+`app/db/ast_guard.py` / `app/db/dataops.py`)。
+
+| 层 | 干什么 | 代码落点 |
+| --- | --- | --- |
+| 0 凭证 | agent 容器不再持有任何数据库凭据(已验证: `hr-agent`/`analyst-agent`/`finance-agent`/`contract-agent` 取口令直接抛错); "姓名->工号"解析从进程内直连库搬到 `hr-mcp` 的 `lookup_employee_by_name`; analytics 取数/写执行 `SET ROLE` 到 NOLOGIN 角色 | `docker-compose.yml` 四个 agent 服务、`app/mcp_servers/hr_server.py`、`app/db/sync.py::_attach_role_events` |
+| 1 隔离 | 8 张业务表带 `tenant_id`/`dept_id`; `ENABLE + FORCE ROW LEVEL SECURITY`(属主也受约束); GUC 缺失 = 一行也看不见(默认拒) | `app/db/rls.py`、`app/db/scope.py`(回填 + 作用域解析), 由 `init_schema()` 尾部幂等执行 |
+| 2 写形状 | 模型不写 SQL, 只交强类型 JSON DSL(`action`/`entity`/`filters`/`sets`/`reason`); 实体与字段逐个查白名单, 作用域谓词由服务端注入, 值全走绑参 | `app/db/datadsl.py`、`app/db/policy.py`、`app/db/dataops.py::compile_plan` |
+| 3 静态校验 | sqlglot AST 校验(语句数/类型/表引用/域谓词形状/恒真 WHERE/函数黑名单/十六进制与 `CHR()` 拼接/注释), 并**由 AST 重生 SQL** 送库; 外加 EXPLAIN 预估扫描行数阈值 | `app/db/ast_guard.py`(仅 analytics 域; 其余三域仍是 `app/db/sql_guard.py` 的正则黑名单) |
+| 4 误操作 | 预演 COUNT 后分四档: 0 行需复核 / 1~50 发起人二次确认 / 51~500 人工审批(审批人≠发起人) / >500 直接拒; DELETE 一律改写成软删; 变更前镜像支持回滚; 单事务 + 语句超时 + 专用小池; 高危表(员工/预算/供应商/审计)永无写权 | `app/db/dataops.py`、`app/db/policy.py::FORBIDDEN_ENTITIES`、`app/dataops/router.py` + `DataOpsView.vue`(审批台) |
+| 5 注入分治 | A 类参数绑定根治; B 类靠权限+AST+审批; C 类间接提示注入: 读回来的数据带 `untrusted_data`+声明(spotlighting), 敏感列出口 DLP 打码, **本轮读过业务数据就不允许发起写计划**(信息流控制), 写意图词表核对计划偏移 | `app/security/spotlight.py`、`app/security/masking.py`、`app/agents/analyst_agent/executor.py` |
+| 6 审计 | 每条 SQL/写计划落 `sql_audit_records`(原文/最终 SQL/决策/审批人/行数/镜像/成本), 与 JSONL 双写; 角色无 UPDATE/DELETE + RULE 拦改; 异常模式实时告警(频繁写计划/拒绝激增/跨域谓词尝试) | `app/db/dataops.py::record_audit`/`detect_anomalies`、`app/db/rls.py::ensure_audit_immutability` |
+
+三个容易误读的点:
+
+- **隔离并不是"代码里加了 WHERE"**: 只读路径靠 RLS 兜底(`SET ROLE` 后策略才真生效,
+  所以 `FORCE` + `NOBYPASSRLS` + `NOLOGIN` 三者缺一不可)。`RLS_ENABLED=false` 会退回
+  "只剩软控制"的状态, 此时固定口径指标/报告对部门级角色直接拒执行(否则就交出全员数字)。
+- **manager 被收紧了**: 改造前经理在 analytics 域"全量可见", 现在只读全量工具集,
+  且数据范围默认限本部门; 能改数据的角色由 `DATAOPS_WRITABLE_ROLES` 控制(默认 finance/admin)。
+- **写不是一步完成的**: A2A 卡片 `streaming=False`, ReAct 循环里无法中途向用户要确认,
+  所以 `plan_data_op` 只生成 `op_id` + 人话回显, 执行发生在下一轮发起人
+  `confirm_data_op` 或审批台批准; 这条两段式同时就是上面的信息流控制。
+
+自检: 离线纯函数 `python -m scripts.test_ast_guard_offline` 与
+`python -m scripts.test_dataops_dsl_offline`; 端到端隔离(含 RLS/写作用域/AST 绕过面)
+必须在容器里跑: `docker compose -f docker/docker-compose.yml exec assistant python -m scripts.test_scope_isolation`;
+RLS 当前结论可看一眼: `python -m scripts.init_db --rls-status`。
+
 ### 三层缓存与降级口径
 
 三类缓存统一落 Redis(`app/cache/`), 全部按"能降级就降级"设计: Redis 关闭/连不上
@@ -186,7 +218,7 @@ RAG:  Query → Embedding
 
 | 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                       |
 | ------------------------------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)     |
+| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)          |
 | Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名;文档重入库时 `refresh_knowledge()` 调 `invalidate_all()`(SCAN 而非 KEYS)     |
 | Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入 |
 

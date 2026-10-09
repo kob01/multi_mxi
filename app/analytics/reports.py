@@ -7,6 +7,10 @@
   "读数成文"——把结构化指标写成有判断的中文摘要, 不参与口径定义。
 
 区间口径: 全部按 created_at 落在 [start, end) 左闭右开, 内网东八区日历日。
+
+数据作用域(层 1/2): 本模块的 SQL 是服务端写好的, 语法不必再过校验器, 但**隔离不能免**:
+它们在同一份"生效角色 + 会话作用域"的事务里执行, 于是 RLS 策略对固定口径指标一样生效。
+JOIN 两侧都会被过滤, 所以"部门费用对比"天然只统计到调用者能看见的那部分人与那部分单。
 """
 
 from __future__ import annotations
@@ -59,14 +63,25 @@ def resolve_range(period: str, end: date | None = None) -> tuple[date, date, str
     return start, today + timedelta(days=1), label
 
 
-def _rows(sql: str, params: dict) -> list[dict[str, Any]]:
+def _rows(sql: str, params: dict, scope: Any = None) -> list[dict[str, Any]]:
     """跑一条服务端写好的只读指标 SQL; 单条失败返回空列表并留 WARNING。
 
     逐条降级是有意为之: 某张业务表还没建(新功能刚上线)时, 周报仍应把其余域的
     数字交出去, 而不是整份报告报错。
+
+    ``scope`` 带上时就切到 analytics 只读角色并注入会话作用域(层 0/1); 不带时
+    行为与改造前一致(属主连接), 仅给"不属于任何调用者"的后台任务用。
     """
     try:
-        payload = dbsync.execute_readonly_sql(sql, ALLOWED_TABLES, params)
+        from app.db.rls import read_role
+
+        payload = dbsync.execute_readonly_sql(
+            sql,
+            ALLOWED_TABLES,
+            params,
+            db_role=read_role(),
+            session_settings=scope.session_settings() if scope is not None else None,
+        )
         return payload[0]["rows"] if payload else []
     except Exception as exc:  # noqa: BLE001 - 指标级降级(白名单校验/执行失败都只让该域为空)
         logger.warning("report metric query failed (%s): %s", exc, sql[:80])
@@ -77,12 +92,22 @@ def _scalar(rows: list[dict[str, Any]], key: str, default: Any = 0) -> Any:
     return rows[0].get(key, default) if rows else default
 
 
-def collect_metrics(start: date, end: date) -> dict[str, Any]:
-    """按区间汇总五类经营指标(费用/预算/服务工单/人力/采购合同)。"""
+def collect_metrics(start: date, end: date, scope: Any = None) -> dict[str, Any]:
+    """按区间汇总五类经营指标(费用/预算/服务工单/人力/采购合同)。
+
+    ``scope`` 决定这些数字能被谁看见: 它被带进每一条指标 SQL 的执行事务(切只读角色 +
+    注会话作用域), 于是 RLS 与层 1 的隔离对固定口径一样生效。不传 = 属主连接全量,
+    只能给无调用者的后台任务用。
+    """
+
+    def _metric(sql: str, params: dict) -> list[dict[str, Any]]:
+        """本批指标 SQL 的统一出口: 把作用域带到每一条执行里。"""
+        return _rows(sql, params, scope)
+
     win = {"start": start.isoformat(), "end": end.isoformat()}
     year = {"year": start.year}
 
-    expense = _rows(
+    expense = _metric(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total, "
         "COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0) AS paid, "
         "COUNT(*) FILTER (WHERE status = 'SUBMITTED') AS pending, "
@@ -90,56 +115,56 @@ def collect_metrics(start: date, end: date) -> dict[str, Any]:
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end",
         win,
     )
-    expense_cat = _rows(
+    expense_cat = _metric(
         "SELECT category, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end "
         "GROUP BY category ORDER BY total DESC",
         win,
     )
-    dept_expense = _rows(
+    dept_expense = _metric(
         "SELECT e.department, COUNT(*) AS cnt, COALESCE(SUM(r.amount), 0) AS total "
         "FROM fin_reimbursements r JOIN hr_employees e ON r.emp_id = e.emp_id "
         "WHERE r.created_at >= :start AND r.created_at < :end "
         "GROUP BY e.department ORDER BY total DESC",
         win,
     )
-    daily = _rows(
+    daily = _metric(
         "SELECT to_char(date_trunc('day', created_at), 'MM-DD') AS day, "
         "COALESCE(SUM(amount), 0) AS total "
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end "
         "GROUP BY 1 ORDER BY 1",
         win,
     )
-    budget = _rows(
+    budget = _metric(
         "SELECT department, annual_budget, used_amount, "
         "ROUND(used_amount / NULLIF(annual_budget, 0) * 100, 1) AS used_pct "
         "FROM fin_department_budgets WHERE year = :year ORDER BY used_pct DESC NULLS LAST",
         year,
     )
-    tickets = _rows(
+    tickets = _metric(
         "SELECT COUNT(*) AS cnt, "
         "COUNT(*) FILTER (WHERE status = 'DONE') AS done, "
         "COUNT(*) FILTER (WHERE status IN ('OPEN', 'PROCESSING')) AS open_cnt "
         "FROM hr_tickets WHERE created_at >= :start AND created_at < :end",
         win,
     )
-    ticket_cat = _rows(
+    ticket_cat = _metric(
         "SELECT category, COUNT(*) AS cnt FROM hr_tickets "
         "WHERE created_at >= :start AND created_at < :end GROUP BY category ORDER BY cnt DESC",
         win,
     )
-    leave = _rows(
+    leave = _metric(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(days), 0) AS days "
         "FROM hr_leave_records WHERE created_at >= :start AND created_at < :end",
         win,
     )
-    purchase = _rows(
+    purchase = _metric(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total, "
         "COUNT(*) FILTER (WHERE status IN ('PRECHECK', 'PENDING')) AS pending "
         "FROM proc_orders WHERE created_at >= :start AND created_at < :end",
         win,
     )
-    contracts = _rows(
+    contracts = _metric(
         "SELECT COUNT(*) AS cnt, "
         "COUNT(*) FILTER (WHERE risk_level = '高') AS high, "
         "COUNT(*) FILTER (WHERE risk_level = '中') AS medium, "
@@ -147,7 +172,7 @@ def collect_metrics(start: date, end: date) -> dict[str, Any]:
         "FROM proc_contracts WHERE created_at >= :start AND created_at < :end",
         win,
     )
-    expiring = _rows(
+    expiring = _metric(
         "SELECT contract_no, title, party_b, expiry_date, amount "
         "FROM proc_contracts WHERE expiry_date IS NOT NULL "
         "AND expiry_date >= :start AND expiry_date < :end ORDER BY expiry_date",

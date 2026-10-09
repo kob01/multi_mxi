@@ -51,6 +51,10 @@ dependencies = [
     # 不打包 TTF 字体文件; docx/xlsx/pptx 由 python-docx/openpyxl/python-pptx 覆盖(已有)。
     "reportlab>=4.1",
     "sqlalchemy[asyncio]>=2.0.30",
+    # 层 3 的 AST SQL 校验(app/db/ast_guard.py): 只服务 analytics 域。为什么不用正则:
+    # 黑名单在多层编码/注释穿插/大小写变形前基本无效, 而模板化写通道必须能确定性地
+    # 数语句、遍历表引用、识别恒真 WHERE —— 这些只有解析器能做。
+    "sqlglot>=25.0",
     "uvicorn[standard]>=0.30.0",
 ]
 

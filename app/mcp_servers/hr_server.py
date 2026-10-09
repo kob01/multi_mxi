@@ -258,5 +258,67 @@ def execute_sql(sql: str) -> list[dict[str, Any]]:
         return [{"error": f"SQL 执行失败: {exc.__class__.__name__}", "sql": sql}]
 
 
+@mcp.tool()
+def lookup_employee_by_name(
+    name: str, caller_user_id: str = "", caller_role: str = ""
+) -> dict[str, Any]:
+    """Look up employee(s) by name and return their user_id (emp_id).
+
+    Use this when the user refers to a target person by NAME only (no emp_id),
+    before calling tools that require a user_id. If several employees share
+    the same name, the result carries needs_selection=True plus a candidates
+    list — present the candidates (name + user_id + department) to the user
+    and ask them to pick one; do NOT guess an emp_id by yourself.
+
+    Args:
+        name: Employee name, e.g. 张三. Exact match first; falls back to a
+            substring match when no exact match exists.
+        caller_user_id: 网关注入的调用者工号(本工具只读, 缺身份不拒)。
+        caller_role: 网关注入的调用者角色, 决定能否看到职位字段。
+
+    Returns:
+        Single match: {user_id, name, department, status} (管理角色另带 position)。
+        Multiple matches: {needs_selection: True, candidates: [...]}.
+        No match: {error: ...}.
+    """
+    name = name.strip()
+    if not name:
+        return {"error": "员工姓名不能为空"}
+    # 层 0(收回跨域凭证): 本工具原先是各 agent 进程内直连库实现的
+    # (app/agents/common_tools.py), 于是每个 agent 容器都得持有一份能读写全部业务表
+    # 的凭据。基础解析能力归到数据属域(HR MCP)由服务端代做, agent 进程只讲 MCP。
+    caller = resolve_caller(user_id=caller_user_id, role=caller_role)
+    with Session(dbsync.get_sync_engine()) as session:
+        stmt = select(Employee).where(Employee.name == name).order_by(Employee.emp_id)
+        emps = session.scalars(stmt).all()
+        if not emps:  # 精确匹配失败 -> 姓名包含匹配 (如"小王"匹配"王小明")
+            emps = session.scalars(
+                select(Employee).where(Employee.name.contains(name)).order_by(Employee.emp_id)
+            ).all()
+        if not emps:
+            return {"error": f"未找到姓名包含 \"{name}\" 的员工"}
+        candidates = [
+            {
+                "user_id": e.emp_id,
+                "name": e.name,
+                "department": e.department,
+                "status": e.status,
+            }
+            for e in emps
+        ]
+        if caller is None or caller.is_privileged:
+            for item, emp in zip(candidates, emps):
+                item["position"] = emp.position
+        if len(candidates) == 1:
+            return candidates[0]
+        # 同名多人: 返回结构化候选列表, 由前端渲染选择器(姓名+工号对应关系),
+        # 或由 LLM 以编号列表形式请用户选择。
+        return {
+            "needs_selection": True,
+            "message": f"找到 {len(candidates)} 位姓名包含 \"{name}\" 的员工, 请选择目标员工",
+            "candidates": candidates,
+        }
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")

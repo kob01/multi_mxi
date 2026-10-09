@@ -14,6 +14,12 @@ const empId = computed({
 })
 
 const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
+
+// 能进"变更审批"页的角色: 与后端 DATAOPS_APPROVER_ROLES 的**默认值**同口径。
+// 这里只是入口可见性, 不是权限判定 —— 服务端每个动作都重新查角色与"审批人≠发起人"，
+// 所以配置改了不重建前端也不会造成越权, 最多是菜单多/少一项。
+const APPROVER_ROLES = ['hr', 'finance', 'admin']
+const showDataOps = computed(() => APPROVER_ROLES.includes(current.role))
 </script>
 
 <template>
@@ -41,6 +47,7 @@ const roleLabel = computed(() => ROLE_LABELS[current.role] || current.role)
       <el-menu-item index="upload" :route="{ name: 'upload' }">文档管理</el-menu-item>
       <el-menu-item index="graph" :route="{ name: 'graph' }">知识图谱</el-menu-item>
       <el-menu-item index="memory" :route="{ name: 'memory' }">我的记忆</el-menu-item>
+      <el-menu-item v-if="showDataOps" index="dataops" :route="{ name: 'dataops' }">变更审批</el-menu-item>
     </el-menu>
   </div>
 </template>

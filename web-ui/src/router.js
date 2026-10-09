@@ -17,6 +17,12 @@ const routes = [
     name: "graph",
     component: () => import("./views/GraphView.vue"),
   },
+  {
+    // 数据变更审批台(层 4 的人工审批流): 待办列表 + 变更前镜像 + 审计回查。
+    path: "/dataops",
+    name: "dataops",
+    component: () => import("./views/DataOpsView.vue"),
+  },
 ];
 
 export default createRouter({

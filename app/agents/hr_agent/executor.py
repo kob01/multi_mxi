@@ -20,7 +20,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from app.agents.common_tools import lookup_employee_by_name
+from app.agents.common_tools import take_lookup_tool, with_lookup_tool
 from app.config import get_settings
 from app.db.schema_docs import HR_SCHEMA_DDL
 from app.llm import get_chat_model
@@ -109,6 +109,7 @@ class HRAgent:
         self._llm = get_chat_model(settings.llm_model, temperature=0.1)
         self._tools: list[Any] | None = None
         self._tools_at = 0.0
+        self._lookup: Any | None = None
         self._agents: dict[Role, Any] = {}
 
     def _ttl(self) -> float:
@@ -126,13 +127,15 @@ class HRAgent:
                 {"hr": {"url": self._settings.hr_mcp_url, "transport": "streamable_http"}}
             )
             self._tools = await client.get_tools()
+            # 层 0: 姓名解析不再在本进程直连库, 取本域 server 提供的那一份即可。
+            self._lookup = take_lookup_tool(self._tools)
             self._tools_at = time.monotonic()
             self._agents.clear()
         if role not in self._agents:
             # 权限Mask: 与编排层共用同一张角色×工具白名单矩阵 (硬控制)。
             tools = filter_tools_for_role(role, "hr", self._tools)
             # 各域共用的"姓名->工号"基础解析能力注入: 用户只给姓名时先解析工号。
-            tools = [*tools, lookup_employee_by_name]
+            tools = with_lookup_tool(tools, self._lookup)
             # 调用者身份注入: 业务工具的归属校验只认服务端注入的 caller_*, 而这份身份
             # 在 :meth:`invoke` 里逐请求写到上下文(不写在工具对象上, 所以同一个
             # 按角色缓存的 agent 能安全地服务不同工号)。

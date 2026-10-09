@@ -79,15 +79,48 @@ FINANCE_TOOL_WHITELIST: dict[Role, set[str] | None] = {
 
 # ---------------------------------------------------------------------------
 # 数据洞察域(analytics): run_sql 可跨 HR/Finance/Procurement 查全员数据, 属敏感工具,
-# 与 execute_sql 同级 —— 仅管理角色可见; 普通员工对本域默认拒绝(无任何工具)。
+# 与 execute_sql 同级 —— 仅管理角色可见; 普通员工对本域默认拒(无任何工具)。
+#
+# 写三工具(plan_data_op/confirm_data_op/list_my_dataops)单独按配置开放: 能看全员
+# 不等于能改数据(所以 manager 从原来的"全量可见"收成了"只读全量")。
 # ---------------------------------------------------------------------------
-ANALYTICS_TOOL_WHITELIST: dict[Role, set[str] | None] = {
-    Role.EMPLOYEE: set(),  # 跨域经营数据对普通员工完全隐藏
-    Role.MANAGER: None,    # 经理及以上: analytics 域全量可见
-    Role.HR: None,
-    Role.FINANCE: None,
-    Role.ADMIN: None,
-}
+ANALYTICS_READ_TOOLS: frozenset[str] = frozenset({
+    "run_sql",
+    "describe_tables",
+    "get_metrics_snapshot",
+    "render_chart",
+    "write_weekly_report",
+    "list_artifacts",
+})
+ANALYTICS_WRITE_TOOLS: frozenset[str] = frozenset({
+    "plan_data_op",
+    "confirm_data_op",
+    "list_my_dataops",
+})
+
+
+def dataops_writable_roles() -> set[str]:
+    """可发起/确认写计划的角色集(配置驱动; 解不出任何角色 = 无人可写)。
+
+    刻意每次调用现读配置而不是 import 时烧成常量: 写权限名单变了就得生效,
+    不能变成"改了 docker/.env 但不重建镜像就不生效"那种静默不一致。
+    """
+    from app.config import get_settings
+
+    raw = (get_settings().dataops_writable_roles or "").lower()
+    known = {r.value for r in Role}
+    return {p.strip() for p in raw.split(",") if p.strip() in known}
+
+
+def analytics_whitelist(role: Role) -> set[str]:
+    """analytics 域对某角色可见的工具集(读集 + 按配置附加写集)。"""
+    if role is Role.EMPLOYEE:
+        # 跨域经营数据对普通员工完全隐藏(网关层 AGENT_WHITELIST 也已拦他们)。
+        return set()
+    tools = set(ANALYTICS_READ_TOOLS)
+    if role.value in dataops_writable_roles():
+        tools |= ANALYTICS_WRITE_TOOLS
+    return tools
 
 # ---------------------------------------------------------------------------
 # 采购合同域(procurement): 员工可自助下单/送审/查自己单据, 但 execute_sql
@@ -116,11 +149,10 @@ PROCUREMENT_TOOL_WHITELIST: dict[Role, set[str] | None] = {
     Role.ADMIN: None,
 }
 
-# server_name -> 角色×工具白名单矩阵
+# server_name -> 角色×工具白名单矩阵; analytics 不在这里(它需要按配置即时算)。
 _DOMAIN_TOOL_WHITELISTS: dict[str, dict[Role, set[str] | None]] = {
     "finance": FINANCE_TOOL_WHITELIST,
     "hr": HR_TOOL_WHITELIST,
-    "analytics": ANALYTICS_TOOL_WHITELIST,
     "procurement": PROCUREMENT_TOOL_WHITELIST,
 }
 
@@ -160,13 +192,16 @@ def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> lis
 
     Tools must expose a ``name`` attribute (LangChain BaseTool). The four MCP
     business domains (finance/hr/analytics/procurement) are tiered by the
-    matrices in ``_DOMAIN_TOOL_WHITELISTS``; unregistered domains (e.g. the
-    in-process capability domains web/docgen) pass through here **without a
-    per-tool matrix** — they are gated one level up by
+    matrices in ``_DOMAIN_TOOL_WHITELISTS`` (analytics by :func:`analytics_whitelist`,
+    because its write tools depend on ``DATAOPS_WRITABLE_ROLES``); unregistered
+    domains (e.g. the in-process capability domains web/docgen) pass through here
+    **without a per-tool matrix** — they are gated one level up by
     :func:`check_capability_permission` plus :mod:`app.security.quota`, so
     "pass through" no longer means "no permission layer at all". Default-deny:
     roles missing from the matrix see nothing.
     """
+    if server_name == "analytics":
+        return [t for t in tools if t.name in analytics_whitelist(role)]
     matrix = _DOMAIN_TOOL_WHITELISTS.get(server_name)
     if matrix is None:
         return list(tools)

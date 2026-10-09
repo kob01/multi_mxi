@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.assistant.router import router as assistant_router
+from app.dataops.router import router as dataops_router
 from app.docs.router import router as docs_router
 from app.files.router import router as files_router
 from app.memory.router import router as memory_router
@@ -277,6 +278,9 @@ def create_app() -> FastAPI:
     app.include_router(docs_router)
     app.include_router(memory_router)
     app.include_router(kg_router)
+    # 数据变更审批台(层 4 的人工审批流 + 层 6 的审计回查): 执行体与 MCP 工具共用
+    # app/db/dataops.py 一套实现, 不在两条路径上各写一份判定逻辑。
+    app.include_router(dataops_router)
 
     # --- Vue3 SPA 托管: 仅当存在构建产物(生产/打包)时才启用 ---
     # 开发期不跑 pnpm build, web/dist 可能不存在: 旧的写法无条件回退 index.html,

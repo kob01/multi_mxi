@@ -126,6 +126,50 @@ _BACKFILL_INDEXES = (
     "ON long_term_memories (user_id, kind, last_accessed_at)",
 )
 
+# ---------------------------------------------------------------------------
+# 层 1 作用域列: 给已存在的业务表补 tenant_id / dept_id / 软删三件套。
+# 默认值给 ``''``(未归属)而不是真实租户号: RLS 下任何会话都匹配不上空串, 回填前这些
+# 行对分析与写通道都不可见 —— 宁可"暂时看不见", 也不要"暂时谁都能看见"。
+# 回填(按部门名算 dept_id)见 app/db/scope.py::ensure_data_scope_backfill。
+# ---------------------------------------------------------------------------
+_SCOPE_TABLES = (
+    "hr_employees",
+    "hr_tickets",
+    "hr_leave_records",
+    "fin_reimbursements",
+    "fin_department_budgets",
+    "proc_suppliers",
+    "proc_orders",
+    "proc_contracts",
+)
+# 只有"单据/台账"类表参与软删; hr_employees/预算/供应商在写通道黑名单里, 不须软删列。
+_SOFT_DELETE_TABLES = (
+    "hr_tickets",
+    "hr_leave_records",
+    "fin_reimbursements",
+    "proc_orders",
+    "proc_contracts",
+)
+_SCOPE_COLUMNS = {
+    "tenant_id": "VARCHAR(32) NOT NULL DEFAULT ''",
+    "dept_id": "VARCHAR(32) NOT NULL DEFAULT ''",
+}
+_SOFT_DELETE_COLUMNS = {
+    "is_deleted": "BOOLEAN NOT NULL DEFAULT false",
+    "deleted_at": "TIMESTAMPTZ",
+    "deleted_by": "VARCHAR(32) NOT NULL DEFAULT ''",
+}
+for _table in _SCOPE_TABLES:
+    _BACKFILL_COLUMNS.setdefault(_table, {}).update(_SCOPE_COLUMNS)
+for _table in _SOFT_DELETE_TABLES:
+    _BACKFILL_COLUMNS.setdefault(_table, {}).update(_SOFT_DELETE_COLUMNS)
+# RLS 谓词与域作域回查都是 (tenant_id, dept_id) 组合条件, 没这个复合索引时
+# 每条分析查询都会退化成"全表扫 + 逐行过策略"。
+_BACKFILL_INDEXES += tuple(
+    f"CREATE INDEX IF NOT EXISTS ix_{_table}_tenant_dept ON {_table} (tenant_id, dept_id)"
+    for _table in _SCOPE_TABLES
+)
+
 
 def _table_columns(sync_conn, table: str) -> set[str]:
     """Existing column names of ``table`` via the dialect inspector (no raw SQL).
@@ -151,6 +195,11 @@ async def init_schema() -> None:
     Also backfills columns/indexes on pre-existing tables (``create_all`` never
     ALTERs existing tables, 见 ``_BACKFILL_COLUMNS`` / ``_BACKFILL_INDEXES``), so
     upgrading an old database stays safe and idempotent.
+
+    最后一道是层 1 的数据库隔离: 先按部门名回填作用域列, 再建两个最小权限角色与
+    RLS 策略(全部幂等)。为什么不只放在 docker/init/*.sql: 那个目录只在**空卷首次
+    初始化**时执行, 已有 pg_data 卷的存量库永远不会跑它 —— 那就等于"只在文档里
+    存在的隔离"。幂等地排在 create_all 之后是新库与老库收敛到同一结论的唯一方式。
     """
     from app.db.models import Base
 
@@ -171,6 +220,21 @@ async def init_schema() -> None:
                     await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
         for ddl in _BACKFILL_INDEXES:
             await conn.execute(text(ddl))
+
+    # 作用域回填与策略/角色建立(内部各自幂等; rls_enabled=false 时只回填不碰策略)。
+    from app.db.rls import (
+        ensure_audit_immutability,
+        ensure_db_principals,
+        ensure_rls_policies,
+    )
+    from app.db.scope import ensure_data_scope_backfill
+
+    await ensure_data_scope_backfill()
+    if get_settings().rls_enabled:
+        await ensure_db_principals()
+        await ensure_rls_policies()
+    # 审计不可变性不跟着 RLS 一起关: 它是层 6 的地基, 与隔离开关无关。
+    await ensure_audit_immutability()
 
 
 def db_available() -> bool:
