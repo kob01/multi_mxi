@@ -154,6 +154,25 @@ class Settings(BaseSettings):
     # 超上限部分截掉并给出提示(需要全文时改为只点选一个智能体)。
     multi_agent_answer_chars: int = 4000
 
+    # ---------- Finance_Agent 第三代 Agentic AI(自主决策 + 协同执行) ----------
+    # 把 finance_agent 从单循环 ReAct 升级为显式 planner -> executor(逐步) -> reflector
+    # (复核/重规划)闭环, 并允许其作为对等智能体横向委派 hr/analytics/procurement 域。
+    # 总开关: 关闭即回退旧的全量单循环 ReAct 路径(_legacy_invoke), 一键可回滚。
+    # 注意: 这是 finance_agent 进程内部的自主规划, 与被下线的"编排层 LLM 自动拆句"
+    # 无关 —— 后者是 Assistant 把一句用户问法跨智能体拆开, 前者的 A2A 契约不变。
+    finance_agentic_enabled: bool = True
+    # 单次目标可排入的子任务步数上限: 触顶即产出"已完成部分 + 未竟事项", 绝不无界自旋
+    # (委派是整轮多步办理, 没有硬预算就会卡死一路 A2A 连接与并发闸门)。
+    finance_max_plan_steps: int = 6
+    # 反思判定"目标未达成需重规划"的最大回炉轮数: 每轮重排剩余子任务, 超出即收口。
+    finance_max_replan_rounds: int = 2
+    # 横向 A2A peer 委派工具(delegate_to_agent)总开关: 关闭即不注入该工具, 智能体只用
+    # 本域工具办理, 不再跨智能体协同。
+    finance_peer_delegate_enabled: bool = True
+    # 单个子任务的 executor 工作者墙钟上限(秒): 外层仍受 a2a_timeout 兑底, 这里是
+    # 步级更紧的一档, 防止某一步的 ReAct 工作者在内部工具上无限打转。
+    finance_step_timeout: float = 60.0
+
     # 统一下沉到线程池的并发上限(同时受两个池约束, 见 app/main.py::_configure_thread_pools)。
     # 为何要显式抬: ``asyncio.to_thread`` 用事件循环默认线程池(上限
     # ``min(32, cpu+4)``), FastAPI 的同步接口/同步工具用 anyio 线程池(默认 40) ——

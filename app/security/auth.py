@@ -60,12 +60,14 @@ HR_TOOL_WHITELIST: dict[Role, set[str] | None] = {
 FINANCE_TOOL_WHITELIST: dict[Role, set[str] | None] = {
     Role.EMPLOYEE: {
         "create_reimbursement",
+        "preview_reimbursement",
         "query_reimbursement",
         "list_reimbursements",
         "get_reimbursement_policy",
     },
     Role.MANAGER: {
         "create_reimbursement",
+        "preview_reimbursement",
         "query_reimbursement",
         "list_reimbursements",
         "get_reimbursement_policy",

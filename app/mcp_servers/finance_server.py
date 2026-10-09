@@ -63,6 +63,30 @@ def _order_dict(o: Reimbursement) -> dict[str, Any]:
     }
 
 
+def _validate_reimbursement_input(
+    title: str, amount: float, category: str, user_id: str, caller_user_id: str, caller_role: str
+) -> tuple[str, dict[str, Any] | None]:
+    """报销单前置校验的单一事实源(create 与 preview 共用, 防两处口径漂移)。
+
+    只做纯校验(类别/金额/限额/归属), 不碰数据库, 因此可安全用于校验-only 的
+    preview_reimbursement。返回 (生效报销人, 错误负载): 错误负载非空即校验未过。
+    """
+    if not title or not title.strip():
+        return "", {"error": "报销事项标题不能为空"}
+    if category not in ALLOWED_CATEGORIES:
+        return "", {"error": f"非法报销类别: {category}; 可选: {sorted(ALLOWED_CATEGORIES)}"}
+    if amount <= 0:
+        return "", {"error": "金额必须大于 0"}
+    if amount > SINGLE_LIMIT:
+        return "", {"error": f"单笔报销上限 {SINGLE_LIMIT} 元, 请拆分后提交"}
+    effective, denial = guard_target_user(
+        resolve_caller(caller_user_id, caller_role), user_id, what="报销单"
+    )
+    if denial is not None:
+        return "", denial
+    return effective, None
+
+
 @mcp.tool()
 def create_reimbursement(
     title: str,
@@ -87,14 +111,8 @@ def create_reimbursement(
     Returns:
         Created order with order_no and workflow status, or error payload.
     """
-    if category not in ALLOWED_CATEGORIES:
-        return {"error": f"非法报销类别: {category}; 可选: {sorted(ALLOWED_CATEGORIES)}"}
-    if amount <= 0:
-        return {"error": "金额必须大于 0"}
-    if amount > SINGLE_LIMIT:
-        return {"error": f"单笔报销上限 {SINGLE_LIMIT} 元, 请拆分后提交"}
-    effective, denial = guard_target_user(
-        resolve_caller(caller_user_id, caller_role), user_id, what="报销单"
+    effective, denial = _validate_reimbursement_input(
+        title, amount, category, user_id, caller_user_id, caller_role
     )
     if denial is not None:
         return denial
@@ -122,6 +140,55 @@ def create_reimbursement(
             session.rollback()
             return {"error": f"报销单创建失败({exc.__class__.__name__}), 请稍后重试"}
         return _order_dict(order)
+
+
+@mcp.tool()
+def preview_reimbursement(
+    title: str,
+    amount: float,
+    category: str,
+    reason: str = "",
+    user_id: str = "",
+    caller_user_id: str = "",
+    caller_role: str = "",
+) -> dict[str, Any]:
+    """校验一张报销单信否合规并回显“拟提单草稿”, 不写库、不取单号。
+
+    第三代 Agentic 自主流程的确认门: 智能体先调本工具把必填信息与限额校验跑
+    一遍, 拿到结构化草稿后向用户复述并请求确认; 仅在用户明确确认的下一轮才调
+    create_reimbursement 真正落单。与 create_reimbursement 共用同一套前置校验。
+
+    Args:
+        title/amount/category/reason/user_id: 与 create_reimbursement 同义。
+        caller_user_id/caller_role: 调用者工号/角色(网关注入, 请勿自行填写)。
+
+    Returns:
+        {valid, draft, policy_hint, would_enter_node} 或 {error}。
+    """
+    effective, denial = _validate_reimbursement_input(
+        title, amount, category, user_id, caller_user_id, caller_role
+    )
+    if denial is not None:
+        return denial
+    policies = {
+        "差旅费": "差旅费按城市等级限额, 需附行程单/发票, 单笔≤5000元",
+        "交通费": "市内交通实报实销, 需附发票, 单笔≤5000元",
+        "餐饮费": "业务招待需事前审批, 需附发票与接待清单",
+        "办公用品": "需附采购清单与发票, 单笔≤5000元",
+        "培训费": "需培训通知与发票, 年度额度20000元",
+    }
+    return {
+        "valid": True,
+        "draft": {
+            "user_id": effective,
+            "title": title.strip(),
+            "amount": round(amount, 2),
+            "category": category,
+            "reason": reason,
+        },
+        "policy_hint": policies.get(category, ""),
+        "would_enter_node": "部门主管审批",
+    }
 
 
 @mcp.tool()

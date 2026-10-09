@@ -18,11 +18,12 @@ def build_agent_card() -> AgentCard:
     return AgentCard(
         name="Finance_Agent",
         description=(
-            "财务专业智能体:负责费用报销全流程(政策咨询、报销单创建、进度查询),"
-            "通过 MCP 协议调用财务报销系统完成实际操作。"
+            "财务专业智能体(第三代 Agentic): 自主分解并多步办理费用报销全流程(政策咨询、"
+            "报销单创建、进度查询), 并可作为对等智能体横向协同 HR/数据洞察/采购智能体; "
+            "通过 MCP 协议调用财务报销系统完成实际操作, 写操作经用户确认后落单。"
         ),
         url=f"{settings.finance_agent_url}/",
-        version="1.0.0",
+        version="3.0.0",
         defaultInputModes=["text"],
         defaultOutputModes=["text"],
         capabilities=AgentCapabilities(streaming=False, pushNotifications=False),
@@ -64,6 +65,32 @@ def build_agent_card() -> AgentCard:
                 ),
                 tags=["finance", "text2sql", "analytics"],
                 examples=["市场部今年报销总额是多少", "各类别报销笔数分布"],
+            ),
+            AgentSkill(
+                id="agentic_planning",
+                name="自主任务规划与反思 (Plan-and-Execute)",
+                description=(
+                    "把复杂财务目标自主拆成有序子任务逐步执行, 每步反思复核, "
+                    "不足时重规划; 写操作只出草稿并等用户确认, 不自主落库"
+                ),
+                tags=["finance", "agentic", "planning"],
+                examples=[
+                    "帮我报销这张出差发票, 并确认一下有没有超报销标准",
+                    "查一下我今年差旅报销一共多少钱然后提一笔新的报销",
+                ],
+            ),
+            AgentSkill(
+                id="peer_collaboration",
+                name="跨智能体协同办理",
+                description=(
+                    "作为对等智能体横向委派 HR/数据洞察/采购智能体并整合结果"
+                    "(转发原始调用者身份, 受各角色可委派范围限制)"
+                ),
+                tags=["finance", "collaboration", "a2a"],
+                examples=[
+                    "报销这笔出差并核对我部门预算还剩多少",
+                    "查一下这位同事的在职情况再帮我把他的报销单提上",
+                ],
             ),
         ],
     )
