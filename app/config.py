@@ -173,6 +173,28 @@ class Settings(BaseSettings):
     # 步级更紧的一档, 防止某一步的 ReAct 工作者在内部工具上无限打转。
     finance_step_timeout: float = 60.0
 
+    # ---------- Contract_Agent 合同初审工作流(LLM 推理 + 规则引擎 + DAG) ----------
+    # 把 contract_agent 从单循环 ReAct 升级为显式 DAG(structure -> rule_precheck ->
+    # chunk_review -> aggregate): 规则红线确定性兜底, 语义风险分条款审查并强制原文
+    # 溯源, 出口做可逆 PII 脱敏还原, 结论以待确认报告落台账(HITL)。范式平移自
+    # finance_agent 第三代 Agentic。总开关: 关闭即回退旧的全量单循环 ReAct
+    # (_legacy_invoke), 一键可回滚; 与被下线的"编排层 LLM 自动拆句"无关, A2A 契约不变。
+    contract_workflow_enabled: bool = True
+    # 条款分块审查的单块字符上限与块数上限: 几十页合同一次塞进模型会触发"中间遗忘",
+    # 故按条款切块逐块审查再汇总; 块数封顶防无界并发起数与 token 膨胀。
+    contract_clause_chunk_chars: int = 1200
+    contract_max_clause_chunks: int = 24
+    # 分块审查的并发上限与单块墙钟上限(秒): 与 finance 步级同一档, 一块超时/异常只降级
+    # 该块观察, 不连坐整份审查。
+    contract_chunk_review_concurrency: int = 2
+    contract_step_timeout: float = 60.0
+    # 可逆 PII 脱敏: 送 LLM 的条款文本先把金额/账号/证件/电话/技术参数替换为占位符,
+    # 出口还原; 规则判定与原文定位始终用未脱敏原文(红线要按真实金额判)。关闭即原文直送。
+    contract_pii_mask_enabled: bool = True
+    # RAG 增强: 分块审查前挂载法规库 + 标准模板/历史批注做 few-shot 比对; 检索不可用或
+    # 无命中只影响 enrich, 不阻断审查(能降级就降级)。
+    contract_rag_augment_enabled: bool = True
+
     # 统一下沉到线程池的并发上限(同时受两个池约束, 见 app/main.py::_configure_thread_pools)。
     # 为何要显式抬: ``asyncio.to_thread`` 用事件循环默认线程池(上限
     # ``min(32, cpu+4)``), FastAPI 的同步接口/同步工具用 anyio 线程池(默认 40) ——

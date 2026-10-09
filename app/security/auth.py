@@ -145,7 +145,7 @@ _PROCUREMENT_BASE_TOOLS = {
 }
 PROCUREMENT_TOOL_WHITELIST: dict[Role, set[str] | None] = {
     Role.EMPLOYEE: _PROCUREMENT_BASE_TOOLS,
-    Role.MANAGER: _PROCUREMENT_BASE_TOOLS | {"execute_sql"},
+    Role.MANAGER: _PROCUREMENT_BASE_TOOLS | {"execute_sql", "confirm_contract_review"},
     Role.HR: None,      # HR/财务专员/管理员: 采购域全量可见
     Role.FINANCE: None,
     Role.ADMIN: None,

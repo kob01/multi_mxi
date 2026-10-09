@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 _PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -57,6 +58,85 @@ def mask_sensitive(data: Any) -> Any:
     if isinstance(data, str):
         return mask_text(data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# 可逆 PII 脱敏往返(合同初审送 LLM 前的净化, 出口还原)。
+# 与上面的单向打码不同: 这里用**稳定占位符**替换敏感串并保留还原映射, 使金额/
+# 账号/证件/电话不进 LLM 上下文与日志, 而模型仍能在占位符原位做条款定位与语义
+# 判断(引用到的就是占位符, 出口再还原回原句)。纯正则实现, 不引 NER 模型 ——
+# 与仓内轻依赖约定一致; 识别不了的"核心技术参数"由调用方经 extra_patterns 传入。
+#
+# 关键口径: 规则红线判定与原文定位必须用**未脱敏原文**(金额阈值、账号一致性只有
+# 看真实值才判得对), 只有送 LLM 的那一份走本函数; 见 contract_agent 工作流的
+# original_text / masked_text 双轨。
+# ---------------------------------------------------------------------------
+_PII_RULES: list[tuple[str, re.Pattern[str]]] = [
+    # 顺序即优先级: 先吃 18 位身份证(含末位 X), 再吃 16-19 位银行/收款账号,
+    # 然后手机号与中文金额串; 前面替换成占位符后, 后面的正则不会再命中([] 定界)。
+    ("ID", re.compile(r"\b\d{17}[\dXx]\b")),
+    ("ACCOUNT", re.compile(r"\b\d{16,19}\b")),
+    ("PHONE", re.compile(r"\b1[3-9]\d{9}\b")),
+    ("AMOUNT", re.compile(r"(?:人民币|¥|￥)?\s*\d[\d,]*(?:\.\d+)?\s*(?:万元|亿|元)")),
+]
+
+
+def mask_round_trip(
+    text: str,
+    *,
+    extra_patterns: Sequence[tuple[str, re.Pattern[str]]] | None = None,
+) -> tuple[str, dict[str, str]]:
+    """把敏感串替换为稳定占位符, 返回 ``(masked_text, restore_map)``。
+
+    - 同一原值映射到同一占位符(合同里重复出现的同一金额可一致还原、且模型看得出是同一值);
+    - URL/下载链接段原样保留(与 :func:`mask_text` 同口径, 打码会撕坏链接);
+    - ``restore_map`` 为 ``{占位符: 原值}``, 交给 :func:`restore` 出口还原。
+    """
+    if not text:
+        return text, {}
+    rules = list(_PII_RULES)
+    if extra_patterns:
+        rules = rules + list(extra_patterns)
+    fwd: dict[str, str] = {}          # 原值 -> 占位符
+    restore: dict[str, str] = {}       # 占位符 -> 原值
+    counters: dict[str, int] = {}
+
+    def _mask_segment(segment: str) -> str:
+        for label, pattern in rules:
+            def _repl(match: re.Match[str], label: str = label) -> str:
+                raw = match.group(0)
+                ph = fwd.get(raw)
+                if ph is None:
+                    counters[label] = counters.get(label, 0) + 1
+                    ph = f"[{label}_{counters[label]}]"
+                    fwd[raw] = ph
+                    restore[ph] = raw
+                return ph
+
+            segment = pattern.sub(_repl, segment)
+        return segment
+
+    out: list[str] = []
+    pos = 0
+    for span in _URL_SPAN.finditer(text):
+        out.append(_mask_segment(text[pos : span.start()]))
+        out.append(span.group(0))
+        pos = span.end()
+    out.append(_mask_segment(text[pos:]))
+    return "".join(out), restore
+
+
+def restore(text: str, restore_map: dict[str, str]) -> str:
+    """把 :func:`mask_round_trip` 产出的占位符还原回原值。
+
+    按占位符长度降序替换, 避免 ``[AMOUNT_1]`` 被 ``[AMOUNT_10]`` 之类前缀误伤
+    (``[]`` 定界本已足够, 降序只是稳妥冗余)。
+    """
+    if not text or not restore_map:
+        return text
+    for ph in sorted(restore_map, key=len, reverse=True):
+        text = text.replace(ph, restore_map[ph])
+    return text
 
 
 # ---------------------------------------------------------------------------

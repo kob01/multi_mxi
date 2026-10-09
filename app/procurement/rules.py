@@ -141,6 +141,34 @@ SINGLE_SIGN_LIMIT = Decimal("50000")   # 超此金额必须走集体决策/招�
 PREPAY_MAX_RATIO = 0.30               # 预付款比例上限(无履约担保时)
 QUOTE_REQUIRED_AMOUNT = Decimal("5000")  # 超此金额需 >=3 家比价
 
+# 违约金/赔偿比例法定上限: 《民法典》第585 条司法实践以"超过造成损失 30%"为约定过高,
+# 命中即一票否决红线(必须人工重拟, 不交给 LLM 判)。用数值解析而非关键词:
+# "是否超 30%" 是可比对的量, 关键词会漏掉 "百分之四十" 之外的数字写法。
+LEGAL_PENALTY_CAP_PCT = 30.0
+_PENALTY_TERM_RE = re.compile(r"违约金|赔偿金?|罚款")
+_PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+
+def _penalty_over_cap(text: str) -> float | None:
+    """返回合同中违约金/赔偿条款里超法定上限(30%)的最大比例; 无则 None。
+
+    按句子粒度判定(而非固定"关键词…数字%"语序): 真实合同里"每日按合同金额的 40%
+    支付违约金"的 `%` 在"违约金"之前, 固定语序的正则会漏。改为同一句内"命中违约/赔偿
+    术语 且 出现百分比"即取该百分比参与比较。
+    """
+    worst = 0.0
+    for sentence in re.split(r"[。;\n]", text or ""):
+        if not _PENALTY_TERM_RE.search(sentence):
+            continue
+        for match in _PCT_RE.finditer(sentence):
+            try:
+                ratio = float(match.group(1))
+            except ValueError:
+                continue
+            if ratio > LEGAL_PENALTY_CAP_PCT and ratio > worst:
+                worst = ratio
+    return worst if worst > LEGAL_PENALTY_CAP_PCT else None
+
 
 def _hit(text: str, keywords: Sequence[str]) -> str | None:
     """返回首个命中的关键词; 用宽松包含而非正则, 减少误配。"""
@@ -280,6 +308,17 @@ def precheck_contract(
         kw = _hit(text, keywords)
         if kw:
             findings.append(Finding(item, "warning", f"命中表述「{kw}」: {why}", "商务谈判调整"))
+
+    # --- 3b. 违约金/赔偿比例超法定上限(一票否决硬红线, 数值解析) ---
+    over = _penalty_over_cap(text)
+    if over is not None:
+        findings.append(Finding(
+            f"违约金/赔偿比例 {over:g}% 超法定上限",
+            "critical",
+            f"命中的违约金或赔偿比例 {over:g}% 高于司法实践认定的过高标准"
+            f"(实际损失的 {LEGAL_PENALTY_CAP_PCT:g}%)",
+            "降至合理区间或补充损失计算依据, 转法务重拟(制度红线, 初审不放行)",
+        ))
 
     # --- 4. 时效 ---
     expiry = _parse_date(expiry_date)

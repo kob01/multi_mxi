@@ -510,13 +510,16 @@ def submit_contract_review(
     expiry_date: str = "",
     doc_key: str = "",
     user_id: str = "",
+    pending_confirm: bool = False,
+    risk_card: list[dict[str, Any]] | None = None,
     caller_user_id: str = "",
     caller_role: str = "",
 ) -> dict[str, Any]:
     """把一份合同登记进台账并出具初审结论(规则判定 + 风险清单 + 初审意见)。
 
-    LLM 的语义补充由 Contract_Agent 负责(它会在本工具结果之上再调
-    analyze_contract_terms), 台账里的 review_json 存那份补充结论。
+    LLM 的语义补充由 Contract_Agent 负责(工作流会先把结构化风险卡经 ``risk_card``
+    一并传入)。 ``pending_confirm=True`` 时状态落 PENDING_CONFIRM(HITL 待确认, 登记
+    不等于放行), 否则按规则结论落 RISK/PRECHECKED。
 
     Args:
         title: 合同名称。
@@ -528,6 +531,8 @@ def submit_contract_review(
         sign_date/effective_date/expiry_date: YYYY-MM-DD, 可留空。
         doc_key: 已入库文档的 doc_key(有则一并记录, 便于溯源到知识库)。
         user_id: 送审人工号; 留空即调用者本人。
+        pending_confirm: True 则以待确认状态入台账(HITL 工作流用)。
+        risk_card: 结构化风险清单(工作流产出, 存入 review_json.hitl 供确认时展示)。
         caller_user_id: 调用者工号(网关注入, 请勿自行填写)。
         caller_role: 调用者角色(网关注入, 请勿自行填写)。
 
@@ -566,6 +571,7 @@ def submit_contract_review(
             supplier=supplier,
         )
         try:
+            hitl = {"confirm_status": "pending"} if pending_confirm else None
             contract = ContractReview(
                 contract_no=_next_no(session, "proc_contracts", "CT", "contract_no", 8000),
                 title=title,
@@ -578,9 +584,10 @@ def submit_contract_review(
                 expiry_date=_d(expiry_date),
                 doc_key=doc_key,
                 content=content,
-                status="RISK" if outcome.risk_level == "高" else "PRECHECKED",
+                status="PENDING_CONFIRM" if pending_confirm else ("RISK" if outcome.risk_level == "高" else "PRECHECKED"),
                 risk_level=outcome.risk_level,
                 findings=[f.to_dict() for f in outcome.findings],
+                review_json={"hitl": {**(hitl or {}), "risk_card": risk_card or []}} if (pending_confirm or risk_card) else None,
                 reviewer=effective,
                 opinion=outcome.conclusion,
                 created_at=datetime.now(timezone.utc),
@@ -749,6 +756,74 @@ def save_contract_opinion(
             session.rollback()
             return {"error": f"初审意见写入失败({exc.__class__.__name__}), 请稍后重试"}
         return _contract_dict(row)
+
+
+@mcp.tool()
+def confirm_contract_review(
+    contract_no: str,
+    action: str,
+    final_risk_level: str = "",
+    edited_opinion: str = "",
+    caller_user_id: str = "",
+    caller_role: str = "",
+) -> dict[str, Any]:
+    """对一份处于待确认(PENDING_CONFIRM)的合同初审做 HITL 人工处置。
+
+    定位是"法务助手非决策者"的闭环: 工作流只会把初审登记为待确认, 真正放行/驳回
+    必须由管理角色(manager/hr/finance/admin)基于展示的风险卡明确表态。普通员工无
+    权确认(防自批自审)。人工可以修改风险等级(人的判断不受"模型只升不降"约束)。
+
+    Args:
+        contract_no: 合同号。
+        action: confirm(接受初审并放行) / modify(人工修改后放行) / reject(驳回)。
+        final_risk_level: 仅 modify 可选, 人工确定的最终风险(低/中/高); 留空则不改。
+        edited_opinion: 仅 modify 可选, 人工修改后的初审意见; 留空则不改。
+        caller_user_id: 调用者工号(网关注入, 请勿自行填写)。
+        caller_role: 调用者角色(网关注入, 请勿自行填写)。
+
+    Returns:
+        更新后台账 或 {error}/{forbidden}。
+    """
+    action = (action or "").strip().lower()
+    if action not in ("confirm", "modify", "reject"):
+        return {"error": f"非法 action: {action}; 可选 confirm/modify/reject"}
+    caller = resolve_caller(caller_user_id, caller_role)
+    if caller is None:
+        return {"error": "缺少调用者身份, 已拒绝执行(该工具只能经助手网关以登录态调用)", "forbidden": True}
+    if not caller.is_privileged:
+        return {"error": "初审确认属审批类动作, 仅管理角色(部门经理/财务/HR/管理员)可执行",
+                "forbidden": True}
+    with Session(dbsync.get_sync_engine()) as session:
+        try:
+            row = session.get(ContractReview, contract_no)
+            if row is None:
+                return {"error": f"合同 {contract_no} 不存在"}
+            if (row.status or "") != "PENDING_CONFIRM":
+                return {"error": f"合同 {contract_no} 不处于待确认状态(当前 {row.status or '空'}), 无需确认"}
+            row.status = {"confirm": "APPROVED", "modify": "APPROVED", "reject": "REJECTED"}[action]
+            if action == "modify":
+                if final_risk_level:
+                    if final_risk_level not in rules.RISK_ORDER:
+                        return {"error": f"非法 final_risk_level: {final_risk_level}; 可选 低/中/高"}
+                    row.risk_level = final_risk_level
+                if edited_opinion.strip():
+                    row.opinion = edited_opinion.strip()
+            hitl = dict((row.review_json or {}).get("hitl") or {})
+            hitl.update({
+                "confirm_status": action,
+                "confirmed_by": caller.user_id,
+                "confirmed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "action": action,
+            })
+            if action == "modify" and (final_risk_level or edited_opinion):
+                hitl["edits"] = {"risk_level": final_risk_level or row.risk_level,
+                                 "opinion_edited": bool(edited_opinion.strip())}
+            row.review_json = {**(row.review_json or {}), "hitl": hitl}
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            return {"error": f"确认写入失败({exc.__class__.__name__}), 请稍后重试"}
+        return {**_contract_dict(row, with_content=False), "confirm_status": action}
 
 
 @mcp.tool()
