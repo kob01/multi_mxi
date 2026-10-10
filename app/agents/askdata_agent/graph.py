@@ -1,0 +1,984 @@
+"""问数状态机: PARSE → LINK → (CLARIFY?) → PLAN → VALIDATE → ROUTE → VERIFY → RENDER → FINALIZE。
+
+为什么是确定性状态机而不是自由 ReAct(与 Analyst_Agent 的最大区别):
+每一步的输入输出形状固定, 于是
+- **可单测**: 每个节点都能拿一份 fixture 状态断言产出(见 scripts/test_askdata_offline.py);
+- **可回放**: 中间产物(槽位/候选/DSL/SQL)全部落进 askdata_query_log, badcase 能定位到段;
+- **可归因**: 失败发生在哪个节点是结构事实, 不用反过来猜模型为什么这么答。
+自由 ReAct 只保留一个有界的入口: ``verify`` 判定结果异常后的自修复循环(默认 ≤2 轮)。
+
+两个刻意的合并, 都为了少一套口径:
+- ``ROUTE`` 内含执行: askdata MCP 的工具本身就是"编译 + 执行"一体的(编译产物不外发),
+  再拆成两个节点只会让"哪一步失败"更难说清;
+- ``RENDER`` 内含叙述: 图型由结果 shape 规则决定, LLM 只补一段人话结论。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from typing import Any, TypedDict
+
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import END, START, StateGraph
+
+from app.agents.askdata_agent import prompts
+from app.config import get_settings
+from app.llm import get_chat_model
+from app.security.caller import caller_tool_args
+from app.semantic.dsl import DslError, parse_dsl
+from app.semantic.dsl import render_schema_hint
+from app.semantic.timesem import TIME_CHOICES
+
+logger = logging.getLogger(__name__)
+
+PAYLOAD_FENCE = "askdata"
+MAX_REWRITE = 1  # 校验失败后回炉重写的次数上限(再多就是在跟模型赌运气)
+_REPAIR_TOOLS = ("list_metrics", "link_terms", "validate_dsl", "exec_sql_sandbox")
+
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.S)
+
+
+class AskDataState(TypedDict, total=False):
+    """状态机流转的共享状态(每个键都属于某个阶段的产物, 便于逐段回放)。"""
+
+    question: str
+    prior_slots: dict[str, Any]
+    user_id: str
+    role: str
+    trace_id: str
+    session_id: str
+    started_at: float
+    slots: dict[str, Any]
+    candidates: list[dict[str, Any]]
+    enum_filters: dict[str, str]
+    catalog_origin: str
+    vector_channel: str
+    dsl: dict[str, Any]
+    rewrite_count: int
+    error_hint: str
+    validate_result: dict[str, Any]
+    exec_result: dict[str, Any]
+    route: str
+    attempts: list[dict[str, Any]]
+    verify: dict[str, Any]
+    repair_text: str
+    chart: dict[str, Any]
+    narrative: str
+    answer: str
+    payload: dict[str, Any]
+    verdict: str
+    error_codes: list[str]
+    notes: list[str]
+
+
+def extract_json(text: str) -> dict[str, Any] | None:
+    """从模型输出里稳健地抠出一个 JSON 对象(容忍 fenced block 与前后杂字)。"""
+    if not text:
+        return None
+    cleaned = _JSON_FENCE_RE.sub("", text.strip())
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except ValueError:
+        pass
+    match = re.search(r"\{.*\}", cleaned, flags=re.S)
+    if not match:
+        return None
+    try:
+        obj = json.loads(match.group(0))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _md_table(columns: list[str], labels: dict[str, str], rows: list[dict[str, Any]], limit: int = 20) -> str:
+    """结果表(Markdown); 只列前 ``limit`` 行, 行数在正文里说明(不要把 200 行塞进对话)。"""
+    if not columns or not rows:
+        return ""
+    head = "| " + " | ".join(labels.get(c, c) for c in columns) + " |"
+    sep = "|" + "|".join(" --- " for _ in columns) + "|"
+    lines = [head, sep]
+    for row in rows[:limit]:
+        cells = []
+        for column in columns:
+            value = row.get(column)
+            if isinstance(value, float):
+                cells.append(f"{value:,.2f}".rstrip("0").rstrip("."))
+            elif value is None:
+                cells.append("-")
+            else:
+                cells.append(str(value))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+class AskDataPipeline:
+    """一台跑在 askdata MCP server 之上的确定性问数流水线(按角色缓存图)。"""
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        self._settings = settings
+        self._llm = get_chat_model(settings.llm_model, temperature=0)
+        self._json_llm = get_chat_model(settings.llm_model, temperature=0, json_mode=True)
+        self._tools: dict[str, Any] = {}
+        self._tools_at = 0.0
+        self._repair_agents: dict[str, Any] = {}
+
+    # ---------------- 工具面 ----------------
+    def _ttl(self) -> float:
+        return max(1.0, float(self._settings.mcp_tools_ttl))
+
+    async def _ensure_tools(self) -> dict[str, Any]:
+        """连 askdata MCP server 拿工具(与 Analyst_Agent 同一 TTL 口径, 永不"一次发现定终身")。"""
+        if self._tools and time.monotonic() - self._tools_at <= self._ttl():
+            return self._tools
+        client = MultiServerMCPClient(
+            {"askdata": {"url": self._settings.askdata_mcp_url, "transport": "streamable_http"}}
+        )
+        tools = await client.get_tools()
+        self._tools = {getattr(t, "name", ""): t for t in tools}
+        self._tools_at = time.monotonic()
+        self._repair_agents.clear()
+        return self._tools
+
+    async def _call(self, name: str, **args: Any) -> dict[str, Any]:
+        """程序化调用一个 MCP 工具(状态机自己决定调什么, 不由模型挑工具)。
+
+        caller_* 用 :func:`caller_tool_args` 现取现注: 这是全仓注入字段的唯一来源,
+        在这里再走一遍比让模型填要可靠得多(它填了也会被覆盖, 但覆盖这件事不该依赖模型)。
+        """
+        tools = await self._ensure_tools()
+        tool = tools.get(name)
+        if tool is None:
+            return {"error": f"askdata MCP server 未提供工具 {name}"}
+        payload = {**args}
+        payload.update(caller_tool_args())
+        raw = await tool.ainvoke(payload)
+        return _as_dict_result(raw)
+
+    # ---------------- 节点 ----------------
+    async def parse(self, state: AskDataState) -> dict[str, Any]:
+        """① 意图理解: 抽槽位(带 confidence), 并用上一轮槽位做确定性继承。"""
+        started = time.monotonic()
+        prior = state.get("prior_slots") or {}
+        prompt = prompts.SLOT_PROMPT.format(
+            question=state.get("question", ""),
+            prior_slots=json.dumps(prior, ensure_ascii=False) if prior else "(无)",
+        )
+        slots: dict[str, Any] = {}
+        try:
+            resp = await self._json_llm.ainvoke(prompt)
+            slots = extract_json(str(resp.content)) or {}
+        except Exception as exc:  # noqa: BLE001 - 抽取失败退化成"什么都没抽到", 由澄清门接管
+            logger.warning("[askdata] 槽位抽取失败(交给澄清门): %s", exc)
+        merged = _inherit(slots, prior)
+        merged = _prune_invented_terms(merged, state.get("question", ""))
+        update: dict[str, Any] = {
+            "slots": merged,
+            "started_at": state.get("started_at") or time.monotonic(),
+        }
+        if merged.get("invented_dropped"):
+            # 剔词本身就是一个信号(模型在这句话上没把握), 进 notes 供归因回查。
+            update["notes"] = list(state.get("notes") or []) + [
+                "槽位里有 " + str(len(merged["invented_dropped"])) + " 个说法不是原话, 已剔除: "
+                + ", ".join(merged["invented_dropped"][:4])
+            ]
+        _track(state, f"槽位抽取完成({time_ms(started)}ms)")
+        return update
+
+    async def link(self, state: AskDataState) -> dict[str, Any]:
+        """② 语义链接: 三路召回(词典/向量/枚举), 产出候选与分数。"""
+        started = time.monotonic()
+        slots = state.get("slots") or {}
+        phrases = _phrase_of(slots)
+        out = await self._call("link_terms", text=phrases or state.get("question", ""))
+        if not out.get("candidates") and (out.get("forbidden") or out.get("error")):
+            forbidden = bool(out.get("forbidden"))
+            reason = str(out.get("error") or "无法确定数据作用域")[:200]
+            if forbidden:
+                # 作用域解不出来不是"没认识你的说法": 写成权限拒, 否则用户与归因
+                # 看到的都是一句误导的"语义层没这个指标"。
+                answer = (
+                    "这次取数被服务端拦下了: 无法确认可见数据范围。\n原因: " + reason
+                    + "\n\n如果你是在本地/测试环境里看到这句, 请确认工号存在于员工主数据"
+                    " 且已回填部门归属(而不是让模型换一个口径重算)。"
+                )
+                codes = ["E_NO_PERMISSION"]
+                verdict = "denied"
+            else:
+                # 工具本身报错(不是拒): 不能冒充权限拒, 也不能当成"没这个口径"。
+                answer = (
+                    "问数服务当前不可用(语义层链接环节报错), 没能给出数字。\n报错: " + reason
+                    + "\n\n这不是「你的问题没法回答」: 服务恢复后再问一次即可。"
+                )
+                codes = ["E_SERVICE"]
+                verdict = "fail"
+            return {
+                "verdict": verdict, "error_codes": codes, "candidates": [], "answer": answer,
+                "notes": list(state.get("notes") or []) + [reason],
+            }
+        result: dict[str, Any] = {
+            "candidates": out.get("candidates") or [],
+            "enum_filters": out.get("enum_filters") or {},
+            "catalog_origin": out.get("catalog_origin") or "unknown",
+            "vector_channel": out.get("vector_channel") or "unknown",
+            "notes": list(state.get("notes") or []),
+        }
+        if out.get("error"):
+            # 部分回 degrade(如枚举反查失败但候选仍在): 记进 notes 供归因, 不中断本轮。
+            result["notes"].append(f"语义链接降级: {str(out['error'])[:160]}")
+        if not result["candidates"]:
+            # 短语一个都没命中时再拿原话试一次(中文连续串里维度说法常被拆开)。
+            retry = await self._call("link_terms", text=state.get("question", ""))
+            result["candidates"] = retry.get("candidates") or []
+        logger.debug("[askdata] link 完成 %dms, 候选 %d",
+                     time_ms(started), len(result["candidates"]))
+        return result
+
+    async def clarify_gate(self, state: AskDataState) -> dict[str, Any]:
+        """②-决定: 置信不足或口径冲突就发起**选项式**澄清; 否则直通。
+
+        判定用的是"分数分布"而不是"最高分够不够": 前两名分差过小意味着系统自己
+        也没把握, 这时硬选一个就是猜。禁止开放式反问 —— 选项必须来自候选集。
+        """
+        settings = self._settings
+        slots = state.get("slots") or {}
+        candidates = state.get("candidates") or []
+        metrics = [c for c in candidates if c.get("kind") == "metric"]
+        threshold = float(settings.askdata_clarify_confidence_threshold)
+        reasons: list[str] = []
+        if not metrics:
+            reasons.append("没能把你的说法对应到任何已登记的指标")
+        else:
+            best = float(metrics[0].get("score") or 0)
+            second = float(metrics[1].get("score") or 0) if len(metrics) > 1 else 0.0
+            if best < threshold:
+                reasons.append(f"指标匹配置信 {best:.2f} 低于阈值 {threshold:.2f}")
+            if second and best - second < 0.08:
+                reasons.append(f"前两个口径太接近({best:.2f} vs {second:.2f}), 需要你确认要哪一个")
+        if not _has_time(slots) and not _candidates_are_snapshots(metrics):
+            reasons.append("没有给出统计区间")
+
+        if not reasons:
+            return {}
+        if not settings.askdata_clarify_enabled:
+            # 开关关掉 = 允许"带着假设回答", 但必须把假设写进口径, 而不是让用户自己猜。
+            # 这里**返回** notes 而不是只改 state: LangGraph 只合并返回字典里的键,
+            # 原地改入参不会进通道, 那条假设说明就会在下一节点静默消失。
+            note = "澄清已关闭: " + "; ".join(reasons) + "(按最接近口径作答)"
+            return {"notes": list(state.get("notes") or []) + [note]}
+        payload = _clarify_payload(state, reasons, metrics)
+        return {"payload": payload, "verdict": "clarify", "answer": _clarify_text(payload)}
+
+    async def plan(self, state: AskDataState) -> dict[str, Any]:
+        """③ DSL 生成: 只产出受约束 JSON, 本地先过语法级校验(L1)。"""
+        started = time.monotonic()
+        slots = state.get("slots") or {}
+        candidates = state.get("candidates") or []
+        prompt = prompts.dsl_prompt(
+            question=state.get("question", ""),
+            slots=json.dumps(slots, ensure_ascii=False),
+            candidates=json.dumps(candidates[:10], ensure_ascii=False),
+            schema_hint=render_schema_hint(),
+            enum_filters=json.dumps(state.get("enum_filters") or {}, ensure_ascii=False),
+            error_hint=state.get("error_hint", ""),
+        )
+        try:
+            resp = await self._json_llm.ainvoke(prompt)
+            raw = extract_json(str(resp.content))
+            if raw is None:
+                raise DslError("模型没有产出合法 JSON 对象")
+            spec = parse_dsl(raw)
+        except DslError as exc:
+            return {"error_hint": str(exc), "verdict": "", "notes": state.get("notes", [])}
+        _track(state, f"DSL 生成完成({time_ms(started)}ms)")
+        return {"dsl": spec.to_payload(), "error_hint": ""}
+
+    async def validate(self, state: AskDataState) -> dict[str, Any]:
+        """③-校验器(独立模块, 不信模型自检): 语义级 + 权限级。"""
+        dsl = state.get("dsl") or {}
+        if not dsl:
+            return {"validate_result": {"ok": False, "errors": [
+                {"code": "E_SCHEMA", "message": state.get("error_hint") or "DSL 未生成", "field": ""}
+            ], "notices": []}}
+        out = await self._call(
+            "validate_dsl", dsl_json=dsl, trace_id=state.get("trace_id", ""),
+        )
+        notices = out.get("notices") or []
+        notes = list(state.get("notes", []))
+        for notice in notices:
+            notes.append(f"[{notice.get('code')}] {notice.get('message')}")
+        return {"validate_result": out, "notes": notes}
+
+    async def route(self, state: AskDataState) -> dict[str, Any]:
+        """④ 执行路由 + 取数: 指标 API → DSL 编译器 → 沙箱 SQL(逐级降级, 记录每级失败原因)。
+
+        同环比/占比这类算术都在引擎侧(编译器出的 SQL)算, 模型不参与算术 —— 这是
+        问数准确率里最容易被低估的一块: 让模型做两位小数的除法就是错答的来源。
+        """
+        settings = self._settings
+        dsl = state.get("dsl") or {}
+        order = [p.strip() for p in (settings.askdata_route_order or "").split(",") if p.strip()]
+        attempts: list[dict[str, Any]] = []
+        for level in order:
+            if level == "sandbox" and not settings.askdata_sandbox_enabled:
+                continue
+            if level == "metric_api":
+                out = await self._call("query_metric_api", dsl_json=dsl,
+                                       nl_question=state.get("question", ""),
+                                       trace_id=state.get("trace_id", ""))
+            elif level == "compiler":
+                out = await self._call("compile_dsl", dsl_json=dsl,
+                                       nl_question=state.get("question", ""),
+                                       trace_id=state.get("trace_id", ""))
+            elif level == "sandbox":
+                out = await self._sandbox(state)
+            else:
+                continue
+            attempts.append({"level": level, "ok": not out.get("error"),
+                             "error": str(out.get("error") or "")[:200]})
+            if not out.get("error"):
+                out.setdefault("route", level)
+                return {"exec_result": out, "route": level, "attempts": attempts}
+        return {"exec_result": {}, "attempts": attempts,
+                "verdict": "fail",
+                "error_codes": _codes_of(attempts),
+                "answer": _route_failed_text(attempts, state)}
+
+    async def _sandbox(self, state: AskDataState) -> dict[str, Any]:
+        """最后一级: 模型直出 SQL, 只在只读沙箱里跑(白名单表 + 行数 + 扫描量 + RLS)。"""
+        from app.db.schema_docs import ANALYTICS_SCHEMA_DDL
+
+        question = state.get("question", "")
+        dsl = json.dumps(state.get("dsl") or {}, ensure_ascii=False)
+        prompt = (
+            "只写一条 PostgreSQL 只读 SELECT(或 WITH...SELECT), 只输出 SQL 本身, 不要解释。\n"
+            f"要回答的问题: {question}\n已确定的查询意图: {dsl}\n"
+            f"可用表与字段:\n{ANALYTICS_SCHEMA_DDL}\n"
+            "规则: 只查上面列出的表; 不要自己写 tenant_id/dept_id 条件(能读到哪些行由"
+            "服务端行级安全决定); 时间用 created_at 左闭右开; 需要部门就 JOIN hr_employees; "
+            "不要注释、不要分号、不要写第二条语句。"
+        )
+        try:
+            resp = await self._llm.ainvoke(prompt)
+            sql = str(resp.content).strip()
+        except Exception as exc:  # noqa: BLE001 - 沙箱生成失败就当作这一级不可用
+            return {"error": f"沙箱 SQL 生成失败: {exc}"}
+        sql = _JSON_FENCE_RE.sub("", sql).strip().strip(";").strip()
+        if not sql.upper().startswith(("SELECT", "WITH")):
+            return {"error": "模型没有产出 SELECT, 沙箱这一级放弃"}
+        return await self._call("exec_sql_sandbox", sql=sql,
+                                nl_question=question, trace_id=state.get("trace_id", ""))
+
+    async def verify(self, state: AskDataState) -> dict[str, Any]:
+        """结果校验(确定性规则, 独立于模型): 列缺失/主指标全 NULL/量级异常/行数越界。
+
+        两类判定必须分开, 否则会把好答案拦下来:
+        - **空结果集不是失败**: "这个范围内就是没数据"是合法答案(当成异常拉起自修复只会
+          烧两轮 token 并给出一个看起来更漂亮的错答案);
+        - **同比列全 NULL 也不是失败**: 对比期没数时 `NULLIF` 就是会给 NULL, 那是
+          "没得比"而不是"算错了"。所以只校用户在 DSL 里点名要的**主指标列**。
+        """
+        result = state.get("exec_result") or {}
+        columns = list(result.get("columns") or [])
+        rows = list(result.get("rows") or [])
+        dsl = state.get("dsl") or {}
+        primary = {str(item.get("id") or "") for item in (dsl.get("metrics") or []) if item.get("id")}
+        problems: list[str] = []
+        notes: list[str] = []
+        if not rows:
+            notes.append("结果为空集(该范围内没数据)")
+        metric_cols = [c for c in columns if str(c).startswith("m_")]
+        checked = [c for c in metric_cols if c in primary] or metric_cols
+        for column in checked:
+            values = [row.get(column) for row in rows]
+            if values and all(v is None for v in values):
+                problems.append(f"主指标列 {column} 全是 NULL(口径可能落空)")
+                continue
+            numeric = [abs(float(v)) for v in values if isinstance(v, (int, float))]
+            if any(v >= 1e12 for v in numeric):
+                problems.append(f"指标列 {column} 出现 1e12 量级值, 疑似单位或口径错")
+        for column in [c for c in metric_cols if c not in checked]:
+            values = [row.get(column) for row in rows]
+            if values and all(v is None for v in values):
+                notes.append(f"对比列 {column} 全为空(对比期没数据, 不是算错)")
+        if primary - set(columns):
+            problems.append(f"缺少主指标列: {sorted(primary - set(columns))}")
+        cap = int(self._settings.askdata_max_rows or 100)
+        if len(rows) > cap:
+            problems.append(f"返回 {len(rows)} 行超过单次上限 {cap}")
+        out: dict[str, Any] = {"verify": {"ok": not problems, "problems": problems, "notes": notes,
+                                         "empty": not rows}}
+        if problems and not self._settings.askdata_repair_enabled:
+            # 自修复关掉时必须把 verdict 写成 fail: 否则 finalize 会拿"有结果"当 ok,
+            # 一个没被任何人复核过的异常结果就以"成功"落留痕并进看板分子。
+            out["verdict"] = "fail"
+            out["error_codes"] = list(state.get("error_codes") or []) + ["E_VERIFY"]
+            out["notes"] = list(state.get("notes") or []) + problems
+        return out
+
+    async def repair(self, state: AskDataState) -> dict[str, Any]:
+        """受限自修复: 只读工具上的有界 ReAct(默认 ≤2 轮 + 墙钟上限), 失败就如实降级。"""
+        settings = self._settings
+        role = state.get("role", "")
+        tools = await self._ensure_tools()
+        subset = [tools[name] for name in _REPAIR_TOOLS if name in tools]
+        if not subset:
+            return {"verdict": "degraded", "repair_text": ""}
+        agent = self._repair_agents.get(role)
+        if agent is None:
+            from app.security.auth import filter_tools_for_role
+            from app.schemas import Role
+            from app.security.caller import bind_caller_tools
+
+            try:
+                parsed = Role(role)
+            except ValueError:
+                parsed = Role.EMPLOYEE
+            agent = create_agent(
+                self._llm,
+                bind_caller_tools(filter_tools_for_role(parsed, "askdata", subset)),
+                system_prompt=prompts.REPAIR_PROMPT.format(
+                    question=state.get("question", ""),
+                    dsl=json.dumps(state.get("dsl") or {}, ensure_ascii=False),
+                    verdict=json.dumps((state.get("verify") or {}), ensure_ascii=False),
+                    candidates=json.dumps((state.get("candidates") or [])[:6], ensure_ascii=False),
+                ),
+            )
+            self._repair_agents[role] = agent
+        try:
+            result = await asyncio.wait_for(
+                agent.ainvoke({"messages": [("user", state.get("question", ""))]}),
+                timeout=float(settings.askdata_repair_timeout),
+            )
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001 - 自修复失败只降级, 不炸整轮
+            logger.warning("[askdata] 自修复失败(降级为如实说明): %s", exc)
+            return {"verdict": "degraded", "repair_text": ""}
+        text = ""
+        for msg in reversed(result["messages"]):
+            if isinstance(msg, AIMessage) and msg.content:
+                text = str(msg.content)
+                break
+        return {"repair_text": text, "verdict": "degraded" if text else "fail"}
+
+    async def render(self, state: AskDataState) -> dict[str, Any]:
+        """⑤ 可视化与叙述: 图型由结果 shape 规则决定, LLM 只补一段结论。"""
+        result = state.get("exec_result") or {}
+        columns = list(result.get("columns") or [])
+        rows = list(result.get("rows") or [])
+        labels = result.get("column_labels") or {}
+        chart: dict[str, Any] = {}
+        kind = prompts.chart_hint(
+            len([c for c in columns if not str(c).startswith("m_") and c != "period"]),
+            "period" in columns,
+            len(rows),
+        )
+        if kind != "none" and rows:
+            cats = [str(r.get(columns[0], "")) for r in rows[:20]]
+            metric_cols = [c for c in columns if str(c).startswith("m_")] or [columns[-1]]
+            primary = metric_cols[0]
+            values = [r.get(primary) for r in rows[:20]]
+            series = [{"name": labels.get(c, c), "data": [r.get(c) for r in rows[:20]]}
+                      for c in metric_cols[:2]]
+            out = await self._call(
+                "render_chart", title=f"{state.get('question', '')[:28]}", chart_type=kind,
+                categories=cats, series=None if kind == "pie" else series,
+                values=values if kind in ("pie", "line") and len(metric_cols) < 2 else None,
+            )
+            if out.get("url"):
+                chart = {"url": out["url"], "png_url": out.get("png_url", ""),
+                         "chart_type": out.get("chart_type", kind), "name": out.get("name", "")}
+        narrative = await self._narrate(state, columns, labels, rows)
+        return {"chart": chart, "narrative": narrative}
+
+    async def _narrate(self, state: AskDataState, columns: list[str],
+                       labels: dict[str, str], rows: list[dict[str, Any]]) -> str:
+        result = state.get("exec_result") or {}
+        table = _md_table(columns, labels, rows)
+        caliber = " ; ".join(result.get("caliber_notes") or []) or "(见下方口径列)"
+        fallback = (
+            f"统计区间: {(result.get('columns') and state.get('dsl', {}).get('time') or {}).get('range', '-')}; "
+            f"可见范围: {result.get('scope_note', '-')}"
+        )
+        try:
+            resp = await self._llm.ainvoke(prompts.NARRATOR_PROMPT.format(
+                question=state.get("question", ""),
+                range_label=json.dumps((state.get("validate_result") or {}).get("resolved_range") or {},
+                                       ensure_ascii=False),
+                scope_note=result.get("scope_note", "-"),
+                caliber=caliber,
+                columns=", ".join(labels.get(c, c) for c in columns) or "-",
+                rowcount=len(rows),
+                truncated="(仅展示前 20 行)" if len(rows) > 20 else "",
+                table=table or "(无数据行)",
+            ))
+            text = str(resp.content).strip()
+            return text or fallback
+        except Exception as exc:  # noqa: BLE001 - 叙述只是加分项, 表已经在答案里
+            logger.warning("[askdata] 叙述生成失败(只出表格): %s", exc)
+            return fallback
+
+    async def finalize(self, state: AskDataState) -> dict[str, Any]:
+        """⑥ 组装答案与结构化载荷, 并把这一轮全链路写进留痕(看板与归因的原料)。"""
+        payload = state.get("payload")
+        if payload and payload.get("kind") == "clarify":
+            query_id = await self._log(state, payload=None)
+            payload["query_id"] = query_id
+            return {"payload": payload, "answer": _clarify_text(payload),
+                    "verdict": "clarify"}
+        result = state.get("exec_result") or {}
+        verdict = state.get("verdict") or ("ok" if result else "fail")
+        answer = state.get("answer") or ""
+        if not answer and not result and verdict != "ok":
+            # 只在"一个数都没算出来"时出拒答模板; 有结果但校验存疑时仍然把数交出去
+            # (带警告), 因为"拦下好答案"比"给出带警告的答案"对用户更差。
+            answer = _refuse_text(state)
+        if not answer:
+            answer = await _compose_answer(self, state, result, verdict)
+        body = {
+            "kind": "result" if verdict == "ok" else ("degraded" if verdict == "degraded" else "refuse"),
+            "question": state.get("question", ""),
+            "route": state.get("route", ""),
+            "slots": state.get("slots") or {},
+            "dsl": state.get("dsl") or {},
+            "range": (state.get("validate_result") or {}).get("resolved_range") or {},
+            "columns": list(result.get("columns") or []),
+            "column_labels": result.get("column_labels") or {},
+            "rows": (result.get("rows") or [])[:50],
+            "rowcount": int(result.get("rowcount") or 0),
+            "sql": result.get("sql", ""),
+            "caliber_notes": list(result.get("caliber_notes") or []) + list(state.get("notes") or []),
+            "scope_note": result.get("scope_note", "") or state.get("validate_result", {}).get("scope_note", ""),
+            "chart": state.get("chart") or {},
+            "verdict": verdict,
+            "error_codes": list(state.get("error_codes") or []),
+            "attempts": state.get("attempts") or [],
+            "catalog_origin": state.get("catalog_origin", ""),
+            "vector_channel": state.get("vector_channel", ""),
+            "trace_id": state.get("trace_id", ""),
+            # 候选口径也随结果一同下发: 反馈面板里"我要改口径"要能列出可选口径,
+            # 否则用户只能自由打字, 那条反馈就没法归到语义层对象上。
+            "metrics": [
+                {"id": c.get("id"), "label": c.get("label"), "caliber": c.get("caliber", ""),
+                 "score": c.get("score"), "time_aware": c.get("time_aware")}
+                for c in (state.get("candidates") or [])
+                if c.get("kind") == "metric"
+            ][:6],
+        }
+        query_id = await self._log(state, payload=body)
+        body["query_id"] = query_id
+        return {"payload": body, "answer": answer, "verdict": verdict,
+                "error_codes": body["error_codes"]}
+
+    async def _log(self, state: AskDataState, *, payload: dict[str, Any] | None) -> str:
+        """写留痕(含被澄清拦住的那一轮); 写不出来就返回空串并让载荷自己说明降级。"""
+        result = state.get("exec_result") or {}
+        route = state.get("route") or (
+            "clarify" if state.get("verdict") == "clarify" else str((payload or {}).get("route") or "")
+        )
+        notes = list(state.get("notes") or [])
+        if state.get("verdict") == "clarify":
+            notes.append(str((payload or state.get("payload") or {}).get("reason") or ""))
+        out = await self._call(
+            "log_query",
+            trace_id=state.get("trace_id", ""),
+            question=state.get("question", ""),
+            slots_json=state.get("slots") or {},
+            candidates_json=(state.get("candidates") or [])[:10],
+            dsl_json=state.get("dsl") or {},
+            route=route,
+            final_sql=result.get("sql", ""),
+            rowcount=int(result.get("rowcount") or 0),
+            latency_ms=int((time.monotonic() - float(state.get("started_at") or time.monotonic())) * 1000),
+            verdict=state.get("verdict") or "ok",
+            error_codes=list(state.get("error_codes") or []),
+            notes=" | ".join(n for n in notes if n)[:2000],
+            session_id=state.get("session_id", ""),
+        )
+        return str(out.get("query_id") or "")
+
+    # ---------------- 图 ----------------
+    def build(self):
+        g = StateGraph(AskDataState)
+        g.add_node("parse", self.parse)
+        g.add_node("link", self.link)
+        g.add_node("clarify_gate", self.clarify_gate)
+        g.add_node("plan", self.plan)
+        g.add_node("validate", self.validate)
+        g.add_node("route", self.route)
+        g.add_node("verify", self.verify)
+        g.add_node("repair", self.repair)
+        g.add_node("render", self.render)
+        g.add_node("finalize", self.finalize)
+        g.add_node("rewrite", _rewrite_node)
+
+        g.add_edge(START, "parse")
+        g.add_edge("parse", "link")
+        g.add_conditional_edges("link", _after_link,
+                                {"denied": "finalize", "clarify_gate": "clarify_gate"})
+        g.add_conditional_edges("clarify_gate", _after_clarify,
+                                {"clarify": "finalize", "proceed": "plan"})
+        g.add_conditional_edges("plan", _after_plan,
+                                {"validate": "validate", "rewrite": "rewrite", "finalize": "finalize"})
+        g.add_conditional_edges("validate", _after_validate,
+                                {"route": "route", "rewrite": "rewrite", "finalize": "finalize"})
+        g.add_edge("rewrite", "plan")
+        g.add_conditional_edges("route", _after_route,
+                                {"verify": "verify", "finalize": "finalize"})
+        g.add_conditional_edges("verify", _after_verify,
+                                {"render": "render", "repair": "repair", "finalize": "finalize"})
+        g.add_edge("repair", "finalize")
+        g.add_edge("render", "finalize")
+        g.add_edge("finalize", END)
+        return g.compile()
+
+    async def run(self, state: AskDataState) -> AskDataState:
+        graph = self.build()
+        return await graph.ainvoke(state)
+
+
+# ---------------------------------------------------------------------------
+# 条件路由(每个判据都是结构事实, 不看答案文本猜)
+# ---------------------------------------------------------------------------
+def _after_link(state: AskDataState) -> str:
+    """链接阶段就被服务端拒(作用域)或服务本身报错时直接出结论, 不再往下猜。"""
+    return "clarify_gate" if not state.get("verdict") else "denied"
+
+
+def _after_clarify(state: AskDataState) -> str:
+    if state.get("verdict") == "clarify":
+        return "clarify"
+    return "proceed"
+
+
+def _rewrite_node(state: AskDataState) -> dict[str, Any]:
+    """回炉计数节点: 把"重写了几个"这件事单独管, 而不是让条件边自己递增。
+
+    这件事看起来小, 但它是终止保证的唯一所在: 条件边直接绕回 plan 而没人递增计数,
+    一个永远修不掉的 DSL 就会在 plan/validate 之间无限振荡直到堆死整个容器。
+    """
+    count = int(state.get("rewrite_count") or 0) + 1
+    errors = (state.get("validate_result") or {}).get("errors") or []
+    hint = state.get("error_hint") or "; ".join(
+        f"[{e.get('code')}] {e.get('message')}" for e in errors[:3]
+    )
+    return {"rewrite_count": count, "error_hint": hint}
+
+
+def _after_plan(state: AskDataState) -> str:
+    if state.get("dsl"):
+        return "validate"
+    # 与 _after_validate 同一个判据(严格小于): 否则"语法失败也能回炉一次"会变成两次重写。
+    if int(state.get("rewrite_count") or 0) < MAX_REWRITE and state.get("error_hint"):
+        return "rewrite"
+    return "finalize"
+
+
+def _after_validate(state: AskDataState) -> str:
+    check = state.get("validate_result") or {}
+    if check.get("ok"):
+        return "route"
+    if int(state.get("rewrite_count") or 0) < MAX_REWRITE:
+        return "rewrite"
+    return "finalize"
+
+
+def _after_route(state: AskDataState) -> str:
+    return "verify" if state.get("exec_result") else "finalize"
+
+
+def _after_verify(state: AskDataState) -> str:
+    check = state.get("verify") or {}
+    if check.get("ok"):
+        return "render"
+    settings = get_settings()
+    if settings.askdata_repair_enabled and not state.get("repair_text"):
+        return "repair"
+    return "finalize"
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+def _inherit(slots: dict[str, Any], prior: dict[str, Any]) -> dict[str, Any]:
+    """多轮省略/指代的确定性继承: 只继承"本轮完全没说"的时间与指标说法。
+
+    只继承这两样是因为它们的省略最常见且后果可控; 维度/过滤条件不继承 —— 那会把
+    上一轮的筛选悄悄带进这一次的数, 是最难被发现的一类错。
+    """
+    merged = dict(slots or {})
+    if not (merged.get("time") or {}).get("phrase") and (prior.get("time") or {}).get("phrase"):
+        merged["time"] = {**(merged.get("time") or {}),
+                          "phrase": prior["time"]["phrase"], "inherited": True}
+    if not merged.get("metric_terms") and prior.get("metric_terms"):
+        merged["metric_terms"] = list(prior["metric_terms"])
+        merged.setdefault("confidence", {})["metric"] = 0.6
+    merged["prior_inherited"] = bool(
+        (merged.get("time") or {}).get("inherited") or merged.get("metric_terms")
+        and not (slots or {}).get("metric_terms")
+    )
+    return merged
+
+
+def _has_time(slots: dict[str, Any]) -> bool:
+    time_slot = slots.get("time") or {}
+    return bool(time_slot.get("phrase") or time_slot.get("start") or time_slot.get("end"))
+
+
+def _candidates_are_snapshots(metrics: list[dict[str, Any]]) -> bool:
+    """候选口径全是不看时间的快照型指标(年度预算消耗率、在职人数等)。
+
+    对这类指标要时间区间没意义(库里根本没有时间列), 问了就是白问一轮。
+    拿不到 ``time_aware`` 时按"需要时间"处理(保守: 宁可多问一句)。
+    """
+    if not metrics:
+        return False
+    return all(m.get("time_aware") is False for m in metrics)
+
+
+def _prune_invented_terms(slots: dict[str, Any], question: str) -> dict[str, Any]:
+    """丢掉不是从本轮原话里截出来的说法(模型拿自己的词表替代了用户的话)。
+
+    为什么必需: 槽位抽取一旦把"每一单外卖的金额中位数"这类它不会的词翻成
+    "报销总额/年假余额合计", 下游链接就会拿到两个 1.00 的**精确命中**看似很有把握,
+    实际是在问一个用户根本没说的口径。提示词里的"不要编造"拦不住这件事(实测会编),
+    所以这里用确定性判据卡一道: 说法必须是归一化后原话的子串。
+
+    继承来的说法不要求在本轮原话里(它就是从上一轮带来的); 完全被剔光时保留
+    问题本身作为说法, 交给链接/澄清去判能不能对应上口径。
+    """
+    haystack = _norm_text(question)
+    out = dict(slots or {})
+    dropped: list[str] = []
+
+    def _keep(items: Any, *, dict_key: str | None = None) -> list[Any]:
+        kept: list[Any] = []
+        for item in items or []:
+            phrase = str(item.get(dict_key) if dict_key else item or "").strip()
+            if not phrase:
+                continue
+            needle = _norm_text(phrase)
+            if needle and needle in haystack:
+                kept.append(item)
+            else:
+                dropped.append(phrase)
+        return kept
+
+    metric_terms = _keep(out.get("metric_terms"))
+    dim_terms = _keep(out.get("dim_terms"))
+    filter_terms = _keep(out.get("filter_terms"), dict_key="phrase")
+    time_phrase = str(((out.get("time") or {}).get("phrase")) or "").strip()
+    if time_phrase and _norm_text(time_phrase) not in haystack and not (out.get("time") or {}).get("inherited"):
+        dropped.append(time_phrase)
+        out["time"] = {k: v for k, v in (out.get("time") or {}).items() if k != "phrase"}
+    out["metric_terms"] = metric_terms or ([question.strip()] if question else [])
+    out["dim_terms"] = dim_terms
+    out["filter_terms"] = filter_terms
+    if dropped:
+        out["invented_dropped"] = dropped[:8]
+    return out
+
+
+def _norm_text(value: str) -> str:
+    from app.docs.normalize import normalize_text
+
+    return re.sub(r"\s+", " ", normalize_text(value or "")).strip().lower()
+
+
+def _phrase_of(slots: dict[str, Any]) -> str:
+    parts: list[str] = []
+    parts.extend(str(p) for p in slots.get("metric_terms") or [])
+    parts.extend(str(p) for p in slots.get("dim_terms") or [])
+    for item in slots.get("filter_terms") or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("phrase") or ""))
+    time_slot = slots.get("time") or {}
+    parts.append(str(time_slot.get("phrase") or ""))
+    compare = slots.get("compare") or {}
+    parts.append(str(compare.get("phrase") or ""))
+    return " ".join(p for p in parts if p).strip()
+
+
+def _time_phrase_to_token(phrase: str) -> str:
+    try:
+        from app.semantic.timesem import normalize_range
+
+        return normalize_range(phrase)
+    except Exception:  # noqa: BLE001 - 说法归不到区间词就走澄清
+        return ""
+
+
+def _clarify_payload(state: AskDataState, reasons: list[str], metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    settings = get_settings()
+    limit = max(2, int(settings.askdata_clarify_max_options))
+    slots = state.get("slots") or {}
+    dims = [c for c in state.get("candidates") or [] if c.get("kind") == "dim"]
+    return {
+        "kind": "clarify",
+        "question": state.get("question", ""),
+        "reason": "; ".join(reasons),
+        "lead": prompts.CLARIFY_LEAD,
+        "metrics": [
+            {"id": m.get("id"), "label": m.get("label"), "caliber": m.get("caliber"),
+             "score": m.get("score")}
+            for m in metrics[:limit]
+        ],
+        "times": [{"token": token, "label": label} for token, label in TIME_CHOICES],
+        "has_time": _has_time(slots),
+        "dims": [{"id": d.get("id"), "label": d.get("label")} for d in dims[:limit]],
+        "allow_none": True,
+        "slots": slots,
+    }
+
+
+def _clarify_text(payload: dict[str, Any]) -> str:
+    """澄清正文: 与面板同源的一份**人读**文本(面板渲染不了时用户仍能看到选项)。"""
+    lines = [payload.get("lead", prompts.CLARIFY_LEAD), f"原因: {payload.get('reason', '')}", ""]
+    metrics = payload.get("metrics") or []
+    if metrics:
+        lines.append("请确认要看的指标口径:")
+        for i, item in enumerate(metrics, 1):
+            lines.append(f"{i}) {item.get('label')} —— {item.get('caliber') or '(口径见语义层)'}")
+    if not payload.get("has_time"):
+        lines.append("")
+        lines.append("请确认统计区间:")
+        for i, item in enumerate(payload.get("times") or [], 1):
+            lines.append(f"{i}) {item.get('label')}")
+    lines.append("")
+    lines.append(
+        "直接回复序号或说法即可; 如果都不是, 说「都不是」我会告诉你现在能用哪些口径。"
+    )
+    return "\n".join(lines)
+
+
+def _refuse_text(state: AskDataState) -> str:
+    """拒答正文: 把校验器的确定拒因翻译给人看, 并列出现在能用什么。
+
+    这里刻意不"换个口径先答个差不多"的: 问数里错的数比没数危险得多。
+    """
+    check = state.get("validate_result") or {}
+    errors = check.get("errors") or []
+    reason = "; ".join(f"{e.get('message')}" for e in errors[:3]) or state.get("error_hint") or ""
+    if not reason:
+        reason = "没能把你的问题对应到一个已登记且可执行的口径"
+    hint = ""
+    metrics = (state.get("candidates") or [])[:3]
+    if metrics:
+        hint = "、".join(str(m.get("label") or m.get("id")) for m in metrics)
+    else:
+        hint = "报销总额/采购申请金额/高风险合同数 等经营指标(说“有哪些口径”可以列全)"
+    return prompts.REFUSE_TEXT.format(reason=reason, hint=hint)
+
+
+def _codes_of(attempts: list[dict[str, Any]]) -> list[str]:
+    codes: list[str] = []
+    for attempt in attempts:
+        for code in re.findall(r"E_[A-Z_]+", str(attempt.get("error") or "")):
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _route_failed_text(attempts: list[dict[str, Any]], state: AskDataState) -> str:
+    lines = [
+        "这个问题现在算不出来: 语义层的三条通道都没能给出可执行的口径。",
+        "",
+        f"- 指标 API / 编译器 / 沙箱逐条结果: "
+        + "; ".join(f"{a.get('level')}={'失败' if not a.get('ok') else '未通过'}" for a in attempts),
+    ]
+    for attempt in attempts:
+        if attempt.get("error"):
+            lines.append(f"- {attempt.get('level')}: {attempt['error']}")
+    candidates = (state.get("candidates") or [])[:3]
+    if candidates:
+        lines.append("")
+        lines.append("最接近的已登记口径: "
+                     + "; ".join(f"{c.get('label')}({c.get('caliber') or ''})" for c in candidates))
+    lines.append("")
+    lines.append("如果这就是你要的口径, 换个说法再问一次; 如果不是, 这个口径需要先在语义层登记。")
+    return "\n".join(lines)
+
+
+async def _compose_answer(
+    pipeline: "AskDataPipeline", state: AskDataState, result: dict[str, Any], verdict: str
+) -> str:
+    """正文 = 叙述 + 结果表 + 图表链接 + 口径与范围说明。"""
+    columns = list(result.get("columns") or [])
+    rows = list(result.get("rows") or [])
+    labels = result.get("column_labels") or {}
+    parts: list[str] = []
+    if verdict == "degraded" and state.get("repair_text"):
+        parts.append(state["repair_text"])
+    elif verdict in ("fail", "degraded"):
+        problems = (state.get("verify") or {}).get("problems") or []
+        if problems:
+            parts.append("⚠️ 结果校验存疑，以下数字请人工复核：" + "; ".join(problems[:3]))
+    else:
+        if state.get("narrative"):
+            parts.append(state["narrative"])
+    table = _md_table(columns, labels, rows)
+    if table:
+        parts.append(table)
+        if len(rows) > 20:
+            parts.append(f"(共 {len(rows)} 行, 以上仅展示前 20 行)")
+    chart = state.get("chart") or {}
+    if chart.get("url"):
+        parts.append(f"![图表]({chart['url']})")
+        parts.append(f"[查看图表]({chart['url']})")
+    notes = result.get("caliber_notes") or []
+    tail = ["", f"> 数据范围: {result.get('scope_note', '-')}"]
+    if notes:
+        tail.append("> 统计口径: " + "; ".join(notes))
+    if state.get("catalog_origin") and state["catalog_origin"] != "db":
+        tail.append(f"> 注意: 本轮口径来自内置兜底集(catalog={state['catalog_origin']}), 未经语义层治理版本确认。")
+    parts.append("\n".join(tail))
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+def _as_dict_result(raw: Any) -> dict[str, Any]:
+    """把 MCP 工具返回(content blocks / 结构化 list / dict / JSON 字符串)统一成一个 dict。
+
+    形状不统一是真的: langchain-mcp-adapters 对 `dict` 工具会给 `[{"type":"text","text":...}]`,
+    对 `list[dict]` 工具又会直接给列表。不能拿"第一项是 dict"就当结果体 ——
+    那会拿到 `{"type": "text", "text": "..."}` 这种块, 看上去是一个空结果而不是报错
+    (实际踩过: 表现为"语义层没这个指标"的误导拒因)。
+    """
+    from app.assistant.mcp_client import flatten_mcp_result
+
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list) and raw and all(isinstance(b, dict) for b in raw):
+        if not any("type" in b or "text" in b for b in raw):
+            # 直接的结构化行列表(analytics 域 run_sql 那种形状)
+            return raw[0] if len(raw) == 1 else {"rows": raw, "rowcount": len(raw)}
+    text = flatten_mcp_result(raw)
+    if not text:
+        return {"error": "MCP 工具返回了空结果"}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        # FastMCP 把工具内异常以纯文本返回来("Error executing tool xxx: ...")。
+        # 不判它就会变成"一个没有候选的合法结果", 上层因此报"语义层没这个指标"
+        # 而不是"工具本身炸了" —— 这两件事必须分开(踩过)。
+        if text.lstrip().lower().startswith(("error", "traceback", "validation error")):
+            return {"error": text[:400]}
+        return {"text": text}
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        return parsed[0] if len(parsed) == 1 else {"rows": parsed, "rowcount": len(parsed)}
+    return {"value": parsed}
+
+
+def _track(state: AskDataState, text: str) -> None:
+    logger.debug("[askdata] %s", text)
+
+
+def time_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)

@@ -259,6 +259,7 @@ def execute_scoped_select(
     db_role: str | None = None,
     session_settings: dict[str, str] | None = None,
     max_scan_rows: int | None = None,
+    timeout_ms: int | None = None,
 ) -> tuple[list[dict], int | None]:
     """执行一条**已由上层校验过**的 SELECT, 返回 ``(结果体, 预估扫描行数)``。
 
@@ -266,10 +267,13 @@ def execute_scoped_select(
     域已升级到 AST 校验(见 app/db/ast_guard.py), 那边给出的就是最终文本。执行与成本
     预估必须在**同一个作用域事务**里做: 预估要看到与执行同一份 RLS 过滤后的行数,
     否则"预估超限"与"实际能读到多少"是两个口径。
+
+    ``timeout_ms`` 让具体调用域自己定语句超时(智能问数是人在等的, 上限比角色默认更紧);
+    不传则沿用角色/全局口径。
     """
     from app.db.ast_guard import estimate_scan_rows
 
-    with scoped_connection(db_role, session_settings) as conn:
+    with scoped_connection(db_role, session_settings, timeout_ms) as conn:
         scan_rows = estimate_scan_rows(conn, sql, params)
         if max_scan_rows is not None and scan_rows is not None and scan_rows > max_scan_rows:
             raise ScanCostExceeded(

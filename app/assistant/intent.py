@@ -39,9 +39,12 @@ from app.schemas import IntentResult, IntentType
 logger = logging.getLogger(__name__)
 
 # 领域关键词: 供规则层判定业务域(target)与终端关键词兜底复用。
-# 顺序即优先级(字典保持插入序): 先具体业务对象(finance/hr), 再报表/采购这类
-# 可能与其他域重叠的域; analytics 排在 procurement 前, 使"采购报表"归数据分析。
+# 顺序即优先级(字典保持插入序): askdata 故意排在最前 —— 它只收"环比/同比/下钻/人均/口径"
+# 这类**只有问数才这么说**的高区分度词, 所以不会抢走"报销进度/年假余额"那些办理型说法,
+# 但能赢过 finance/analytics 的泛词("报销额环比"不该归财务办理)。再后是具体业务对象,
+# analytics 排在 procurement 前, 使"采购报表"归数据分析。
 _AGENT_KEYWORDS = {
+    "askdata": ("问数", "环比", "同比", "下钻", "人均", "统计口径", "口径是", "报个数"),
     "finance": ("报销", "费用", "发票", "借款", "付款", "预算"),
     "hr": ("入职", "离职", "在职证明", "证明", "考勤", "请假", "年假申请", "工单"),
     "analytics": ("统计", "报表", "周报", "月报", "数据分析", "趋势", "占比", "汇总",
@@ -85,6 +88,9 @@ _RULES: list[tuple[re.Pattern, IntentType]] = [
     (re.compile(r"(申请|我要|办理).{0,4}(离职|入职|转正)"), IntentType.AGENT_DELEGATE),
     # 数据分析: "生成/出/做一份周报/月报/报表" 这类成文成图诉求委派 Analyst_Agent。
     (re.compile(r"(生成|出|做|来|写|整).{0,6}(周报|月报|报表|分析报告|经营报告|图表)"), IntentType.AGENT_DELEGATE),
+    # 智能问数: 环比/同比/下钻/问数 是只有"要一个准确数字"才会用的说法,
+    # 直接委派 AskData_Agent(不靠关键词与语义层碰运气)。
+    (re.compile(r"(环比|同比|下钻|问数|人均)"), IntentType.AGENT_DELEGATE),
     # 采购/合同: 送审合同、发起采购委派 Contract_Agent(多步办理 + 初审)。
     (re.compile(r"(审|审查|初审|送审|合规|把关).{0,4}(合同|采购)"), IntentType.AGENT_DELEGATE),
     (re.compile(r"(申请|我要|发起|办理|提).{0,4}(采购|下单|进货)"), IntentType.AGENT_DELEGATE),
@@ -122,6 +128,14 @@ _SEEDS: dict[tuple[IntentType, str | None], list[str]] = {
     (IntentType.AGENT_DELEGATE, "analytics"): [
         "生成本周经营周报", "帮我做一份月度分析报告", "出一份费用趋势图",
         "写个季度数据分析报告", "做个部门预算对比图表",
+    ],
+    (IntentType.TOOL_CALL, "askdata"): [
+        "本月报销总额是多少", "各部门采购金额环比怎么样", "高风险合同一共有几份",
+        "人均报销额是多少", "按类别看一下今年差旅花费",
+    ],
+    (IntentType.AGENT_DELEGATE, "askdata"): [
+        "帮我问个数: 这个月花了多少报销", "各部门本月报销总额并做同比",
+        "按部门下钻看一下采购金额", "预算消耗率现在是多少", "请给我准确的口径数字",
     ],
     (IntentType.TOOL_CALL, "procurement"): [
         "查一下 PO3000 采购单", "CT8000 合同初审到哪了", "我的采购单进度",
@@ -313,7 +327,7 @@ class IntentRecognizer:
         data = json.loads(str(content))
         intent = IntentType(data.get("intent", "knowledge_qa"))
         target = data.get("target")
-        if target not in ("finance", "hr", "analytics", "procurement", "web", "docgen"):
+        if target not in ("finance", "hr", "analytics", "askdata", "procurement", "web", "docgen"):
             target = None
         return IntentResult(
             intent=intent,

@@ -9,8 +9,9 @@
 
 为什么需要这个脚本: 本项目的全部服务(含 assistant 网关)都在 compose 里
 (assistant / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru /
-hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent /
-analyst-agent / contract-agent), 宿主只跑 vite dev 与 Ollama。**验证代码改动只允许
+hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / askdata-mcp /
+hr-agent / finance-agent / analyst-agent / contract-agent / askdata-agent),
+宿主只跑 vite dev 与 Ollama。**验证代码改动只允许
 走容器**(.qoder/rules/container-first-verification.md), 宿主直跑网关属违规。
 麻烦之处在于这些层
 连不上时**全是静默降级**: Redis 退回内存 dict、checkpoint 退回 InMemorySaver、TEI 超时
@@ -56,10 +57,12 @@ DEV_SERVICES = [
     "finance-mcp",
     "analytics-mcp",
     "procurement-mcp",
+    "askdata-mcp",
     "hr-agent",
     "finance-agent",
     "analyst-agent",
     "contract-agent",
+    "askdata-agent",
 ]
 
 # 允许出现在 .env / docker/.env 里的密钥字段: 出现非空值即视为写错了位置。
@@ -90,10 +93,12 @@ CONTAINER_HOSTS = (
     "finance-mcp",
     "analytics-mcp",
     "procurement-mcp",
+    "askdata-mcp",
     "hr-agent",
     "finance-agent",
     "analyst-agent",
     "contract-agent",
+    "askdata-agent",
     # Langfuse 自建可观测栈(profile=langfuse)的服务名。
     "langfuse-web",
     "langfuse-minio",
@@ -366,10 +371,12 @@ def _config_track_checks() -> list[Check]:
         "FINANCE_MCP_URL": s.finance_mcp_url,
         "ANALYTICS_MCP_URL": s.analytics_mcp_url,
         "PROCUREMENT_MCP_URL": s.procurement_mcp_url,
+        "ASKDATA_MCP_URL": s.askdata_mcp_url,
         "HR_AGENT_URL": s.hr_agent_url,
         "FINANCE_AGENT_URL": s.finance_agent_url,
         "ANALYST_AGENT_URL": s.analyst_agent_url,
         "CONTRACT_AGENT_URL": s.contract_agent_url,
+        "ASKDATA_AGENT_URL": s.askdata_agent_url,
         "OLLAMA_BASE_URL": s.ollama_base_url,
         "MINERU_BASE_URL": s.mineru_base_url,
         "PG_HOST": s.pg_host,
@@ -466,10 +473,12 @@ async def _build_checks(with_gateway: bool) -> list[Check]:
         Check("finance-mcp", s.finance_mcp_url, lambda: _probe_mcp("finance-mcp", s.finance_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d finance-mcp"),
         Check("analytics-mcp", s.analytics_mcp_url, lambda: _probe_mcp("analytics-mcp", s.analytics_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d analytics-mcp"),
         Check("procurement-mcp", s.procurement_mcp_url, lambda: _probe_mcp("procurement-mcp", s.procurement_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d procurement-mcp"),
+        Check("askdata-mcp", s.askdata_mcp_url, lambda: _probe_mcp("askdata-mcp", s.askdata_mcp_url), fix="docker compose -f docker/docker-compose.yml up -d askdata-mcp"),
         Check("hr-agent", s.hr_agent_url, lambda: _probe_agent("hr-agent", s.hr_agent_url), fix="docker compose -f docker/docker-compose.yml up -d hr-agent"),
         Check("finance-agent", s.finance_agent_url, lambda: _probe_agent("finance-agent", s.finance_agent_url), fix="docker compose -f docker/docker-compose.yml up -d finance-agent"),
         Check("analyst-agent", s.analyst_agent_url, lambda: _probe_agent("analyst-agent", s.analyst_agent_url), fix="docker compose -f docker/docker-compose.yml up -d analyst-agent"),
         Check("contract-agent", s.contract_agent_url, lambda: _probe_agent("contract-agent", s.contract_agent_url), fix="docker compose -f docker/docker-compose.yml up -d contract-agent"),
+        Check("askdata-agent", s.askdata_agent_url, lambda: _probe_agent("askdata-agent", s.askdata_agent_url), fix="docker compose -f docker/docker-compose.yml up -d askdata-agent"),
     ]
     if with_gateway:
         checks.append(
@@ -578,10 +587,12 @@ COMPOSE_REDLINE_KEYS = {
     "FINANCE_MCP_URL",
     "ANALYTICS_MCP_URL",
     "PROCUREMENT_MCP_URL",
+    "ASKDATA_MCP_URL",
     "HR_AGENT_URL",
     "FINANCE_AGENT_URL",
     "ANALYST_AGENT_URL",
     "CONTRACT_AGENT_URL",
+    "ASKDATA_AGENT_URL",
     "MONGO_URL",
 }
 
@@ -591,11 +602,13 @@ DRIFT_IGNORE = {
     "OLLAMA_BASE_URL", "ES_URL", "MONGO_URL", "REDIS_URL", "NEO4J_URI", "TEI_RERANK_URL",
     "MINERU_BASE_URL", "PG_HOST", "DATABASE_URL",
     "HR_MCP_URL", "FINANCE_MCP_URL", "ANALYTICS_MCP_URL", "PROCUREMENT_MCP_URL",
+    "ASKDATA_MCP_URL",
     "HR_AGENT_URL", "FINANCE_AGENT_URL", "ANALYST_AGENT_URL", "CONTRACT_AGENT_URL",
+    "ASKDATA_AGENT_URL",
     "ASSISTANT_HOST", "ASSISTANT_PORT", "WEB_SEARCH_PROXY", "AUDIT_LOG_PATH",
     "UPLOAD_DIR", "KNOWLEDGE_DIR", "REPORT_DIR",
     "ASSISTANT_HOST_PORT", "HR_MCP_HOST_PORT", "FINANCE_MCP_HOST_PORT",
-    "ANALYTICS_MCP_HOST_PORT", "PROCUREMENT_MCP_HOST_PORT",
+    "ANALYTICS_MCP_HOST_PORT", "PROCUREMENT_MCP_HOST_PORT", "ASKDATA_MCP_HOST_PORT",
     "NEO4J_HTTP_HOST_PORT", "NEO4J_BOLT_HOST_PORT", "TEI_PORT",
     "LANGSMITH_TRACING",
     # Langfuse: 两轨故意不同值的地址键, 以及"宿主脚本可开、容器默认关"的开关。

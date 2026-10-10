@@ -7,24 +7,30 @@ from typing import Any
 from app.schemas import Role
 
 # Which MCP tool namespaces each role may invoke.
-# analytics/procurement 是新增的两个业务域(数据洞察 / 采购合同初审)。
+# analytics/procurement 是新增的两个业务域(数据洞察 / 采购合同初审);
+# askdata 是智能问数(NL2DSL + 语义层), 同样能跨业务域拿全员数字, 与 analytics 同敏感级。
 MCP_WHITELIST: dict[Role, set[str]] = {
     Role.EMPLOYEE: {"hr", "finance", "procurement"},
-    Role.MANAGER: {"hr", "finance", "analytics", "procurement"},
-    Role.HR: {"hr", "finance", "analytics", "procurement"},
-    Role.FINANCE: {"hr", "finance", "analytics", "procurement"},
-    Role.ADMIN: {"hr", "finance", "analytics", "procurement"},
+    Role.MANAGER: {"hr", "finance", "analytics", "procurement", "askdata"},
+    Role.HR: {"hr", "finance", "analytics", "procurement", "askdata"},
+    Role.FINANCE: {"hr", "finance", "analytics", "procurement", "askdata"},
+    Role.ADMIN: {"hr", "finance", "analytics", "procurement", "askdata"},
 }
 
 # Which A2A agents each role may delegate to.
 # analytics_agent(Analyst_Agent) 跨域查询全员经营数据, 属敏感能力, 不对普通员工开放;
+# askdata_agent(AskData_Agent) 同样能拿到全员数字(只是走语义层口径), 沿用同一口径;
 # procurement_agent(Contract_Agent) 支持员工自提采购单/送审合同, 对其开放。
 AGENT_WHITELIST: dict[Role, set[str]] = {
     Role.EMPLOYEE: {"finance_agent", "hr_agent", "procurement_agent"},
-    Role.MANAGER: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
-    Role.HR: {"hr_agent", "finance_agent", "analytics_agent", "procurement_agent"},
-    Role.FINANCE: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
-    Role.ADMIN: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent"},
+    Role.MANAGER: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent",
+                   "askdata_agent"},
+    Role.HR: {"hr_agent", "finance_agent", "analytics_agent", "procurement_agent",
+              "askdata_agent"},
+    Role.FINANCE: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent",
+                   "askdata_agent"},
+    Role.ADMIN: {"finance_agent", "hr_agent", "analytics_agent", "procurement_agent",
+                 "askdata_agent"},
 }
 
 # Fine-grained tool-level restrictions: sensitive tools are limited by role.
@@ -125,6 +131,30 @@ def analytics_whitelist(role: Role) -> set[str]:
     return tools
 
 # ---------------------------------------------------------------------------
+# 智能问数域(askdata): 全部是只读工具(语义层查询/链接/校验/编译取数/沙箱取数/成图/留痕)。
+# 没有写通道: 改数据仍然是 Analyst_Agent 受治理写通道的职责, 两者不开双重入口。
+# 普通员工对本域默认拒(与 analytics 同一口径: 能拿到全员数字的能力不默认开放)。
+# ---------------------------------------------------------------------------
+ASKDATA_TOOLS: frozenset[str] = frozenset({
+    "list_metrics",
+    "link_terms",
+    "validate_dsl",
+    "query_metric_api",
+    "compile_dsl",
+    "exec_sql_sandbox",
+    "render_chart",
+    "log_query",
+})
+
+
+def askdata_whitelist(role: Role) -> set[str]:
+    """askdata 域对某角色可见的工具集(普通员工为空 = 默认拒)。"""
+    if role is Role.EMPLOYEE:
+        return set()
+    return set(ASKDATA_TOOLS)
+
+
+# ---------------------------------------------------------------------------
 # 采购合同域(procurement): 员工可自助下单/送审/查自己单据, 但 execute_sql
 # (跨全员采购/合同统计)仅对管理角色开放。None 表示全量可见。
 # ---------------------------------------------------------------------------
@@ -195,7 +225,9 @@ def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> lis
     Tools must expose a ``name`` attribute (LangChain BaseTool). The four MCP
     business domains (finance/hr/analytics/procurement) are tiered by the
     matrices in ``_DOMAIN_TOOL_WHITELISTS`` (analytics by :func:`analytics_whitelist`,
-    because its write tools depend on ``DATAOPS_WRITABLE_ROLES``); unregistered
+    because its write tools depend on ``DATAOPS_WRITABLE_ROLES``; askdata by
+    :func:`askdata_whitelist`, it is read-only so there is no config-driven part);
+    unregistered
     domains (e.g. the in-process capability domains web/docgen) pass through here
     **without a per-tool matrix** — they are gated one level up by
     :func:`check_capability_permission` plus :mod:`app.security.quota`, so
@@ -204,6 +236,8 @@ def filter_tools_for_role(role: Role, server_name: str, tools: list[Any]) -> lis
     """
     if server_name == "analytics":
         return [t for t in tools if t.name in analytics_whitelist(role)]
+    if server_name == "askdata":
+        return [t for t in tools if t.name in askdata_whitelist(role)]
     matrix = _DOMAIN_TOOL_WHITELISTS.get(server_name)
     if matrix is None:
         return list(tools)

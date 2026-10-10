@@ -75,6 +75,12 @@ from langgraph.graph import END, START, StateGraph
 
 from app.agents.common_tools import take_lookup_tool, with_lookup_tool
 from app.assistant.a2a_client import AGENT_PROFILES, get_a2a_pool, is_agent_domain
+from app.assistant.askdata_bridge import (
+    artifacts_from_payload,
+    slots_of,
+    split_askdata_payload,
+    to_metadata as askdata_view,
+)
 from app.assistant.intent import IntentRecognizer, needs_current_time
 from app.assistant.mcp_client import get_mcp_pool
 from app.assistant.memory import get_memory_store
@@ -85,6 +91,7 @@ from app.assistant.prompts import (
     RETRY_REWRITE_PROMPT,
 )
 from app.assistant.stream import RunOverloaded, get_stream_hub, new_run_id
+from app.assistant.slot_store import get_slot_store
 from app.cache.prompt_cache import cached_llm_call
 from app.cache.retrieval_cache import cached_retrieve, invalidate_all
 from app.cache.tool_cache import wrap_tools_for_cache
@@ -209,6 +216,11 @@ class AssistantState(TypedDict):
     # [{index, domain, agent, route, answer, ok, status, error, elapsed_ms}]
     agent_targets: list[str]
     agent_results: list[dict[str, Any]]
+    # --- AskData_Agent(智能问数)结构化载荷 ---
+    # 智能体回文末尾附的 ```askdata JSON 被 _delegate_task 剥到这里: 它同时是
+    # 前端渲染澄清面板/反馈按钮的依据(metadata.askdata)与下一轮槽位继承的来源
+    # (persist_memory 写进 slot_store)。非问数轮始终为空 dict。
+    askdata_payload: dict[str, Any]
     # --- Retrieve-Judge Loop state (knowledge_qa path) ---
     kb_query: str  # query used for the current retrieval attempt
     kb_chunks: list[Any]  # ACL-cleared parent blocks for the current attempt
@@ -1033,15 +1045,48 @@ class AssistantOrchestrator:
         self._audit.log(state.get("trace_id") or "", "assistant", "a2a_delegate", {"agent": agent_name}, state.get("session_id"))
         await self._emit_status(state, "delegate", f"正在委派 {agent_name} 专业智能体办理…")
         # 可信身份经协议级 metadata 结构化下发 (而非文本标签), 供专业智能体做权限分级。
+        metadata: dict[str, Any] = {
+            "user_id": state.get("user_id") or "", "role": role.value,
+        }
+        # 问数域额外带会话号与上一轮槽位: 前者供留痕回查, 后者让"那研发部呢"这种
+        # 省略追问能确定性继承口径而不是由模型猜(见 app/assistant/slot_store.py)。
+        if target == "askdata":
+            session_id = state.get("session_id") or ""
+            metadata["session_id"] = session_id
+            # 留痕与槽位抽取要的是"用户这句话", 不是拼好的 task 文本(带对话背景与
+            # 当前时间前缀) —— 拿 task 当问题会把历史噪声喂进槽位抽取, 也让 badcase
+            # 清单里写着"对话背景:..."而没法看。
+            metadata["question"] = query
+            prior = await get_slot_store().get(session_id)
+            if prior:
+                metadata["slots"] = prior
         # send_guarded 而不 send: 智能体侧的 ReAct 循环没有全局预算, 卡住时这一条委派
         # 会永远不返回并永久占住一个并发额度; 超时降级为可读文本比挂死好得多。
         answer = await get_a2a_pool().send_guarded(
             target,
             task,
-            metadata={"user_id": state.get("user_id") or "", "role": role.value},
+            metadata=metadata,
             timeout=timeout,
         )
-        return {"answer": answer, "status": "ok", "route": "a2a_agent", "target": target}
+        update: dict[str, Any] = {"answer": answer, "status": "ok", "route": "a2a_agent", "target": target}
+        if target == "askdata":
+            # 剥掉末尾的结构化载荷: 不剥的话多智能体分节合并会把一整段 JSON 当正文贴给用户。
+            answer, payload = split_askdata_payload(answer)
+            update["answer"] = answer
+            if payload:
+                update["askdata_payload"] = payload
+                artifacts = list(state.get("artifacts") or [])
+                artifacts.extend(artifacts_from_payload(payload))
+                update["artifacts"] = artifacts
+                self._audit.log(
+                    state.get("trace_id") or "", "assistant", "askdata_payload",
+                    {"kind": payload.get("kind"), "route": payload.get("route", ""),
+                     "verdict": payload.get("verdict", ""), "rowcount": payload.get("rowcount", 0),
+                     "query_id": payload.get("query_id", ""),
+                     "error_codes": payload.get("error_codes") or []},
+                    state.get("session_id"),
+                )
+        return update
 
     async def chitchat(self, state: AssistantState) -> dict[str, Any]:
         """单意图路径的直答(薄壳)。"""
@@ -1094,6 +1139,11 @@ class AssistantOrchestrator:
         session_id = state.get("session_id") or ""
         # append 的返回值是本轮新折叠出的会话摘要(没发生溢出压缩时为空串)。
         session_summary = await self._memory.append(session_id, masked_message, masked_answer)
+        # 问数轮: 把本轮确定的槽位存下来供下一轮省略继承。存的是 payload 里的槽位
+        # (说法与区间), 不是结果行 —— 于是继承是确定性的, 也不会把业务数字搬进记忆层。
+        askdata = state.get("askdata_payload") or {}
+        if askdata.get("kind") in ("result", "clarify", "degraded") and askdata.get("slots"):
+            await get_slot_store().set(session_id, slots_of(askdata))
         await self._write_personal_memory(state, masked_message, masked_answer, session_summary)
         # 显式"记一下"指令是 knowledge 桶唯一的写入入口(自动提取与情节蒸馏已下线):
         # 关键词命中才进 LLM 提炼链路, 未命中零成本; 失败只记日志不阻断对话。
@@ -1257,6 +1307,11 @@ class AssistantOrchestrator:
                     else (answer[:160] if status == "denied" else "未产生回答"),
                 }
             )
+            # 问数那一节的结构化载荷跟着本节走: 点选 askdata 与单意图委派共用一份
+            # _delegate_task, 不接住它就会在"多智能体并发"这条路上丢掉面板与反馈号。
+            if result.get("askdata_payload"):
+                outcome["askdata"] = result["askdata_payload"]
+                outcome["artifacts"] = list(result.get("artifacts") or [])
         except asyncio.TimeoutError:
             outcome["status"] = "timeout"
             outcome["error"] = f"超过 {self._settings.multi_agent_timeout:.0f}s 未返回"
@@ -1373,6 +1428,13 @@ class AssistantOrchestrator:
         return {
             "answer": answer, "route": "multi_agent", "target": primary or None,
             "intent": intent, "agent_results": results,
+            # 本节里如果有问数的结构化载荷, 照单意图路径一样上浮(面板/反馈/槽位继承都靠它);
+            # 多节同时带载荷时取第一节, 不拼在一起(两个问数轮的结果形状无法合并成一个面板)。
+            **({"askdata_payload": next(r["askdata"] for r in results if r.get("askdata"))}
+               if any(r.get("askdata") for r in results) else {}),
+            # 图表产物合并上抬: 它是 URL 列表, 与正文不冲突, 多节一起拼也不会串口径。
+            **({"artifacts": [a for r in results for a in (r.get("artifacts") or [])]}
+               if any(r.get("artifacts") for r in results) else {}),
         }
 
     @classmethod
@@ -1828,6 +1890,7 @@ class AssistantOrchestrator:
                     "kb_acl_blocked": False,
                     "agent_targets": agent_targets,
                     "agent_results": [],
+                    "askdata_payload": {},
                 },
                 # Working State Checkpoint: thread_id 用 session_id, 每轮对话都完整
                 # 传入上方所有 AssistantState 字段, 不会与上一轮残留的 checkpoint
@@ -1870,6 +1933,11 @@ class AssistantOrchestrator:
                 }
                 for r in agent_results
             ]
+        # 问数轮携结构化视图(澄清面板/反馈按钮靠它): rows/sql 不在视图里,
+        # 表格已在正文、SQL 已进留痕表 —— 不拿同一份数据把 SSE 事件与会话历史双量放大。
+        askdata = final.get("askdata_payload") or {}
+        if askdata:
+            metadata["askdata"] = askdata_view(askdata)
         return ChatResponse(
             session_id=req.session_id,
             answer=mask_text(final["answer"]),

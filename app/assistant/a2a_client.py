@@ -36,6 +36,8 @@ AGENT_URLS = {
     # analytics_agent / procurement_agent, 与 AGENT_WHITELIST 中的名称一致。
     "analytics": lambda: get_settings().analyst_agent_url,
     "procurement": lambda: get_settings().contract_agent_url,
+    # 智能问数(NL2DSL + 语义层): domain 键与 askdata MCP server 同名。
+    "askdata": lambda: get_settings().askdata_agent_url,
 }
 
 # domain 键 -> (卡片可读名, 一句话能力边界); 键集合与 AGENT_URLS 严格一致。
@@ -48,6 +50,7 @@ AGENT_PROFILES: dict[str, tuple[str, str]] = {
     "finance": ("Finance_Agent", "费用报销全流程: 政策咨询/报销单创建/进度查询"),
     "analytics": ("Analyst_Agent", "跨域数据统计(Text2SQL)/图表/周期经营报告"),
     "procurement": ("Contract_Agent", "采购申请发起与合规初审/合同条款风险初审"),
+    "askdata": ("AskData_Agent", "自然语言问数(NL2DSL+语义层)/多维下钻/同环比/图表"),
 }
 
 

@@ -7,8 +7,8 @@
     CONFIG_RULES.md 第 9 条):
       - **容器是唯一的验证环境**: assistant 网关与全部依赖(postgres / elasticsearch /
         redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp /
-        analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent /
-        contract-agent)都跑在 docker compose 里。
+        analytics-mcp / procurement-mcp / askdata-mcp / hr-agent / finance-agent /
+        analyst-agent / contract-agent / askdata-agent)都跑在 docker compose 里。
       - 宿主机**禁止**直跑网关(uvicorn app.main:app)做代码验证 —— 宿主轨与容器轨配置
         视角不同, 宿主验证通过的结论对容器部署不成立。
       - 宿主机只跑两个例外: vite dev(前端页面, 不属于后端验证) 与 Ollama(:11434,

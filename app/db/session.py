@@ -10,12 +10,15 @@ It is never hard-coded and .env files are git-ignored.
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import quote_plus
 
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -235,6 +238,20 @@ async def init_schema() -> None:
         await ensure_rls_policies()
     # 审计不可变性不跟着 RLS 一起关: 它是层 6 的地基, 与隔离开关无关。
     await ensure_audit_immutability()
+
+    # 语义层灌入(只在 sem_metrics 为空时写内置 Top 指标集, 已有则完全不动):
+    # 为什么同样不能只放 docker/init/*.sql: 那个目录只在空卷首建时跑, 存量库永不重放。
+    # 语义层空 = AskData_Agent 一个口径都认不出来(而不是"降级成自由 SQL"),
+    # 所以它必须与建表同一条收敛路径; 灌入失败只记日志不阻断启动(问数不可用但对话可用)。
+    if get_settings().askdata_enabled:
+        from app.semantic.registry import ensure_seeded
+
+        try:
+            counts = await ensure_seeded()
+            if counts.get("metrics"):
+                logger.info("[askdata] 语义层首次灌入: %s", counts)
+        except Exception as exc:  # noqa: BLE001 - 灌入失败不能拖死整个网关
+            logger.error("[askdata] 语义层灌入失败, 智能问数将退回内置口径: %s", exc)
 
 
 def db_available() -> bool:

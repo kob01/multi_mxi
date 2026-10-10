@@ -168,8 +168,15 @@ async def ensure_db_principals() -> None:
                 await conn.execute(text(f"GRANT SELECT, INSERT ON {table} TO {rw}"))
                 await _grant_table_sequences(conn, table, rw)
 
-        # 控制面表(写计划状态机 + 审计)对两个 analytics 角色都不可见。
+        # 控制面表(写计划状态机 + 审计)对两个 analytics 角色不可见。
         for table in ("dataops_pending", "sql_audit_records"):
+            for role in filter(None, (ro, rw)):
+                await conn.execute(text(f"REVOKE ALL ON {table} FROM {role}"))
+        # 智能问数的治理面同样不可见: 问数留痕里带着别人的问题与结果条数,
+        # 评测集是"标准答案" —— 两者都不该出现在只能读业务行的那个角色手里。
+        # (语义层三表也不授: 它由本进程的属主连接读, 取数角色用不到它 —— 少一次
+        # 顺手授权就少一个将来被误用的面。)
+        for table in ("askdata_query_log", "askdata_golden", "askdata_eval_run"):
             for role in filter(None, (ro, rw)):
                 await conn.execute(text(f"REVOKE ALL ON {table} FROM {role}"))
 

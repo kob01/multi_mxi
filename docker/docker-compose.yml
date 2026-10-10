@@ -283,6 +283,64 @@ services:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
 
+  # askdata-mcp: 智能问数的执行面(语义层读写 + 指标 API + DSL→SQL 编译 + 沙箱取数 + 成图)。
+  # 它同时是问数链路上**唯一持有数据库凭据**的进程: AskData_Agent 容器不再有 PG_* 与
+  # pg_password(层 0 收回跨域凭证)。render_chart 产物落 /data/reports 共享卷, 与
+  # analytics-mcp 同一目录, 网关才能凭 /api/files/reports/{name} 回取。
+  askdata-mcp:
+    build: *build
+    command: python -m app.mcp_servers.askdata_server
+    ports: ["${ASKDATA_MCP_HOST_PORT:-18007}:8007"]
+    env_file: [.env]
+    environment:
+      PG_HOST: postgres
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: disable
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      REPORT_DIR: /data/reports
+      # 审计与留痕都必须落共享卷: 作用域/成本/编译结论是在本进程里算出来的,
+      # 不落卷就只存在容器文件系统里, 网关页面与 SIEM 都看不到。
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+    secrets: [pg_password, deepseek_api_key, zhipu_api_key]
+    volumes:
+      - ../data:/data
+      - ../logs:/data/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  # askdata-agent: 智能问数专业智能体(A2A, 确定性状态机)。本容器不持任何数据库凭据:
+  # 语义层、校验、编译、取数全部经 askdata-mcp, 所以缺 ASKDATA_MCP_URL 会静默失去能力。
+  askdata-agent:
+    build: *build
+    command: python -m app.agents.askdata_agent.server
+    ports: ["9007:9007"]
+    env_file: [.env]
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      INTENT_MODEL: ${INTENT_MODEL:-deepseek-flash}
+      ASKDATA_MCP_URL: http://askdata-mcp:8007/mcp
+      # Agent Card 通告地址: Assistant 侧以配置端点为准(见 a2a_client 的 url 覆盖)。
+      ASKDATA_AGENT_URL: http://askdata-agent:9007
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      # 层 0: 不注入 PG_* 与 pg_password, 取数只走 MCP(见 askdata-mcp 同名注释)。
+    secrets: [deepseek_api_key, zhipu_api_key]
+    volumes:
+      - ../logs:/data/logs
+    depends_on: [askdata-mcp]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
   # docgen-mcp: 已下线 —— 网页创作工坊(HTML 成品页 + Playwright 沙箱 + 编辑器)整体移除。
   # docgen 现在是进程内工具(app/tools/docgen.py): 文字+图片 -> 可下载 office/PDF/MD 文件。
 
@@ -631,10 +689,12 @@ services:
       FINANCE_MCP_URL: http://finance-mcp:8002/mcp
       ANALYTICS_MCP_URL: http://analytics-mcp:8005/mcp
       PROCUREMENT_MCP_URL: http://procurement-mcp:8006/mcp
+      ASKDATA_MCP_URL: http://askdata-mcp:8007/mcp
       HR_AGENT_URL: http://hr-agent:9001
       FINANCE_AGENT_URL: http://finance-agent:9002
       ANALYST_AGENT_URL: http://analyst-agent:9005
       CONTRACT_AGENT_URL: http://contract-agent:9006
+      ASKDATA_AGENT_URL: http://askdata-agent:9007
       AUDIT_LOG_PATH: /data/logs/audit.jsonl
       # 分析产物目录: 与 analytics-mcp 写入同一 /data/reports(共用 ../data 卷),
       # 网关才能凭 /api/files/reports/{name} 回取到智能体生成的图表/报告。
@@ -689,6 +749,8 @@ services:
       analyst-agent:
         condition: service_started
       contract-agent:
+        condition: service_started
+      askdata-agent:
         condition: service_started
       elasticsearch:
         condition: service_started

@@ -339,9 +339,14 @@ def estimate_scan_rows(conn: Any, sql: str, params: dict | None = None) -> int |
     if not get_settings().sqlguard_explain_enabled:
         return None
     try:
-        row = conn.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"), params or {}).fetchone()
+        # 必须包在 SAVEPOINT 里: EXPLAIN 失败(列不在 GROUP BY、表不存在、类型不匹等)
+        # 会把整个事务标成 aborted, 下一句真实执行只能报
+        # "current transaction is aborted" —— 原本那条可读的错反被抹掉了。
+        # 用 savepoint 回滚就只丢掉这一次预估, 后面的执行照旧(失败时能看到真错)。
+        with conn.begin_nested():
+            row = conn.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"), params or {}).fetchone()
         raw = row[0] if row else None
-    except Exception as exc:  # noqa: BLE001 - 预估失败不阻断, 由调用方判
+    except Exception as exc:  # noqa: BLE001 - 预估不出来不是攻击, 但也不能当成"预估通过"
         logger.warning("EXPLAIN 成本预估失败(跳过阈值判定): %s", exc)
         return None
     if raw is None:

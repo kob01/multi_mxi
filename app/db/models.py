@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance/Procurement 业务表 + pgvector 知识块 + 个人记忆/用户画像 + 会话记录 + 报表产物."""
+"""SQLAlchemy ORM models (PostgreSQL): 文档元数据 + HR/Finance/Procurement 业务表 + pgvector 知识块 + 个人记忆/用户画像 + 会话记录 + 报表产物 + 语义层(指标中台) + 智能问数留痕/评测集."""
 
 from __future__ import annotations
 
@@ -809,3 +809,227 @@ class DataOpArchive(Base):
     )
     # 到期才允许真删(与软删保留窗口同一口径)。
     purge_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# 语义层(指标中台元数据): AskData_Agent 的"组织级共享长期记忆"
+#
+# 为什么是表而不是配置文件: 语义层要被人修订、要被 badcase 回流补词、要被问数链路
+# 按向量召回 —— 它是一个需要审计与并发读的数据面, 不是一次性启动参数。而
+# `docker/init/*.sql` 只在空卷首建时执行(存量库永不重放), 所以 DDL 必须走 create_all。
+# 三张 sem_ 表都**不带 dept_id**: 它们是"定义"而不是"业务数据", 隔离粒度是角色级
+# (见 sem_metrics.allowed_roles), 真正的行隔离仍在被引用表的 RLS 上。
+# ---------------------------------------------------------------------------
+class MetricDef(Base):
+    """一个受治理的指标定义(问数只能命中这里登记过的口径)。
+
+    ``expression`` 是**列级片段**而不是整条 SQL: 编译器只把它插进 SELECT 子句, 列名
+    必须落在该表真实列集合内(见 app/db/policy.table_columns 的对账口径), 于是
+    "模型说我要 SUM(pg_read_file(...))"这类面根本不存在。
+    """
+
+    __tablename__ = "sem_metrics"
+    __table_args__ = (
+        Index(
+            "ix_sem_metrics_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        Index("ix_sem_metrics_status_domain", "status", "domain"),
+    )
+
+    metric_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label: Mapped[str] = mapped_column(String(128), default="")       # 中文名
+    domain: Mapped[str] = mapped_column(String(32), default="")       # expense/budget/hr/leave/purchase/contract
+    unit: Mapped[str] = mapped_column(String(16), default="")         # 元/单/天/人次/%
+    agg: Mapped[str] = mapped_column(String(16), default="sum")       # sum/count/avg/max/min/ratio/count_distinct
+    source_table: Mapped[str] = mapped_column(String(64), default="")
+    expression: Mapped[str] = mapped_column(Text, default="")         # 受控聚合片段(列名须在白名单内)
+    caliber_where: Mapped[str] = mapped_column(Text, default="")      # 口径谓词(服务端文本, 不含值)
+    join_sql: Mapped[str] = mapped_column(Text, default="")           # 需要的 JOIN(服务端模板)
+    time_column: Mapped[str] = mapped_column(String(64), default="created_at")
+    compatible_dims: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    calendar: Mapped[str] = mapped_column(String(16), default="month")  # 默认时间粒度
+    # 逗号包裹的角色串 ",finance,admin,": 空串 = 继承 analytics 域级白名单。
+    allowed_roles: Mapped[str] = mapped_column(String(128), default="")
+    # 口径出处: "reports:expense_total" 表示与周报共用同一份常量(防两版数字对不上)。
+    caliber_ref: Mapped[str] = mapped_column(String(64), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/draft
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+class DimensionDef(Base):
+    """一个可下钻/可过滤的维度(枚举值反查与维度兼容性判定的依据)。"""
+
+    __tablename__ = "sem_dimensions"
+    __table_args__ = (
+        Index(
+            "ix_sem_dimensions_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+    )
+
+    dim_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label: Mapped[str] = mapped_column(String(128), default="")
+    source_table: Mapped[str] = mapped_column(String(64), default="")
+    column: Mapped[str] = mapped_column(String(64), default="")
+    join_sql: Mapped[str] = mapped_column(Text, default="")
+    column_prefix: Mapped[str] = mapped_column(String(8), default="")  # 多表 JOIN 时的列前缀别名
+    # static = 枚举落 enum_values; column:table.col = 从库里反查(不写死, 主数据会变)。
+    enum_source: Mapped[str] = mapped_column(String(64), default="static")
+    enum_values: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    time_like: Mapped[bool] = mapped_column(Boolean, default=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now()
+    )
+
+
+class TermAlias(Base):
+    """说法 -> 语义对象 的映射(同义词/业务黑话/表头简称), 向量召回的载体。"""
+
+    __tablename__ = "sem_terms"
+    __table_args__ = (
+        UniqueConstraint("term", "term_type", "target_id", name="uq_sem_terms_term_target"),
+        Index(
+            "ix_sem_terms_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        Index("ix_sem_terms_target", "term_type", "target_id"),
+    )
+
+    term_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    term: Mapped[str] = mapped_column(String(128), index=True)
+    term_type: Mapped[str] = mapped_column(String(16), default="metric")  # metric/dim/enum
+    target_id: Mapped[str] = mapped_column(String(64), default="")
+    weight: Mapped[float] = mapped_column(Numeric(4, 3), default=1.0)  # 同分时的优先级
+    # manual=人工登记; seed=随语义层灌入; badcase=归因路由产出的补词草案
+    source: Mapped[str] = mapped_column(String(16), default="seed")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/draft
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 智能问数: 全链路留痕与评测集
+# ---------------------------------------------------------------------------
+class AskDataQueryLog(Base):
+    """一次问数的完整链路记录: 看板指标与 badcase 归因的唯一原料。
+
+    为什么不只写 audit.jsonl: JSONL 是给 SIEM 采集的流, 回答不了"上周澄清触发率是多少"
+    这种聚合问题; 为什么不只靠 LLM judge: 归因要能定位到具体槽位与候选, 必须结构化存。
+    """
+
+    __tablename__ = "askdata_query_log"
+    __table_args__ = (
+        Index("ix_askdata_log_verdict_created", "verdict", "created_at"),
+        Index("ix_askdata_log_user_created", "user_id", "created_at"),
+    )
+
+    query_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # uuid hex
+    trace_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    session_id: Mapped[str] = mapped_column(String(64), default="")
+    tenant_id: Mapped[str] = mapped_column(String(32), default="")
+    user_id: Mapped[str] = mapped_column(String(64), default="")
+    role: Mapped[str] = mapped_column(String(16), default="")
+    question: Mapped[str] = mapped_column(Text, default="")
+    slots_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)       # 槽位 + confidence
+    candidates_json: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 三路召回候选
+    dsl_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)         # LLM 产出的 DSL
+    # metric_api / compiler / sandbox / clarify / repair / degrade
+    route: Mapped[str] = mapped_column(String(24), default="")
+    final_sql: Mapped[str] = mapped_column(Text, default="")
+    rowcount: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    token_cost: Mapped[int] = mapped_column(Integer, default=0)
+    # ok / clarify / denied / fail / degraded
+    verdict: Mapped[str] = mapped_column(String(16), default="ok", index=True)
+    error_codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    # up / down / rewritten (None = 未反馈)
+    feedback: Mapped[str] = mapped_column(String(16), default="")
+    # intent / link / dsl / exec / render
+    attribution: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True, server_default=func.now()
+    )
+
+
+class AskDataGolden(Base):
+    """自建 golden 评测集: 真实业务问法 -> 期望 DSL/SQL/结果集。
+
+    公开基准(BIRD/Spider)标注噪声大, 只作参考不进回归; 本表是"改了 prompt/语义层会不会
+    把准确率搞坏"的唯一判据, 因此期望结果存**行数据**而不是存 SQL 文本(文本等价但结果
+    不同也算错, 反过来也一样 —— EX 以结果集为准)。
+    """
+
+    __tablename__ = "askdata_golden"
+    __table_args__ = (
+        Index("ix_askdata_golden_enabled_tag", "enabled", "tags"),
+    )
+
+    case_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    question: Mapped[str] = mapped_column(Text, default="")
+    dsl_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    expected_sql: Mapped[str] = mapped_column(Text, default="")
+    expected_result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tags: Mapped[str] = mapped_column(String(128), default="")  # 逗号分隔: 环比/下钻/澄清
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+
+
+class AskDataEvalRun(Base):
+    """一次离线评测的结果概要(只存结论, 逐条明细留在报告文件里)。
+
+    为什么不只存文件: 看板要回答"EX 现在多少、比上一跑好了还是坏了", 而
+    ``reports/*.md`` 在容器里不是共享卷、也不是能聚合的面。一行一个结论比
+    去解构 markdown 便宜得多, 也与 ``sql_audit_records`` 的"结构化回查面"同构。
+    """
+
+    __tablename__ = "askdata_eval_run"
+    __table_args__ = (
+        Index("ix_askdata_eval_run_started", "started_at"),
+    )
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
+    case_count: Mapped[int] = mapped_column(Integer, default=0)
+    exec_accuracy: Mapped[float] = mapped_column(Numeric(5, 2), default=0)  # EX %
+    first_pass_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    clarify_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    degrade_rate: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    p95_latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # 降级标记: judge 不可用时只跑 EX, 结论不能与全量跑同口径比较。
+    mode: Mapped[str] = mapped_column(String(32), default="full")
+    report_path: Mapped[str] = mapped_column(String(512), default="")
+    summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="")

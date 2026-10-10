@@ -37,6 +37,62 @@ ALLOWED_TABLES = {
     "proc_suppliers",
 }
 
+# ---------------------------------------------------------------------------
+# 口径单一事实源: 聚合片段的唯一定义处
+#
+# 为什么抽出来: 智能问数(AskData_Agent)的语义层必须与周报算同一个数, 否则用户拿问数
+# 结果去对周报会对不上账 —— 那是"两个都对但互相矛盾"最难排查的一类问题。所以两边不是
+# "各写一份碰巧一致的 SQL", 而是**共用下面这份常量**: 语义层 seed 用 caliber_ref
+# (如 "reports:expense_total")回指到这里, 离线测试逐字断言两侧相等。
+# ---------------------------------------------------------------------------
+CALIBER_EXPENSE_TOTAL = "COALESCE(SUM(amount), 0)"
+# 报销 JOIN 员工表后的同一个总额口径(列带别名前缀; 与上面的区别只是限定名)。
+CALIBER_EXPENSE_TOTAL_R = "COALESCE(SUM(r.amount), 0)"
+CALIBER_EXPENSE_COUNT = "COUNT(*)"
+CALIBER_EXPENSE_PAID = "COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0)"
+CALIBER_EXPENSE_PENDING = "COUNT(*) FILTER (WHERE status = 'SUBMITTED')"
+CALIBER_EXPENSE_REJECTED = "COUNT(*) FILTER (WHERE status = 'REJECTED')"
+CALIBER_BUDGET_USED_PCT = "ROUND(used_amount / NULLIF(annual_budget, 0) * 100, 1)"
+# 同一个消耗率的**聚合形态**: 周报是按部门一行一行列出来(表里 (department, year) 本就唯一),
+# 所以行级表达式够用; 问数一旦按部门 GROUP BY, 行级写法会被 PG 拒("must appear in GROUP BY"),
+# 所以必须有一份聚合形态。两者在同一分组内数值相同, 因此分开定义而不是就地改周报那份。
+CALIBER_BUDGET_USED_PCT_AGG = "ROUND(SUM(used_amount) / NULLIF(SUM(annual_budget), 0) * 100, 1)"
+CALIBER_TICKET_COUNT = "COUNT(*)"
+CALIBER_TICKET_DONE = "COUNT(*) FILTER (WHERE status = 'DONE')"
+CALIBER_TICKET_OPEN = "COUNT(*) FILTER (WHERE status IN ('OPEN', 'PROCESSING'))"
+CALIBER_LEAVE_COUNT = "COUNT(*)"
+CALIBER_LEAVE_DAYS = "COALESCE(SUM(days), 0)"
+CALIBER_PURCHASE_TOTAL = "COALESCE(SUM(amount), 0)"
+CALIBER_PURCHASE_COUNT = "COUNT(*)"
+CALIBER_PURCHASE_PENDING = "COUNT(*) FILTER (WHERE status IN ('PRECHECK', 'PENDING'))"
+CALIBER_CONTRACT_COUNT = "COUNT(*)"
+CALIBER_CONTRACT_HIGH = "COUNT(*) FILTER (WHERE risk_level = '高')"
+CALIBER_CONTRACT_MEDIUM = "COUNT(*) FILTER (WHERE risk_level = '中')"
+CALIBER_CONTRACT_RISK = "COUNT(*) FILTER (WHERE status = 'RISK')"
+
+# caliber_ref -> 常量: 语义层 seed 里 ``caliber_ref="reports:expense_total"`` 取的就是这一项。
+CALIBER_SQL: dict[str, str] = {
+    "expense_total": CALIBER_EXPENSE_TOTAL,
+    "expense_count": CALIBER_EXPENSE_COUNT,
+    "expense_paid": CALIBER_EXPENSE_PAID,
+    "expense_pending": CALIBER_EXPENSE_PENDING,
+    "expense_rejected": CALIBER_EXPENSE_REJECTED,
+    "budget_used_pct": CALIBER_BUDGET_USED_PCT,
+    "budget_used_pct_agg": CALIBER_BUDGET_USED_PCT_AGG,
+    "ticket_count": CALIBER_TICKET_COUNT,
+    "ticket_done": CALIBER_TICKET_DONE,
+    "ticket_open": CALIBER_TICKET_OPEN,
+    "leave_count": CALIBER_LEAVE_COUNT,
+    "leave_days": CALIBER_LEAVE_DAYS,
+    "purchase_total": CALIBER_PURCHASE_TOTAL,
+    "purchase_count": CALIBER_PURCHASE_COUNT,
+    "purchase_pending": CALIBER_PURCHASE_PENDING,
+    "contract_count": CALIBER_CONTRACT_COUNT,
+    "contract_high": CALIBER_CONTRACT_HIGH,
+    "contract_medium": CALIBER_CONTRACT_MEDIUM,
+    "contract_risk": CALIBER_CONTRACT_RISK,
+}
+
 
 def current_cst_date() -> date:
     """东八区今天(容器 TZ 默认 UTC, 直接用 date.today() 会差 8 小时)。"""
@@ -108,21 +164,21 @@ def collect_metrics(start: date, end: date, scope: Any = None) -> dict[str, Any]
     year = {"year": start.year}
 
     expense = _metric(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total, "
-        "COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0) AS paid, "
-        "COUNT(*) FILTER (WHERE status = 'SUBMITTED') AS pending, "
-        "COUNT(*) FILTER (WHERE status = 'REJECTED') AS rejected "
+        f"SELECT {CALIBER_EXPENSE_COUNT} AS cnt, {CALIBER_EXPENSE_TOTAL} AS total, "
+        f"{CALIBER_EXPENSE_PAID} AS paid, "
+        f"{CALIBER_EXPENSE_PENDING} AS pending, "
+        f"{CALIBER_EXPENSE_REJECTED} AS rejected "
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end",
         win,
     )
     expense_cat = _metric(
-        "SELECT category, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
+        f"SELECT category, {CALIBER_EXPENSE_COUNT} AS cnt, {CALIBER_EXPENSE_TOTAL} AS total "
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end "
         "GROUP BY category ORDER BY total DESC",
         win,
     )
     dept_expense = _metric(
-        "SELECT e.department, COUNT(*) AS cnt, COALESCE(SUM(r.amount), 0) AS total "
+        f"SELECT e.department, {CALIBER_EXPENSE_COUNT} AS cnt, {CALIBER_EXPENSE_TOTAL_R} AS total "
         "FROM fin_reimbursements r JOIN hr_employees e ON r.emp_id = e.emp_id "
         "WHERE r.created_at >= :start AND r.created_at < :end "
         "GROUP BY e.department ORDER BY total DESC",
@@ -130,45 +186,45 @@ def collect_metrics(start: date, end: date, scope: Any = None) -> dict[str, Any]
     )
     daily = _metric(
         "SELECT to_char(date_trunc('day', created_at), 'MM-DD') AS day, "
-        "COALESCE(SUM(amount), 0) AS total "
+        f"{CALIBER_EXPENSE_TOTAL} AS total "
         "FROM fin_reimbursements WHERE created_at >= :start AND created_at < :end "
         "GROUP BY 1 ORDER BY 1",
         win,
     )
     budget = _metric(
         "SELECT department, annual_budget, used_amount, "
-        "ROUND(used_amount / NULLIF(annual_budget, 0) * 100, 1) AS used_pct "
+        f"{CALIBER_BUDGET_USED_PCT} AS used_pct "
         "FROM fin_department_budgets WHERE year = :year ORDER BY used_pct DESC NULLS LAST",
         year,
     )
     tickets = _metric(
-        "SELECT COUNT(*) AS cnt, "
-        "COUNT(*) FILTER (WHERE status = 'DONE') AS done, "
-        "COUNT(*) FILTER (WHERE status IN ('OPEN', 'PROCESSING')) AS open_cnt "
+        f"SELECT {CALIBER_TICKET_COUNT} AS cnt, "
+        f"{CALIBER_TICKET_DONE} AS done, "
+        f"{CALIBER_TICKET_OPEN} AS open_cnt "
         "FROM hr_tickets WHERE created_at >= :start AND created_at < :end",
         win,
     )
     ticket_cat = _metric(
-        "SELECT category, COUNT(*) AS cnt FROM hr_tickets "
+        f"SELECT category, {CALIBER_TICKET_COUNT} AS cnt FROM hr_tickets "
         "WHERE created_at >= :start AND created_at < :end GROUP BY category ORDER BY cnt DESC",
         win,
     )
     leave = _metric(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(days), 0) AS days "
+        f"SELECT {CALIBER_LEAVE_COUNT} AS cnt, {CALIBER_LEAVE_DAYS} AS days "
         "FROM hr_leave_records WHERE created_at >= :start AND created_at < :end",
         win,
     )
     purchase = _metric(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total, "
-        "COUNT(*) FILTER (WHERE status IN ('PRECHECK', 'PENDING')) AS pending "
+        f"SELECT {CALIBER_PURCHASE_COUNT} AS cnt, {CALIBER_PURCHASE_TOTAL} AS total, "
+        f"{CALIBER_PURCHASE_PENDING} AS pending "
         "FROM proc_orders WHERE created_at >= :start AND created_at < :end",
         win,
     )
     contracts = _metric(
-        "SELECT COUNT(*) AS cnt, "
-        "COUNT(*) FILTER (WHERE risk_level = '高') AS high, "
-        "COUNT(*) FILTER (WHERE risk_level = '中') AS medium, "
-        "COUNT(*) FILTER (WHERE status = 'RISK') AS risk "
+        f"SELECT {CALIBER_CONTRACT_COUNT} AS cnt, "
+        f"{CALIBER_CONTRACT_HIGH} AS high, "
+        f"{CALIBER_CONTRACT_MEDIUM} AS medium, "
+        f"{CALIBER_CONTRACT_RISK} AS risk "
         "FROM proc_contracts WHERE created_at >= :start AND created_at < :end",
         win,
     )

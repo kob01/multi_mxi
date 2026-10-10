@@ -310,6 +310,38 @@ class Settings(BaseSettings):
     dataops_write_intent_guard: bool = True
     # 可疑指令样式启发检测(降噪层, 不是唯一依赖)。
     dataops_suspicious_data_guard: bool = True
+
+    # ---------- 智能问数(AskData_Agent + askdata MCP): NL2DSL + 语义层 ----------
+    # 总开关: 关闭后智能体卡片仍可达, 但直接回复"问数能力未开启"(而不是带着默认值算错)。
+    askdata_enabled: bool = True
+    # 选项式澄清总开关: 关闭后低置信不追问, 按最高分候选作答并在口径里标明假设。
+    askdata_clarify_enabled: bool = True
+    # 任一槽位置信低于此值(或候选口径冲突)就触发澄清。0.75 是对"同义词+向量"两路
+    # 融合分的经验值: 再低就会把"看着像但口径不同"的指标直接拿去算数。
+    askdata_clarify_confidence_threshold: float = 0.75
+    # 面板上最多摆几个候选(超过 4 个选择本身就是一种负担); "都不是"作为退出口不占额。
+    askdata_clarify_max_options: int = 4
+    # 澄清触发率目标上限(只是看板告警线, 不是拦截器: 宁可多问也不能猜错)。
+    askdata_clarify_rate_target: float = 0.15
+    # 单次问数返回行数上限(与 ast_guard 的行数收紧同一口径)。
+    askdata_max_rows: int = 100
+    # 跨度上限(天): 超过就拒而不是"慢一点也放过", 拉三年明细是典型的误用。
+    askdata_max_time_span_days: int = 730
+    # 降级链顺序(口径确定性 -> DSL 编译 -> 沙箱 SQL): 改顺序就是改"宁可算不出来也不放开自由 SQL"。
+    askdata_route_order: str = "metric_api,compiler,sandbox"
+    # 第 3 级(模型直出 SQL)默认开: 它只跑在只读角色 + AST 校验 + 行数/扫描量上限的沙箱里。
+    askdata_sandbox_enabled: bool = True
+    # 结果校验失败后的受限自修复(ReAct)总开关与顶。
+    askdata_repair_enabled: bool = True
+    askdata_repair_max_rounds: int = 2
+    askdata_repair_timeout: int = 40
+    # 语义层快照 TTL(秒): 改了库里口径最多这么久生效; 补词后可调 invalidate() 立刻生效。
+    askdata_semantic_ttl: int = 300
+    # 向量召回 Top-K 与相似度下限: 下限以下的命中宁可作为"没命中"参与澄清判定。
+    askdata_link_top_k: int = 12
+    askdata_link_min_similarity: float = 0.62
+    # 问数取数的语句超时(毫秒): 比写通道宽、比默认紧 —— 问数是人在等的。
+    askdata_statement_timeout_ms: int = 8000
     # 结果出口 DLP 列黑名单(逗号分隔列名): 命中列返回前打码。
     dlp_mask_columns: str = "bank_account,phone,id_card,email,id_no"
     # bge-m3 稠密向量维度; 换 embedding 模型必须同步改这里并全量重建向量表。
@@ -510,6 +542,8 @@ class Settings(BaseSettings):
     # 数据洞察与采购合同两个新域: 宿主端口同样走 18xxx 约定(容器内监听 8005/8006)。
     analytics_mcp_url: str = "http://localhost:18005/mcp"
     procurement_mcp_url: str = "http://localhost:18006/mcp"
+    # 智能问数域: 语义层读写 + 指标 API + DSL 编译 + 沙箱取数都落在这个 server 上。
+    askdata_mcp_url: str = "http://localhost:18007/mcp"
 
     # A2A agents
     # 9001/9002 不在历史排除段内, 故容器与宿主同端口; 新增两个专业智能体沿用该约定。
@@ -517,6 +551,7 @@ class Settings(BaseSettings):
     finance_agent_url: str = "http://localhost:9002"
     analyst_agent_url: str = "http://localhost:9005"
     contract_agent_url: str = "http://localhost:9006"
+    askdata_agent_url: str = "http://localhost:9007"
 
     # ---------- 进程内 web 工具 (app/tools/web.py: 联网检索与抓取) ----------
     # 检索 provider: ddgs 免密默认; tavily/serper 需密钥(见 docker/secrets/)。provider

@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.assistant.router import router as assistant_router
+from app.askdata.router import router as askdata_router
 from app.dataops.router import router as dataops_router
 from app.docs.router import router as docs_router
 from app.files.router import router as files_router
@@ -64,8 +65,8 @@ def _log_dependency_endpoints() -> None:
     logger.info(
         "依赖对接地址[宿主轨看 .env, 容器轨看 compose]: pg=%s:%s/%s es=%s redis=%s neo4j=%s "
         "mongo=%s tei=%s ollama=%s mineru=%s hr_mcp=%s finance_mcp=%s analytics_mcp=%s "
-        "procurement_mcp=%s hr_agent=%s finance_agent=%s analyst_agent=%s "
-        "contract_agent=%s public_base=%s report_dir=%s audit=%s",
+        "procurement_mcp=%s askdata_mcp=%s hr_agent=%s finance_agent=%s analyst_agent=%s "
+        "contract_agent=%s askdata_agent=%s public_base=%s report_dir=%s audit=%s",
         s.pg_host,
         s.pg_port,
         s.pg_database,
@@ -80,10 +81,12 @@ def _log_dependency_endpoints() -> None:
         s.finance_mcp_url,
         s.analytics_mcp_url,
         s.procurement_mcp_url,
+        s.askdata_mcp_url,
         s.hr_agent_url,
         s.finance_agent_url,
         s.analyst_agent_url,
         s.contract_agent_url,
+        s.askdata_agent_url,
         s.public_base_url or "(相对路径)",
         s.report_dir,
         s.audit_log_path,
@@ -101,6 +104,7 @@ _CAPABILITY_FLAGS: tuple[tuple[str, str], ...] = (
     ("cache_enabled", "三类缓存"),
     ("mongo_enabled", "正文外置存储(父块上下文)"),
     ("multi_agent_enabled", "多智能体并发委派"),
+    ("askdata_enabled", "智能问数(AskData_Agent)"),
     ("checkpoint_enabled", "LangGraph Checkpointer"),
 )
 
@@ -281,6 +285,9 @@ def create_app() -> FastAPI:
     # 数据变更审批台(层 4 的人工审批流 + 层 6 的审计回查): 执行体与 MCP 工具共用
     # app/db/dataops.py 一套实现, 不在两条路径上各写一份判定逻辑。
     app.include_router(dataops_router)
+    # 智能问数的治理面(看板/反馈/badcase/评测集/语义层快照): 与 askdata MCP server
+    # 共用 app/askdata/store.py 一份 DAO, 区别只在于这里面向页面与运维, 不由模型驱动。
+    app.include_router(askdata_router)
 
     # --- Vue3 SPA 托管: 仅当存在构建产物(生产/打包)时才启用 ---
     # 开发期不跑 pnpm build, web/dist 可能不存在: 旧的写法无条件回退 index.html,

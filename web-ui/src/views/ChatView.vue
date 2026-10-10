@@ -4,6 +4,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import { BubbleList, XSender } from 'vue-element-plus-x'
 import MarkdownView from '../components/MarkdownView.vue'
+import ClarifyPanel from '../components/ClarifyPanel.vue'
+import AskDataFeedback from '../components/AskDataFeedback.vue'
 import { useEmployee } from '../composables/useEmployee'
 
 const { current } = useEmployee()
@@ -167,6 +169,8 @@ function applyRouteTag(msg, data) {
     type: ROUTE_TAG_TYPES[data.route] || 'info',
   }
   msg.route = data.route
+  // 智能问数的结构化载荷(澄清选项/口径/图表/留痕号): 没这个键就是其他路由。
+  msg.askdata = (data.metadata && data.metadata.askdata) || null
   const docs = (data.metadata && data.metadata.docs) || []
   const seen = new Set()
   msg.cites = docs
@@ -414,6 +418,25 @@ async function sendText(text) {
 }
 
 const currentSessionId = computed(() => sessionId.value)
+
+// ---------- 智能问数: 澄清点选与反馈 ----------
+// 点选后拼一条**带精确引用**的新消息发回去: 前缀固定带"问数"二字,
+// 因为意图层的 askdata 关键词排在最前, 不写它这句"报销总额"会被归到财务办理域。
+function askdataChoose(item, choice) {
+  const payload = item.askdata || {}
+  const bits = []
+  if (choice.kind === 'metric') bits.push(`口径用「${choice.label}」(${choice.id})`)
+  else if (choice.kind === 'time') bits.push(`统计区间用「${choice.label}」(${choice.token})`)
+  else if (choice.kind === 'dim') bits.push(`按「${choice.label}」下钻(${choice.id})`)
+  const question = payload.question || ''
+  const parts = [question, ...bits].filter(Boolean)
+  sendText(`问数确认：${parts.join('，')}`)
+}
+
+function askdataNone(item) {
+  const payload = item.askdata || {}
+  sendText(`问数：刚才这些口径都不是，请列出与「${payload.question || item.content}」相关的可用口径`)
+}
 </script>
 
 <template>
@@ -460,6 +483,21 @@ const currentSessionId = computed(() => sessionId.value)
               <div v-show="item.thinkingOpen" class="thinking-body">{{ item.thinking }}</div>
             </div>
             <div v-if="item.status" class="status-line">{{ item.status }}</div>
+            <!-- 智能问数: 选项式澄清面板 + 反馈条(载荷由 metadata.askdata 驱动) -->
+            <ClarifyPanel
+              v-if="item.askdata && item.askdata.kind === 'clarify'"
+              :payload="item.askdata"
+              :disabled="sending"
+              @choose="(c) => askdataChoose(item, c)"
+              @none="() => askdataNone(item)"
+            />
+            <AskDataFeedback
+              v-else-if="item.askdata && item.askdata.query_id"
+              :query-id="item.askdata.query_id"
+              :payload="item.askdata"
+              :user-id="current.empId"
+              :disabled="sending"
+            />
             <div v-if="item.cites && item.cites.length" class="cites">
               📎 参考来源：{{ item.cites.join(' ; ') }}
             </div>

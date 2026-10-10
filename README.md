@@ -34,14 +34,21 @@ MCP 工具调用、A2A 专业智能体委派。
 A2A 遵循 Agent2Agent 协议:Agent Card 发布于 `/.well-known/agent-card.json`,
 通信为 JSON-RPC 2.0 over HTTP(`message/send`)。MCP 遵循 Model Context
 Protocol:FastMCP server,streamable-http transport(服务自身监听 `:8001/mcp`、`:8002/mcp`、
-`:8005/mcp`、`:8006/mcp`;compose 已把它们发布到宿主 `18001`/`18002`/`18005`/`18006`,
+`:8005/mcp`、`:8006/mcp`、`:8007/mcp`;compose 已把它们发布到宿主 `18001`/`18002`/`18005`/`18006`/`18007`,
 宿主机直连走后者, 容器间走服务名+原端口)。
 
-> 四个专业智能体与四个 MCP 域一一对应: `HR_Agent`(:9001)/`Finance_Agent`(:9002) 各走
+> 五个专业智能体与五个 MCP 域一一对应: `HR_Agent`(:9001)/`Finance_Agent`(:9002) 各走
 > hr/finance 域; `Analyst_Agent`(:9005) 走 analytics 域(跨 HR/财务/采购的 Text2SQL
 > 只读洞察 + SVG/PNG 图表 + 周期报告), `Contract_Agent`(:9006) 走 procurement 域(采购申请单
-> 合规初审 + 合同条款初审, 规则引擎保底 + 模型补充语义风险)。
+> 合规初审 + 合同条款初审, 规则引擎保底 + 模型补充语义风险), `AskData_Agent`(:9007) 走 askdata
+> 域(智能问数: NL2DSL + 语义层, 多维下钻与同环比由引擎算)。
 > 分析产物(图表/报告)落 `data/reports`, 由网关 `/api/files/reports/{name}` 静态回取。
+>
+> **Analyst 与 AskData 的分界不是重复建设**: Analyst_Agent 是自由 Text2SQL(模型写 SELECT,
+> 服务端只做拦截), 适合口径未被治理过的探索式分析与成文报告; AskData_Agent 禁止模型出 SQL,
+> 只能选语义层已登记的指标与维度(SQL 由服务端模板编译), 适合"要拿准数"且必须可复现口径的
+> 场景。同一名词的口径两边共用 `app/analytics/reports.py` 的同一份常量, 不会出现"周报与问数
+> 两个数对不上账"。
 >
 > 另有一组**进程内工具能力域**(`app/tools/`, 无容器/端口): `web`(联网检索 `search_web` +
 > 网页抓取 `fetch_url`, SSRF 护栏见 `app/security/url_guard.py`)与 `docgen`(把结构化文字 +
@@ -73,7 +80,7 @@ rewrite_query ─────────── 多轮指代消解: 把"那它�
   │                        LLM 失败或结果不可信时回退原话)
   │
   ├─(调用方显式点选智能体) ► multi_agent_execute ── 同一个(已消解的)问题并发下发给
-  │                        点选的每个 A2A 专业智能体(hr/finance/analytics/procurement),
+  │                        点选的每个 A2A 专业智能体(hr/finance/analytics/procurement/askdata),
   │                        并发上限 Semaphore + 逐位超时 + 异常隔离, 一个智能体挂了只
   │                        降级它自己那一节; 程序化拼成"一节一个智能体"的 Markdown
   │                        (不再过 LLM); 本轮不走意图漏斗(MULTI_AGENT_ENABLED=false
@@ -91,7 +98,8 @@ classify_intent ───────── 三层漏斗(规则快筛 → bge-m3
   │                       │                web=联网检索/抓取, docgen=生成 Word/Excel/PPT/PDF/MD/图片
   │                       │                (纯进程内 tool, 无容器/端口)
   └── agent_delegate ► agent_delegate ── A2A 委派专业智能体(消解后的问题
-                          │                作为当前请求, metadata 传身份)
+                          │                作为当前请求, metadata 传身份; 委派 askdata 时
+                          │                额外传上一轮确定的槽位供省略继承)
                           ▼
                     persist_memory ────── 脱敏后写会话记忆 + 一次 LLM 提取,
                           │                分桶沉淀为个人记忆(溢出摘要另存情节)
@@ -187,7 +195,7 @@ Analyst_Agent 能跨 HR/财务/采购查全员数据, 也能受治理地改数�
 
 | 层         | 干什么                                                                                                                                                                                                                                           | 代码落点                                                                                                         |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| 0 凭证     | agent 容器不再持有任何数据库凭据(已验证: `hr-agent`/`analyst-agent`/`finance-agent`/`contract-agent` 取口令直接抛错); "姓名->工号"解析从进程内直连库搬到 `hr-mcp` 的 `lookup_employee_by_name`; analytics 取数/写执行 `SET ROLE` 到 NOLOGIN 角色 | `docker-compose.yml` 四个 agent 服务、`app/mcp_servers/hr_server.py`、`app/db/sync.py::_attach_role_events`      |
+| 0 凭证     | agent 容器不再持有任何数据库凭据(已验证: `hr-agent`/`analyst-agent`/`finance-agent`/`contract-agent`/`askdata-agent` 取口令直接报错); "姓名->工号"解析从进程内直连库搬到 `hr-mcp` 的 `lookup_employee_by_name`; analytics/askdata 取数与写执行 `SET ROLE` 到 NOLOGIN 角色 | `docker-compose.yml` 五个 agent 服务、`app/mcp_servers/hr_server.py`、`app/db/sync.py::_attach_role_events`      |
 | 1 隔离     | 8 张业务表带 `tenant_id`/`dept_id`; `ENABLE + FORCE ROW LEVEL SECURITY`(属主也受约束); GUC 缺失 = 一行也看不见(默认拒)                                                                                                                           | `app/db/rls.py`、`app/db/scope.py`(回填 + 作用域解析), 由 `init_schema()` 尾部幂等执行                           |
 | 2 写形状   | 模型不写 SQL, 只交强类型 JSON DSL(`action`/`entity`/`filters`/`sets`/`reason`); 实体与字段逐个查白名单, 作用域谓词由服务端注入, 值全走绑参                                                                                                       | `app/db/datadsl.py`、`app/db/policy.py`、`app/db/dataops.py::compile_plan`                                       |
 | 3 静态校验 | sqlglot AST 校验(语句数/类型/表引用/域谓词形状/恒真 WHERE/函数黑名单/十六进制与 `CHR()` 拼接/注释), 并**由 AST 重生 SQL** 送库; 外加 EXPLAIN 预估扫描行数阈值                                                                                    | `app/db/ast_guard.py`(仅 analytics 域; 其余三域仍是 `app/db/sql_guard.py` 的正则黑名单)                          |
@@ -210,6 +218,48 @@ Analyst_Agent 能跨 HR/财务/采购查全员数据, 也能受治理地改数�
 `python -m scripts.test_dataops_dsl_offline`; 端到端隔离(含 RLS/写作用域/AST 绕过面)
 必须在容器里跑: `docker compose -f docker/docker-compose.yml exec assistant python -m scripts.test_scope_isolation`;
 RLS 当前结论可看一眼: `python -m scripts.init_db --rls-status`。
+
+### 智能问数：语义层 + NL2DSL 的确定性状态机
+
+AskData_Agent(:9007) + askdata-mcp(:8007) 的目标不是"能回答更多问题", 而是**每个数都说得出
+怎么算的**。企业问数里错的数比没数危险得多(错的数会被写进汇报), 所以主干不自由:
+
+```
+PARSE(槽位) -> LINK(三路召回) -> CLARIFY? -> PLAN(DSL) -> VALIDATE(三级) ->
+ROUTE(指标API -> DSL编译器 -> 沙箱SQL) -> VERIFY(结果校验) -> [REPAIR ≤2 轮] ->
+RENDER(规则选型 + 叙述) -> FEEDBACK(留痕 + 归因路由)
+```
+
+| 阶段 | 硬约束 | 代码落点 |
+| ---- | ------ | -------- |
+| 语义层 | 指标/维度/别名是**库里的治理对象**(52 指标 + 33 维度 + 83 别名内置集), 口径表达式是受控列级片段; 与周报重叠的口径共用 `reports.py` 常量 | `app/db/models.py`(sem_*)、`app/semantic/{catalog,seed,registry}.py` |
+| 链接 | 同义词精确 + pgvector 相似 + 枚举值反查三路融合打分, **不够就澄清不猜**; 枚举按调用者作用域反查(不泄露别人部门名) | `app/semantic/link.py` |
+| DSL | 模型只交强类型 JSON: 无标识符自由(列名出自登记表)、无值拼接自由(全走绑参)、无作用域自由、**无算术自由** | `app/semantic/dsl.py` |
+| 校验 | 独立模块不信模型自检: 语法→语义(兼容性/时间/枚举)→权限(角色白名单) 三级, 带错误码回炉重写一次 | `app/semantic/validate.py` |
+| 编译 | DSL→SQL 全模板: 裸列自动限定表别名、作用域谓词注入、产物再过 `ast_guard`, 同环比走双窗口 CTE 由 SQL 算 | `app/semantic/compiler.py` |
+| 取数 | 只读角色 + 事务作用域 + EXPLAIN 扫描量上限 + 行数上限; 出口 DLP 打码与 spotlighting | `app/mcp_servers/askdata_server.py` 复用 `app/db/{rls,sync,scope}.py` |
+| 呈现 | 图型由结果 shape 规则定(时序→line/占比→pie/对比→bar), LLM 只写叙述 | `app/agents/askdata_agent/{graph,prompts}.py` |
+| 闭环 | 全链路进 `askdata_query_log`(含被澄清与被拒的轮次), 看板算一次通过率/澄清率/降级率/P95/点踩率; 五类归因只产出**未生效的草案** | `app/askdata/{store,attribution,router}.py` + `/api/askdata/*` |
+
+三个设计取舍值得记在这:
+
+- **状态机而不是 ReAct**: 主干每步输入输出形状固定, 可单测可回放可归因; 自由 ReAct 只留在
+  结果校验失败后的有界自修复(默认 ≤2 轮, 工具集只有只读四件)。
+- **澄清用选项不用开放反问**: 开放式反问会得到另一句同样含糊的话; 选项带语义层 id,
+  前端拼一条带精确引用的确认消息回去(`问数确认：…`, 前缀保证路由回 askdata)。
+- **多轮继承走结构化槽位而不是会话摘要**: `app/assistant/slot_store.py` 存上一轮确定的
+  槽位(Redis + 进程内降级), 继承是一条 dict 合并, 只继承时间/指标不继承维度与过滤 ——
+  后者会把上一轮的筛选悄悄带进这一次的数, 是最难发现的错。
+
+自检与评测:
+
+- 离线纯函数(不碰库不碰 LLM): `python -m scripts.test_askdata_offline`
+  (DSL/三级校验错误码/编译产物形状/口径一致性/澄清门/载荷剥离/注册一致性);
+- 语义层灌入与向量回填: `python -m scripts.seed_semantic_layer`(启动后跑一次, 新增指标后重跑);
+- golden 评测集: `python -m scripts.seed_askdata_golden`(公开基准噪声大, 只认自建集);
+- 回归: `python -m scripts.askdata_eval`(DSL 编译回归, 无 LLM) 与
+  `python -m scripts.askdata_eval --mode agent`(端到端), 报告进 `reports/askdata_eval_*`,
+  结论进 `askdata_eval_run` 供看板取 EX。
 
 ### 三层缓存与降级口径
 
@@ -320,6 +370,7 @@ mxi/
 │   │   ├── finance_server.py     #   财务报销系统(:8002/mcp)
 │   │   ├── analytics_server.py   #   数据洞察(:8005/mcp, Text2SQL/图表/周报)
 │   │   ├── procurement_server.py #   采购与合同初审(:8006/mcp)
+│   │   └── askdata_server.py     #   智能问数(:8007/mcp, 语义层/指标API/DSL编译/沙箱取数)
 │   ├── analytics/                # ★ 数据洞察支撑(不引 matplotlib/cairosvg)
 │   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie) + Pillow PNG(供 office 嵌图)
 │   │   ├── reports.py            #   固定口径指标 SQL + Markdown 报告组装
@@ -340,11 +391,25 @@ mxi/
 │   │   └── router.py             #   四层防护: 令牌形状/文件名安全集/子树断言/扩展名→MIME 白名单
 │   ├── procurement/              # ★ 采购/合同确定性规则引擎
 │   │   └── rules.py              #   必备条款/高风险表述/金额分级/预算余额
+│   ├── semantic/                 # ★ 问数语义层(指标中台元数据)
+│   │   ├── catalog.py            #   指标/维度/别名的内存快照形状(prompt 与校验共用)
+│   │   ├── seed.py               #   内置 Top 指标/维度/别名集(灌库源 + 无库时的兜底)
+│   │   ├── registry.py           #   读 sem_* 三表 + TTL 缓存 + 幂等灌入
+│   │   ├── dsl.py                #   受约束查询 DSL(强类型, 拒绝作用域列/表达式)
+│   │   ├── timesem.py            #   时间语义: 区间词 -> 左闭右开区间与对比期(MTD 环比对齐同期)
+│   │   ├── validate.py           #   三级校验器(语法→语义→权限), 带错误码
+│   │   ├── link.py               #   三路召回链接(词典/向量/枚举反查, 枚举带作用域)
+│   │   └── compiler.py           #   DSL→SQL 编译器(模板化 + 作用域注入 + AST 自校验)
+│   ├── askdata/                  # ★ 问数治理面(留痕/看板/归因/评测集)
+│   │   ├── store.py              #   同步 DAO: 问数留痕 + stats 聚合 + golden + 评测结论
+│   │   ├── attribution.py        #   五类归因与草案路由(只产出未生效的草案)
+│   │   └── router.py             #   /api/askdata/{stats,queries,feedback,badcases,golden,semantic}
 │   ├── agents/                   # ★ A2A 专业智能体
 │   │   ├── finance_agent/        #   agent_card / executor / server(:9002)
 │   │   ├── hr_agent/             #   agent_card / executor / server(:9001)
 │   │   ├── analyst_agent/        #   数据洞察 agent_card/executor/server(:9005)
-│   │   └── contract_agent/       #   采购合同 agent_card/executor/server(:9006)
+│   │   ├── contract_agent/       #   采购合同 agent_card/executor/server(:9006)
+│   │   └── askdata_agent/        #   智能问数(:9007): graph 确定性状态机 + prompts + executor
 │   └── security/                 # ★ 安全治理
 │       ├── auth.py               #   角色→工具/Agent 白名单
 │       ├── url_guard.py          #   SSRF 护栏(字面名拒/白名单/解析即校验 is_global)
@@ -454,11 +519,12 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 > | assistant                                                                                  | `18000`                                                                | `8000`          | Web 聊天 / API / 文档管理                     |
 > | hr-mcp / finance-mcp                                                                       | `18001` / `18002`                                                      | `8001` / `8002` | MCP 服务                                      |
 > | analytics-mcp / procurement-mcp                                                            | `18005` / `18006`                                                      | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
+> | askdata-mcp                                                                                | `18007`                                                                | `8007`          | 智能问数 MCP(语义层/编译/取数)              |
 > | neo4j HTTP                                                                                 | `17474`                                                                | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
 > | neo4j Bolt                                                                                 | `17687`                                                                | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
 > | tei-rerank                                                                                 | `8080`                                                                 | `8080`          | 重排服务 `/rerank`与`/health`                 |
 > | redis                                                                                      | `16379`                                                                | `6379`          | redis-stack-server, 记忆层/缓存层共用         |
-> | postgres / ES / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent | `5432` / `9200` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` | 同左            | 未抬, 保持原值                                |
+> | postgres / ES / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent / askdata-agent | `5432` / `9200` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` / `9007` | 同左            | 未抬, 保持原值                                |
 >
 > 抬端口只动**宿主发布端口**, 容器内监听端口与 compose 网络内的服务名地址(`bolt://neo4j:7687` 等)
 > 一律不变, 所以容器间连通性不受影响; 受影响的是宿主直连 —— 宿主 `.env` 必须写发布端口。
@@ -517,7 +583,7 @@ uv run python -m scripts.dev_services down         # 只停 docker 服务(只停
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d --build \
-  assistant postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp hr-agent finance-agent analyst-agent contract-agent
+  assistant postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp askdata-mcp hr-agent finance-agent analyst-agent contract-agent askdata-agent
 uv run python -m scripts.dev_services check --gateway    # 对接结果 + 容器网关健康
 cd web-ui && pnpm install && pnpm dev                    # 前端 dev, /api 代理到 assistant 容器发布端口(18000)
 docker logs -f assistant                                 # 网关日志(不再落宿主文件)
