@@ -75,9 +75,12 @@ def run_dsl(case: dict[str, Any], *, scope: DataScope | None = None) -> dict[str
         return _error(f"{type(exc).__name__}: {str(exc)[:200]}", started)
 
 
-def _error(reason: str, started: float) -> dict[str, Any]:
-    return {"columns": [], "rows": [], "rowcount": 0, "route": "", "sql": "",
-            "error": reason[:400], "latency_ms": int((time.monotonic() - started) * 1000)}
+def _error(reason: str, started: float, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {"columns": [], "rows": [], "rowcount": 0, "route": "", "sql": "",
+                           "error": reason[:400],
+                           "latency_ms": int((time.monotonic() - started) * 1000)}
+    out.update(extra or {})
+    return out
 
 
 async def run_agent(case: dict[str, Any], *, agent: Any = None) -> dict[str, Any]:
@@ -105,9 +108,26 @@ async def run_agent(case: dict[str, Any], *, agent: Any = None) -> dict[str, Any
     finally:
         reset_caller(token)
     verdict = str(payload.get("verdict") or "")
+    kind = str(payload.get("kind") or "")
+    if not verdict:
+        # 澄清除非轮在载荷里写的是 `kind=clarify` 而不是 `verdict`。不补这一步,
+        # 评测会把"反问了"当成"结果缺列"报(本轮实测过: 10 条实际是澄清, 而报告写着"澄清 0 条")。
+        verdict = {"clarify": "clarify", "refuse": "fail", "degraded": "degraded"}.get(kind, "")
+    common = {
+        "verdict": verdict,
+        "kind": kind,
+        "slots": payload.get("slots") or {},
+        "candidates": payload.get("metrics") or [],
+        "cache_hit": bool(payload.get("cache_hit")),
+        "semver": str(payload.get("semver") or ""),
+        "policies": list(payload.get("policies") or []),
+        "token_cost": int(payload.get("token_cost") or 0),
+    }
     if verdict != "ok":
+        # 澄清轮要把候选带回去: 误澄清的判据就是"被拦下了, 但最高分候选恰好就是期望口径"。
         return _error(f"未出数(verdict={verdict or '空'}, route={payload.get('route')}): "
-                      f"{'; '.join(payload.get('error_codes') or []) or (answer[:160] or '')}", started)
+                      f"{'; '.join(payload.get('error_codes') or []) or (answer[:160] or '')}",
+                      started, extra=common)
     return {
         "columns": list(payload.get("columns") or []),
         "rows": list(payload.get("rows") or [])[:20],
@@ -116,6 +136,7 @@ async def run_agent(case: dict[str, Any], *, agent: Any = None) -> dict[str, Any
         "sql": str(payload.get("sql") or ""),
         "dsl": payload.get("dsl") or {},
         "latency_ms": int((time.monotonic() - started) * 1000),
+        **common,
     }
 
 

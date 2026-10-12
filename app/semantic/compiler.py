@@ -10,7 +10,11 @@
 
 两条出口对应降级链的前两级:
 - :func:`compile_metric_api` —— 口径确定性首选: 除时间窗外**没有任何来自模型的谓词**;
-- :func:`compile_analytical` —— 通用分析: 多维下钻 + 过滤 + 同环比(CTE 双窗口)。
+- :func:`compile_analytical` —— 通用分析: 多维下钻 + 过滤 + 同环比。
+
+同环比默认走**单扫描条件聚合**(``SUM(CASE WHEN 窗口 THEN 度量 END)``), 解不出度量片段时
+退回双窗口 CTE: 前者是两回事里更重要的那件(一遇表扫描), 后者是确定性(任何形状
+的聚合都能原样跑两次)。两条路产出的列名一致, 所以下游校验与前端不必区分。
 
 产出的文本必须再过一次 :func:`app.db.ast_guard.validate_sql`(``normalize=False``,
 因为 sqlglot 会把 ``:name`` 重写成驱动才认的形式, 而这里执行的是服务端自己写的模板),
@@ -22,6 +26,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from sqlglot import exp, parse_one
@@ -63,6 +68,10 @@ class Compiled:
     labels: dict[str, str] = field(default_factory=dict)
     caliber_notes: list[str] = field(default_factory=list)
     limit: int = 100
+    # 本轮生效的语义层版本与行策略(只进审计/留痕, 不进给模型的文本): 回查时要知道
+    # 这个数是"哪一版口径 + 哪几条额外谓词"算出来的。
+    semver: str = ""
+    policies: list[str] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -72,6 +81,8 @@ class Compiled:
             "labels": self.labels,
             "caliber_notes": self.caliber_notes,
             "limit": self.limit,
+            "semver": self.semver,
+            "policies": list(self.policies),
         }
 
 
@@ -156,11 +167,15 @@ def _where_parts(
     scope: Any,
     resolved: ResolvedRange,
     window_suffix: str = "",
+    extra_windows: tuple[tuple[str, Any, Any], ...] = (),
+    catalog: MetricCatalog | None = None,
+    policy_log: list[str] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
-    """一份 WHERE 条件(作用域谓词 + 软删 + 时间窗 + 指标口径)。
+    """一份 WHERE 条件(作用域谓词 + 行策略 + 软删 + 时间窗 + 指标口径)。
 
-    ``window_suffix`` 让同环比的两个 CTE 用不同的绑参名而不共用值: 参数名由本模块
-    编号生成, 永不来自模型输出。
+    ``window_suffix`` 让同环比的两个 CTE 用不同的绑参名而不共用值; ``extra_windows``
+    是给单扫描条件聚合用的("当期与对比期都落在同一次扫描里"的 OR 谓词)。
+    参数名由本模块编号生成, 永不来自模型输出。
     """
     parts: list[str] = []
     params: dict[str, Any] = {}
@@ -169,34 +184,111 @@ def _where_parts(
         params.update(scope.scope_params())
     else:
         raise CompileError("缺少数据作用域, 拒绝编译无隔离的查询")
+    policy_parts, policy_params = _policy_parts(
+        metric=metric, alias=alias, scope=scope, catalog=catalog, policy_log=policy_log
+    )
+    parts.extend(policy_parts)
+    params.update(policy_params)
     if metric.source_table in SOFT_DELETE_TABLES:
         parts.append(f"{alias}.is_deleted = false")
+    windows: list[tuple[str, Any, Any]] = [(window_suffix, resolved.start, resolved.end)]
+    windows.extend(extra_windows)
     if not resolved.whole and metric.has_time:
-        start_key, end_key = f"p_start{window_suffix}", f"p_end{window_suffix}"
         col = _qualify(metric.time_column, alias, where="时间列")
-        parts.append(f"{col} >= :{start_key}")
-        parts.append(f"{col} < :{end_key}")
-        params[start_key] = resolved.start.isoformat() if resolved.start else ""
-        params[end_key] = resolved.end.isoformat() if resolved.end else ""
+        clauses = []
+        for suffix, start, end in windows:
+            start_key, end_key = f"p_start{suffix}", f"p_end{suffix}"
+            clauses.append(f"({col} >= :{start_key} AND {col} < :{end_key})")
+            params[start_key] = start.isoformat() if start else ""
+            params[end_key] = end.isoformat() if end else ""
+        parts.append(clauses[0] if len(clauses) == 1 else "(" + " OR ".join(clauses) + ")")
     if metric.caliber_where:
         parts.append(f"({_qualify(metric.caliber_where, alias, where='指标口径谓词')})")
     return parts, params
 
 
-def _render_filters(spec: QuerySpec, dims: dict[str, Dimension], alias: str) -> tuple[list[str], dict[str, Any]]:
+# 行策略模板里允许的变量位 -> ``(绑参名后缀, 取值函数, 是否部门集)``。
+_POLICY_BINDERS = {
+    "{user_id}": ("user_id", lambda scope: getattr(scope, "user_id", "") or "", False),
+    "{dept_id}": ("dept_id", lambda scope: getattr(scope, "dept_scope_text", lambda: "")() or "__none__", True),
+    "{tenant_id}": ("tenant_id", lambda scope: getattr(scope, "tenant_id", "") or "", False),
+    "{today}": ("today", lambda scope: date.today(), False),
+}
+
+
+def _policy_parts(
+    *, metric: Metric, alias: str, scope: Any,
+    catalog: MetricCatalog | None, policy_log: list[str] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    """把生效的行策略翻成 ``(谓词片段, 绑参)``(在 RLS 之上再叠一层按指标/角色的限定)。
+
+    值一律走绑参(部门集用 ``ANY(string_to_array(:..., ','))``, 与 RLS 同一写法), 模板里只出现
+    列名与占位符 —— 所以策略文本被谁改过都拼不进一个值。片段与参数一起返回而不是存模块级
+    字典: FastMCP 的同步工具跑在 threadpool 里, 任何进程级可变槽位都是串请求的通道。
+    拿不到 catalog(内置兜底集)时为空: 策略是库里治理过的东西, 兜底集不携带它。
+    """
+    if catalog is None or not catalog.row_policies:
+        return [], {}
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    role = str(getattr(scope, "role", "") or "")
+    for index, policy in enumerate(catalog.row_policy_for(role, metric.source_table, metric.metric_id)):
+        fragment = policy.predicate.replace("{alias}", alias)
+        for marker, (suffix, getter, is_dept_set) in _POLICY_BINDERS.items():
+            if marker not in fragment:
+                continue
+            name = f"rp_{suffix}_{index}"
+            params[name] = getter(scope)
+            fragment = fragment.replace(
+                marker,
+                f"ANY(string_to_array(:{name}, ','))" if is_dept_set else f":{name}",
+            )
+        if policy_log is not None:
+            policy_log.append(policy.policy_id)
+        parts.append(f"({fragment})")
+    return parts, params
+
+
+def _render_filters(
+    spec: QuerySpec, dims: dict[str, Dimension], alias: str,
+    extra: tuple[dict[str, Any], ...] = (),
+    redundant: frozenset[tuple[str, str, str]] = frozenset(),
+) -> tuple[list[str], dict[str, Any]]:
     """把过滤条件渲染成谓词 + 绑参(谓词模板与写通道同源: 复用 datadsl 的 ``_OP_TEMPLATES``)。
 
     列位上放的是**本模块限定好的列**(``r.category``), 而不是模型给的 dim_id ——
     所以谓词里没有任何一个字来自模型。
+
+    ``extra`` 是校验器从语义层兼容规则里拿到的 default_filter: 它们同样不是模型写的,
+    但同样要过"列名必须已登记"这一关(拿不到维度就直接拒, 不默默丢弃一条限定)。
+
+    ``redundant`` 是校验器已判定"与指标口径重复"的过滤三元组: 由校验器决定不加,
+    这里只照决定执行 —— 两边各自判一次就会出现"校验通过但编译说维度未登记"的矛盾。
     """
     from app.db.datadsl import FilterOp, predicate_sql
+    from app.semantic.dsl import SpecFilter
+
+    items: list[Any] = list(spec.filters)
+    for item in extra:
+        dim_id = str(item.get("dim") or "")
+        if dim_id not in dims:
+            raise CompileError(f"兼容规则指定的默认过滤维度 {dim_id or '?'} 未登记, 无法编译")
+        try:
+            items.append(SpecFilter.model_validate({
+                "dim": dim_id, "op": item.get("op") or "eq", "value": item.get("value"),
+            }))
+        except Exception as exc:  # noqa: BLE001 - 兼容规则写错了是配置问题, 要说清楚
+            raise CompileError(f"兼容规则的默认过滤不合法({dim_id}): {exc}") from exc
 
     parts: list[str] = []
     params: dict[str, Any] = {}
-    for index, filt in enumerate(spec.filters):
+    for index, filt in enumerate(items):
         dim = dims.get(filt.dim)
         if dim is None:
             raise CompileError(f"过滤维度 {filt.dim} 未登记, 无法编译")
+        op_name = str(filt.op.value if hasattr(filt.op, "value") else filt.op)
+        if (str(filt.dim), op_name, str(filt.value)) in redundant:
+            continue  # 口径里已经有这个限定, 再加一次会掉那些本应为 0 的分组行
         column = _qualify(dim.qualified_column, alias, where=f"维度 {filt.dim} 的列")
         op = filt.op if isinstance(filt.op, FilterOp) else FilterOp(str(filt.op))
         fragment, names, values = predicate_sql(_DslFilter(field=column, op=op, value=filt.value), f"f{index}")
@@ -239,6 +331,33 @@ def _resolve_columns(dims: list[Dimension], alias: str) -> list[tuple[Dimension,
             column = f"{alias}.{column}"
         out.append((dim, _qualify(column, alias, where=f"维度 {dim.dim_id} 的列")))
     return out
+
+
+_JOIN_ALIAS_RE = re.compile(r"\bJOIN\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _require_joined_alias(alias: str, joins: list[str], dims: list[Dimension]) -> None:
+    """维度用到的表别名必须真的被 JOIN 过 —— 否则 PG 会报"missing FROM-clause entry"。
+
+    为什么要在这里拒而不是让数据库报错: 运行时报错会**逐降级落到沙箱**, 沙箱里的模型
+    会自己拼一个 JOIN 并算出一个看起来对但没人核对过的数(实际被这项问题抖出来过:
+    报销指标用了登记在 hr_employees 上的员工姓名维度, 没 join_sql 也没人补)。
+    拒在编译前、并把"该登记什么"写进拒因, 才能让人一步改到语义层。
+    """
+    available = {alias}
+    for join in joins:
+        match = _JOIN_ALIAS_RE.search(join)
+        if match:
+            available.add(match.group(2))
+    for dim in dims:
+        prefix = dim.column_prefix or alias
+        if prefix in available:
+            continue
+        raise CompileError(
+            f"维度 {dim.label}({dim.dim_id}) 落在 {prefix}.{dim.column} 上, 但本次 FROM/JOIN 里没有"
+            f" {prefix}; 请在语义层为该事实表登记这个维度的 join_sql(或改用已登记的同义维度),"
+            " 而不是让模型自己拼 JOIN"
+        )
 
 
 def compile_analytical(
@@ -296,6 +415,9 @@ def compile_analytical(
         group_parts.append(column)
         columns.append(out_name)
         labels[out_name] = dim.label
+    # 单扫描同环比只要维度部分(度量要在它上面重新包一层 CASE)。
+    dim_select = list(select_parts)
+    dim_group = list(group_parts)
 
     for item, m in zip(spec.metrics, check.metrics):
         out_name = m.output_alias
@@ -311,49 +433,90 @@ def compile_analytical(
     joins = _collect_joins(check.dims, alias)
     # 过滤维度可能带进新的 JOIN(如只按部门过滤而不按部门下钻)。
     join_keys = {j.split(" ON ")[0] for j in joins}
-    for dim in check.filter_dims.values():
+    filter_dims = dict(check.filter_dims)
+    # 兼容规则救回来的 default_filter 也是一个过滤维度: 它同样可能要带进关联表。
+    for item in check.auto_filters:
+        dim = catalog.get_dim(str(item.get("dim") or ""))
+        if dim is not None and dim.dim_id not in filter_dims:
+            filter_dims[dim.dim_id] = dim
+    for dim in filter_dims.values():
         if not dim.join_sql:
             continue
         text = dim.join_sql.replace("{alias}", alias)
         if text.split(" ON ")[0] not in join_keys:
             joins.append(text)
             join_keys.add(text.split(" ON ")[0])
+    _require_joined_alias(alias, joins, check.dims + list(filter_dims.values()))
 
-    where_parts, params = _where_parts(metric=metric, alias=alias, scope=scope, resolved=resolved)
-    filter_parts, filter_params = _render_filters(spec, check.filter_dims, alias)
+    policy_log: list[str] = []
+    where_parts, params = _where_parts(
+        metric=metric, alias=alias, scope=scope, resolved=resolved,
+        catalog=catalog, policy_log=policy_log,
+    )
+    filter_parts, filter_params = _render_filters(
+        spec, filter_dims, alias, extra=tuple(check.auto_filters),
+        redundant=frozenset(check.redundant_filters),
+    )
     params.update(filter_params)
     where_parts.extend(filter_parts)
+    if check.auto_filters:
+        notes.append("本次按语义层登记的兼容规则自动加了限定(不是模型自己补的条件)")
+    if check.redundant_filters:
+        notes.append("有一条限定与指标口径重复, 本次没重复加(否则计数为 0 的分组行会从结果里消失)")
     dim_cols = [dim_alias[d.dim_id] for d in check.dims]
     query = _Query(
         table=metric.source_table, alias=alias, select=select_parts,
         where=where_parts, group=group_parts, joins=joins,
     )
+    semver = catalog.semver
 
     if not with_compare:
         sql = query.render() + _order_and_limit(
             spec, columns=columns, default_order=metric_outs[0] if dim_cols else "", max_rows=max_rows,
         )
-        return _finish(sql, params, spec, columns, labels, notes, max_rows, "compiler")
+        return _finish(sql, params, spec, columns, labels, notes, max_rows, "compiler",
+                       semver=semver, policies=policy_log)
 
     if resolved.prev_start is None or resolved.prev_end is None:
         raise CompileError("对比期没算出来, 不能出同环比")
-    # 同环比已抑制时间桶, 所以对比期查询与当期只差窗口绑参名(形状一份模板产出两次)。
+    if resolved.note:
+        notes.append(f"对比期: {resolved.note}")
+    kind = "mom" if (spec.compare.type if spec.compare else "mom") == "mom" else "yoy"
+
+    # 首选单扫描条件聚合(同一张事实表只扫一次, 方案里同环比的标准形状)。
+    single = _compare_single_scan(
+        spec=spec, metrics=check.metrics, metric=metric, alias=alias, scope=scope,
+        resolved=resolved, catalog=catalog, dim_select=dim_select, dim_group=dim_group,
+        joins=joins, filter_parts=filter_parts, metric_outs=metric_outs, kind=kind,
+        columns=columns, max_rows=max_rows, policy_log=policy_log,
+    )
+    if single is not None:
+        sql, extra_columns, single_params = single
+        notes.append("同环比走单扫描条件聚合(SUM(CASE WHEN 窗口 ...)), 事实表只扫一次")
+        notes.append("同环比由引擎算(上一等长周期/去年同期), 不由模型做算术")
+        for col in extra_columns:
+            columns.append(col)
+        labels.update({c: labels.get(m, m) + ("(上期)" if c.endswith("_prev") else "(变化%)")
+                       for m in metric_outs for c in (f"{m}_prev", f"{m}_{kind}_pct")})
+        return _finish(sql, single_params, spec, columns, labels, notes, max_rows, "compiler",
+                       semver=semver, policies=policy_log)
+
+    # 退回双窗口 CTE: 口径形状解不出"度量片段"(非常见聚合写法)时, 宁可多扫一次
+    # 也不能算错。两条路产出同名列与同语义结果(上期为空时都得到 NULL 变化率),
+    # 所以下游校验与前端不必区分。
     prev_where, prev_params = _where_parts(
         metric=metric, alias=alias, scope=scope,
         resolved=ResolvedRange(
             token=resolved.token, start=resolved.prev_start, end=resolved.prev_end,
             gran="none", label=resolved.label, whole=False,
         ),
-        window_suffix="_prev",
+        window_suffix="_prev", catalog=catalog,
     )
     prev_params.update(filter_params)
-    if resolved.note:
-        notes.append(f"对比期: {resolved.note}")
     prev_query = _Query(
         table=metric.source_table, alias=alias, select=list(select_parts),
         where=prev_where, group=list(group_parts), joins=list(joins),
     )
-    kind = "mom" if (spec.compare.type if spec.compare else "mom") == "mom" else "yoy"
     sql, extra_columns = _compare_sql(
         cur=query.render(), prev=prev_query.render(),
         dim_cols=dim_cols, metric_cols=metric_outs, kind=kind,
@@ -364,8 +527,9 @@ def compile_analytical(
         columns.append(col)
     labels.update({c: labels.get(m, m) + ("(上期)" if c.endswith("_prev") else "(变化%)")
                    for m in metric_outs for c in (f"{m}_prev", f"{m}_{kind}_pct")})
-    notes.append("同环比由引擎算(上一等长周期/去年同期), 不由模型做算术")
-    return _finish(sql, params, spec, columns, labels, notes, max_rows, "compiler")
+    notes.append("同环比走双窗口 CTE(口径未能安全拆成条件聚合), 结果与单扫描等价")
+    return _finish(sql, params, spec, columns, labels, notes, max_rows, "compiler",
+                   semver=semver, policies=policy_log)
 
 
 def compile_metric_api(
@@ -450,6 +614,146 @@ def _order_and_limit(
     return f"{order} LIMIT {_cap_rows(spec, max_rows)}"
 
 
+_PH_RE = re.compile(r"__ph_([a-z0-9_]+)__")
+
+
+def _restore_placeholders(sql: str | None) -> str | None:
+    """把渲染阶段用的哨兵 token 恢复成 SQLAlchemy 的 ``:name`` 绑参。"""
+    if sql is None:
+        return None
+    return _PH_RE.sub(r":\1", sql)
+
+
+def _conditional(expression: str, cond_sql: str) -> str | None:
+    """把口径表达式里的**每一个**聚合函数改写成条件聚合(只吃满足 ``cond_sql`` 的行)。
+
+    为什么在 AST 上做而不是正则: 口径是登记过的自由形状片段(带 FILTER、COALESCE、
+    两个聚合相除的比率型), 文本改写迟早会漏一种形状并**默默算错数**; AST 改写至少
+    能保证"改不动就返回 None"(退回双窗口 CTE), 而不是猜。
+
+    两个细节:
+    - ``COUNT(*)`` 的参是 Star, 换成 ``CASE WHEN ... THEN 1 END``(COUNT 只数非 NULL);
+    - ``FILTER (WHERE p)`` 的谓词并进 CASE 条件后整个节点换掉: PG 的
+      ``COUNT(CASE ...) FILTER (WHERE p)`` 也合法, 但两种写法共存会让上期的 p 重复计算。
+    """
+    try:
+        node = parse_one(expression, read="postgres")
+    except ParseError:
+        return None
+    aggregates = list(node.find_all(exp.AggFunc))
+    if not aggregates:
+        return None  # 行级表达式(无聚合): 不能拿它做条件聚合, 交回 CTE 路径
+    for agg in aggregates:
+        parent = agg.parent
+        wrapper = parent if isinstance(parent, exp.Filter) else None
+        arg = agg.args.get("this")
+        inner = "1" if arg is None or isinstance(arg, exp.Star) else arg.sql(dialect="postgres")
+        condition = cond_sql
+        if wrapper is not None:
+            where_node = wrapper.expression
+            condition = f"{condition} AND {where_node.this.sql(dialect='postgres')}"
+        distinct = bool(agg.args.get("distinct"))
+        name = agg.key.upper()
+        replacement = f"{name}({'DISTINCT ' if distinct else ''}CASE WHEN {condition} THEN {inner} END)"
+        try:
+            new_node = parse_one(replacement, read="postgres")
+        except ParseError:
+            return None
+        target = wrapper or agg
+        # **根节点必须重新绑定**: 对 `COUNT(*) FILTER (WHERE 口径谓词)` 这种整棵表达式就是
+        # 一个带 FILTER 的聚合的口径, replace() 只能改子节点 —— 拿它当已替换的话,
+        # 渲出来的 SQL 还是原树(窗口条件静默消失, 上期=当期, 环比永远是 0%)。
+        if target is node:
+            node = new_node
+        else:
+            target.replace(new_node)
+    return node.sql(dialect="postgres")
+
+
+def _compare_single_scan(
+    *,
+    spec: QuerySpec,
+    metrics: list[Metric],
+    metric: Metric,
+    alias: str,
+    scope: Any,
+    resolved: ResolvedRange,
+    catalog: MetricCatalog,
+    dim_select: list[str],
+    dim_group: list[str],
+    joins: list[str],
+    filter_parts: list[str],
+    metric_outs: list[str],
+    kind: str,
+    columns: list[str],
+    max_rows: int,
+    policy_log: list[str],
+) -> tuple[str, list[str], dict[str, Any]] | None:
+    """同环比的单扫描形状: ``(sql, 额外列, 绑参)``, 拿不到就返回 None 让上层走 CTE。
+
+    形状是"内层一次扫描算出两列 + 外层算变化率": 同一层的 SELECT 里不能引用刚定义的别名,
+    所以变化率必须到外层去; 这也顺带避开了"无维度时写恒真 JOIN"那个被 AST 校验器拒绝的形状。
+    """
+    if not metric.has_time or resolved.prev_start is None or resolved.prev_end is None:
+        return None
+    time_col = _qualify(metric.time_column, alias, where="时间列")
+    # 窗口谓词里先放哨兵 token 而不是 `:p_start`: sqlglot 渲染时会把 `:name` 改写成驱动才认的
+    # `%(name)s` 形式, 与模板里其余部分的 `:name` 混在一条语句里就是两种 paramstyle 同存
+    # (轻则报绑定错, 重则默默少绑一个参数)。token 形如 __ph_p_start__ 被 sqlglot 当普通列名
+    # 原样带过, 渲完再恢复成 `:p_start`。
+    cond_cur = f"{time_col} >= __ph_p_start__ AND {time_col} < __ph_p_end__"
+    cond_prev = f"{time_col} >= __ph_p_start_prev__ AND {time_col} < __ph_p_end_prev__"
+
+    inner_select = list(dim_select)
+    for out_name, m in zip(metric_outs, metrics):
+        expression = _metric_expr(m, alias, grouped=bool(dim_group))
+        cur = _restore_placeholders(_conditional(expression, cond_cur))
+        prev = _restore_placeholders(_conditional(expression, cond_prev))
+        if cur is None or prev is None:
+            return None
+        inner_select.append(f"{cur} AS {out_name}")
+        inner_select.append(f"{prev} AS {out_name}_prev")
+
+    where_parts, params = _where_parts(
+        metric=metric, alias=alias, scope=scope, resolved=resolved,
+        extra_windows=(("_prev", resolved.prev_start, resolved.prev_end),),
+        catalog=catalog, policy_log=policy_log,
+    )
+    where_parts.extend(filter_parts)
+    inner = _Query(
+        table=metric.source_table, alias=alias, select=inner_select,
+        where=where_parts, group=dim_group, joins=joins,
+    ).render()
+
+    extra: list[str] = []
+    outer_select = list(_dim_select_columns(dim_select, columns))
+    for out_name in metric_outs:
+        prev_name = f"{out_name}_prev"
+        pct_name = f"{out_name}_{kind}_pct"
+        outer_select.append(out_name)
+        outer_select.append(prev_name)
+        # 分母用 NULLIF: 上期为 0/没数时变化率是 NULL("没得比")而不是一个除零异常或 0%。
+        outer_select.append(
+            f"ROUND(({out_name} - {prev_name}) / NULLIF({prev_name}, 0) * 100, 1) AS {pct_name}"
+        )
+        extra.extend([prev_name, pct_name])
+    sql = f"SELECT {', '.join(outer_select)} FROM ({inner}) cmp" + _order_and_limit(
+        spec, columns=columns + extra,
+        default_order=metric_outs[0] if dim_select else "", max_rows=max_rows,
+    )
+    return sql, extra, params
+
+
+def _dim_select_columns(select_parts: list[str], columns: list[str]) -> list[str]:
+    """从内层维度选取片段里取回输出列名(外层只透传维度列)。"""
+    out: list[str] = []
+    for part in select_parts:
+        name = part.rsplit(" AS ", 1)[-1].strip()
+        if name in columns:
+            out.append(name)
+    return out
+
+
 def _compare_sql(
     *,
     cur: str,
@@ -504,6 +808,34 @@ def _compare_sql(
     return sql, extra
 
 
+# 方言转译的目标集(方案 §4④ 要 CK/MySQL/Hive/PG): 只用于**比对产物**。
+# 本仓数据源只有 PostgreSQL, 所以真正执行的永远是 `Compiled.sql`;
+# 把 dialect 做成额外字段而不是替掉 sql, 是为了"能看目标方言长什么样"不会
+# 顺便把取数打到不存在的引擎上(那才是真事故)。
+DIALECTS = frozenset({"postgres", "clickhouse", "mysql", "hive", "spark", "trino", "duckdb"})
+
+
+def transpile_sql(sql: str, dialect: str) -> str:
+    """把编译产物转成另一种方言的 SQL 文本(不执行, 只给人对形状)。
+
+    失败就抛 CompileError: 转译不出来比"默默给一段 PG 语法当作已转译"安全得多。
+    """
+    target = (dialect or "").strip().lower()
+    if not target or target == "postgres":
+        return sql
+    if target not in DIALECTS:
+        raise CompileError(f"不支持的方言 {dialect!r}(可用: {sorted(DIALECTS)})")
+    try:
+        from sqlglot import transpile
+
+        converted = transpile(sql, read="postgres", write=target)
+    except Exception as exc:  # noqa: BLE001 - 转译失败要当错报而不是静默返回原文
+        raise CompileError(f"方言 {target} 转译失败: {type(exc).__name__}: {str(exc)[:160]}") from exc
+    if not converted or not str(converted[0]).strip():
+        raise CompileError(f"方言 {target} 转译结果为空")
+    return str(converted[0])
+
+
 def _finish(
     sql: str,
     params: dict[str, Any],
@@ -513,6 +845,9 @@ def _finish(
     notes: list[str],
     max_rows: int,
     route: str,
+    *,
+    semver: str = "",
+    policies: list[str] | None = None,
 ) -> Compiled:
     from app.db.ast_guard import READ_MODE, validate_sql
 
@@ -526,7 +861,10 @@ def _finish(
         raise CompileError(f"编译产物未通过安全校验: {exc}") from exc
     return Compiled(
         sql=checked, params=params, route=route, columns=columns, labels=labels,
-        caliber_notes=notes, limit=cap,
+        caliber_notes=notes, limit=cap, semver=semver,
+        # 去重: 同环比的单扫描与回退 CTE 都各跑一次 _where_parts, 同一策略会被记两遍;
+        # 留痕里看"生效了哪几条策略"时不该重复计数。
+        policies=sorted(set(policies or [])),
     )
 
 

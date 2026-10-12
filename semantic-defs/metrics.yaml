@@ -1,0 +1,883 @@
+# 智能问数语义层真值(由 scripts/export_semantic_defs.py 生成/维护)
+# 改这里 = 改口径: 必须走 scripts/sync_semantic_defs.py 同步进库并留版本记录。
+metrics:
+- metric_id: m_expense_total
+  label: 报销总额
+  domain: expense
+  unit: 元
+  agg: sum
+  source_table: fin_reimbursements
+  expression: COALESCE(SUM(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_total
+  description: 全部状态报销单的金额合计(含待审与驳回)
+  status: active
+- metric_id: m_expense_count
+  label: 报销单数
+  domain: expense
+  unit: 单
+  agg: count
+  source_table: fin_reimbursements
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_count
+  status: active
+- metric_id: m_expense_paid_total
+  label: 已打款报销金额
+  domain: expense
+  unit: 元
+  agg: sum
+  source_table: fin_reimbursements
+  expression: COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_paid
+  status: active
+- metric_id: m_expense_pending_count
+  label: 待审报销单数
+  domain: expense
+  unit: 单
+  agg: count
+  source_table: fin_reimbursements
+  expression: COUNT(*) FILTER (WHERE status = 'SUBMITTED')
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_pending
+  status: active
+- metric_id: m_expense_rejected_count
+  label: 被驳回报销单数
+  domain: expense
+  unit: 单
+  agg: count
+  source_table: fin_reimbursements
+  expression: COUNT(*) FILTER (WHERE status = 'REJECTED')
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_rejected
+  status: active
+- metric_id: m_expense_avg_amount
+  label: 平均单笔报销额
+  domain: expense
+  unit: 元
+  agg: avg
+  source_table: fin_reimbursements
+  expression: COALESCE(AVG(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  status: active
+- metric_id: m_expense_max_amount
+  label: 单笔最高报销额
+  domain: expense
+  unit: 元
+  agg: max
+  source_table: fin_reimbursements
+  expression: COALESCE(MAX(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  status: active
+- metric_id: m_expense_reject_rate
+  label: 报销驳回率
+  domain: expense
+  unit: '%'
+  agg: ratio
+  source_table: fin_reimbursements
+  expression: ROUND(COUNT(*) FILTER (WHERE status = 'REJECTED') * 100.0 / NULLIF(COUNT(*), 0), 1)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  status: active
+- metric_id: m_expense_travel_total
+  label: 差旅费金额
+  domain: expense
+  unit: 元
+  agg: sum
+  source_table: fin_reimbursements
+  expression: COALESCE(SUM(amount), 0)
+  caliber_where: category = '差旅费'
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  caliber_ref: reports:expense_total
+  status: active
+- metric_id: m_expense_person_count
+  label: 报销涉及人数
+  domain: expense
+  unit: 人
+  agg: count_distinct
+  source_table: fin_reimbursements
+  expression: COUNT(DISTINCT emp_id)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  status: active
+- metric_id: m_expense_per_capita
+  label: 人均报销额
+  domain: expense
+  unit: 元
+  agg: ratio
+  source_table: fin_reimbursements
+  expression: ROUND(COALESCE(SUM(amount), 0) / NULLIF(COUNT(DISTINCT emp_id), 0), 2)
+  time_column: created_at
+  compatible_dims:
+  - d_expense_department
+  - d_expense_category
+  - d_expense_status
+  - d_reimb_node
+  - d_expense_employee_name
+  - d_expense_employee_position
+  calendar: month
+  status: active
+- metric_id: m_budget_annual_total
+  label: 年度预算总额
+  domain: budget
+  unit: 元
+  agg: sum
+  source_table: fin_department_budgets
+  expression: COALESCE(SUM(annual_budget), 0)
+  compatible_dims:
+  - d_budget_department
+  - d_budget_year
+  calendar: year
+  description: 按年度快照, 不受时间区间约束
+  status: active
+- metric_id: m_budget_used_total
+  label: 已用预算总额
+  domain: budget
+  unit: 元
+  agg: sum
+  source_table: fin_department_budgets
+  expression: COALESCE(SUM(used_amount), 0)
+  compatible_dims:
+  - d_budget_department
+  - d_budget_year
+  calendar: year
+  status: active
+- metric_id: m_budget_remaining
+  label: 预算剩余额
+  domain: budget
+  unit: 元
+  agg: expression
+  source_table: fin_department_budgets
+  expression: COALESCE(SUM(annual_budget) - SUM(used_amount), 0)
+  compatible_dims:
+  - d_budget_department
+  - d_budget_year
+  calendar: year
+  status: active
+- metric_id: m_budget_used_pct
+  label: 预算消耗率
+  domain: budget
+  unit: '%'
+  agg: ratio
+  source_table: fin_department_budgets
+  expression: ROUND(SUM(used_amount) / NULLIF(SUM(annual_budget), 0) * 100, 1)
+  compatible_dims:
+  - d_budget_department
+  - d_budget_year
+  calendar: year
+  caliber_ref: reports:budget_used_pct_agg
+  description: 按分组聚合后的消耗占比(与周报行级口径同值)
+  status: active
+- metric_id: m_budget_over_count
+  label: 超支部门数
+  domain: budget
+  unit: 个
+  agg: count
+  source_table: fin_department_budgets
+  expression: COUNT(*) FILTER (WHERE used_amount > annual_budget)
+  compatible_dims:
+  - d_budget_department
+  - d_budget_year
+  calendar: year
+  status: active
+- metric_id: m_ticket_count
+  label: 工单总量
+  domain: hr
+  unit: 单
+  agg: count
+  source_table: hr_tickets
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  caliber_ref: reports:ticket_count
+  status: active
+- metric_id: m_ticket_done_count
+  label: 已结工单数
+  domain: hr
+  unit: 单
+  agg: count
+  source_table: hr_tickets
+  expression: COUNT(*) FILTER (WHERE status = 'DONE')
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  caliber_ref: reports:ticket_done
+  status: active
+- metric_id: m_ticket_open_count
+  label: 未结工单数
+  domain: hr
+  unit: 单
+  agg: count
+  source_table: hr_tickets
+  expression: COUNT(*) FILTER (WHERE status IN ('OPEN', 'PROCESSING'))
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  caliber_ref: reports:ticket_open
+  status: active
+- metric_id: m_ticket_onboard_count
+  label: 入职类工单数
+  domain: hr
+  unit: 单
+  agg: count
+  source_table: hr_tickets
+  expression: COUNT(*) FILTER (WHERE category = '入职')
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  status: active
+- metric_id: m_ticket_cert_count
+  label: 证明开具类工单数
+  domain: hr
+  unit: 单
+  agg: count
+  source_table: hr_tickets
+  expression: COUNT(*) FILTER (WHERE category = '证明开具')
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  status: active
+- metric_id: m_ticket_person_count
+  label: 提单人数
+  domain: hr
+  unit: 人
+  agg: count_distinct
+  source_table: hr_tickets
+  expression: COUNT(DISTINCT emp_id)
+  time_column: created_at
+  compatible_dims:
+  - d_ticket_department
+  - d_ticket_category
+  - d_ticket_status
+  - d_ticket_employee_name
+  - d_ticket_employee_position
+  calendar: month
+  status: active
+- metric_id: m_leave_count
+  label: 请假人次
+  domain: leave
+  unit: 人次
+  agg: count
+  source_table: hr_leave_records
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  caliber_ref: reports:leave_count
+  status: active
+- metric_id: m_leave_days_total
+  label: 请假天数合计
+  domain: leave
+  unit: 天
+  agg: sum
+  source_table: hr_leave_records
+  expression: COALESCE(SUM(days), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  caliber_ref: reports:leave_days
+  status: active
+- metric_id: m_leave_avg_days
+  label: 平均单次请假天数
+  domain: leave
+  unit: 天
+  agg: avg
+  source_table: hr_leave_records
+  expression: COALESCE(AVG(days), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  status: active
+- metric_id: m_leave_annual_days
+  label: 年假天数
+  domain: leave
+  unit: 天
+  agg: sum
+  source_table: hr_leave_records
+  expression: COALESCE(SUM(days), 0)
+  caliber_where: leave_type = '年假'
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  caliber_ref: reports:leave_days
+  status: active
+- metric_id: m_leave_sick_days
+  label: 病假天数
+  domain: leave
+  unit: 天
+  agg: sum
+  source_table: hr_leave_records
+  expression: COALESCE(SUM(days), 0)
+  caliber_where: leave_type = '病假'
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  caliber_ref: reports:leave_days
+  status: active
+- metric_id: m_leave_approved_days
+  label: 已批准请假天数
+  domain: leave
+  unit: 天
+  agg: sum
+  source_table: hr_leave_records
+  expression: COALESCE(SUM(days), 0)
+  caliber_where: status = '已批准'
+  time_column: created_at
+  compatible_dims:
+  - d_leave_department
+  - d_leave_type
+  - d_leave_status
+  - d_leave_employee_name
+  - d_leave_employee_position
+  calendar: month
+  caliber_ref: reports:leave_days
+  status: active
+- metric_id: m_employee_headcount
+  label: 在职人数
+  domain: employee
+  unit: 人
+  agg: count
+  source_table: hr_employees
+  expression: COUNT(*) FILTER (WHERE status = '在职')
+  compatible_dims:
+  - d_employee_department
+  - d_employee_position
+  - d_employee_name
+  - d_employee_status
+  calendar: year
+  description: 人数快照, 不受时间区间约束
+  status: active
+- metric_id: m_employee_onboard_count
+  label: 新入职人数
+  domain: employee
+  unit: 人
+  agg: count
+  source_table: hr_employees
+  expression: COUNT(*)
+  time_column: hire_date
+  compatible_dims:
+  - d_employee_department
+  - d_employee_position
+  - d_employee_name
+  - d_employee_status
+  calendar: month
+  caliber_ref: reports:expense_count
+  description: 按 hire_date 落在区间内计数
+  status: active
+- metric_id: m_employee_left_count
+  label: 离职人数
+  domain: employee
+  unit: 人
+  agg: count
+  source_table: hr_employees
+  expression: COUNT(*) FILTER (WHERE status = '离职')
+  time_column: hire_date
+  compatible_dims:
+  - d_employee_department
+  - d_employee_position
+  - d_employee_name
+  - d_employee_status
+  calendar: month
+  status: active
+- metric_id: m_employee_leave_balance_total
+  label: 年假余额合计
+  domain: employee
+  unit: 天
+  agg: expression
+  source_table: hr_employees
+  expression: COALESCE(SUM(GREATEST(annual_leave_total - annual_leave_used, 0)), 0)
+  compatible_dims:
+  - d_employee_department
+  - d_employee_position
+  - d_employee_name
+  - d_employee_status
+  calendar: year
+  status: active
+- metric_id: m_employee_avg_leave_used
+  label: 人均已用年假
+  domain: employee
+  unit: 天
+  agg: avg
+  source_table: hr_employees
+  expression: COALESCE(AVG(annual_leave_used), 0)
+  compatible_dims:
+  - d_employee_department
+  - d_employee_position
+  - d_employee_name
+  - d_employee_status
+  calendar: month
+  status: active
+- metric_id: m_purchase_total
+  label: 采购申请金额
+  domain: purchase
+  unit: 元
+  agg: sum
+  source_table: proc_orders
+  expression: COALESCE(SUM(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  caliber_ref: reports:purchase_total
+  status: active
+- metric_id: m_purchase_count
+  label: 采购申请单数
+  domain: purchase
+  unit: 单
+  agg: count
+  source_table: proc_orders
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  caliber_ref: reports:purchase_count
+  status: active
+- metric_id: m_purchase_pending_count
+  label: 待审采购单数
+  domain: purchase
+  unit: 单
+  agg: count
+  source_table: proc_orders
+  expression: COUNT(*) FILTER (WHERE status IN ('PRECHECK', 'PENDING'))
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  caliber_ref: reports:purchase_pending
+  status: active
+- metric_id: m_purchase_approved_total
+  label: 已批准采购金额
+  domain: purchase
+  unit: 元
+  agg: sum
+  source_table: proc_orders
+  expression: COALESCE(SUM(amount), 0)
+  caliber_where: status IN ('APPROVED', 'PAID')
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  caliber_ref: reports:purchase_total
+  status: active
+- metric_id: m_purchase_avg_amount
+  label: 平均单笔采购额
+  domain: purchase
+  unit: 元
+  agg: avg
+  source_table: proc_orders
+  expression: COALESCE(AVG(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  status: active
+- metric_id: m_purchase_quotes_short
+  label: 比价不足采购单数
+  domain: purchase
+  unit: 单
+  agg: count
+  source_table: proc_orders
+  expression: COUNT(*) FILTER (WHERE quotes_count < 3)
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  description: 比价份数不足 3 份, 合规红线项
+  status: active
+- metric_id: m_purchase_supplier_count
+  label: 涉及供应商数
+  domain: purchase
+  unit: 家
+  agg: count_distinct
+  source_table: proc_orders
+  expression: COUNT(DISTINCT supplier_name)
+  time_column: created_at
+  compatible_dims:
+  - d_order_department
+  - d_order_category
+  - d_order_status
+  - d_order_supplier
+  - d_order_node
+  - d_order_budget_year
+  - d_order_currency
+  - d_order_employee_name
+  calendar: month
+  status: active
+- metric_id: m_contract_count
+  label: 合同初审份数
+  domain: contract
+  unit: 份
+  agg: count
+  source_table: proc_contracts
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:contract_count
+  status: active
+- metric_id: m_contract_amount_total
+  label: 合同金额合计
+  domain: contract
+  unit: 元
+  agg: sum
+  source_table: proc_contracts
+  expression: COALESCE(SUM(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:purchase_total
+  status: active
+- metric_id: m_contract_high_risk_count
+  label: 高风险合同数
+  domain: contract
+  unit: 份
+  agg: count
+  source_table: proc_contracts
+  expression: COUNT(*) FILTER (WHERE risk_level = '高')
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:contract_high
+  status: active
+- metric_id: m_contract_medium_risk_count
+  label: 中风险合同数
+  domain: contract
+  unit: 份
+  agg: count
+  source_table: proc_contracts
+  expression: COUNT(*) FILTER (WHERE risk_level = '中')
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:contract_medium
+  status: active
+- metric_id: m_contract_risk_flag_count
+  label: 判定为有风险的合同数
+  domain: contract
+  unit: 份
+  agg: count
+  source_table: proc_contracts
+  expression: COUNT(*) FILTER (WHERE status = 'RISK')
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:contract_risk
+  status: active
+- metric_id: m_contract_avg_amount
+  label: 平均合同金额
+  domain: contract
+  unit: 元
+  agg: avg
+  source_table: proc_contracts
+  expression: COALESCE(AVG(amount), 0)
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  status: active
+- metric_id: m_contract_expiring_count
+  label: 区间内到期合同数
+  domain: contract
+  unit: 份
+  agg: count
+  source_table: proc_contracts
+  expression: COUNT(*)
+  caliber_where: expiry_date IS NOT NULL
+  time_column: expiry_date
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  caliber_ref: reports:contract_count
+  description: 按到期日落在区间内计数(未来 30 天 = 区间取到 30 天后)
+  status: active
+- metric_id: m_contract_party_count
+  label: 合同对手方数
+  domain: contract
+  unit: 家
+  agg: count_distinct
+  source_table: proc_contracts
+  expression: COUNT(DISTINCT party_b)
+  time_column: created_at
+  compatible_dims:
+  - d_contract_category
+  - d_contract_status
+  - d_contract_risk_level
+  - d_contract_party_b
+  - d_contract_reviewer
+  - d_contract_currency
+  calendar: month
+  status: active
+- metric_id: m_supplier_count
+  label: 在册供应商数
+  domain: supplier
+  unit: 家
+  agg: count
+  source_table: proc_suppliers
+  expression: COUNT(*)
+  time_column: created_at
+  compatible_dims:
+  - d_supplier_category
+  - d_supplier_risk_status
+  - d_supplier_qualification
+  - d_supplier_name
+  calendar: month
+  caliber_ref: reports:expense_count
+  status: active
+- metric_id: m_supplier_blacklist_count
+  label: 黑名单供应商数
+  domain: supplier
+  unit: 家
+  agg: count
+  source_table: proc_suppliers
+  expression: COUNT(*) FILTER (WHERE risk_status = '黑名单')
+  time_column: created_at
+  compatible_dims:
+  - d_supplier_category
+  - d_supplier_risk_status
+  - d_supplier_qualification
+  - d_supplier_name
+  calendar: month
+  status: active
+- metric_id: m_supplier_watch_count
+  label: 关注名单供应商数
+  domain: supplier
+  unit: 家
+  agg: count
+  source_table: proc_suppliers
+  expression: COUNT(*) FILTER (WHERE risk_status = '关注')
+  time_column: created_at
+  compatible_dims:
+  - d_supplier_category
+  - d_supplier_risk_status
+  - d_supplier_qualification
+  - d_supplier_name
+  calendar: month
+  status: active
+- metric_id: m_supplier_general_taxpayer_count
+  label: 一般纳税人供应商数
+  domain: supplier
+  unit: 家
+  agg: count
+  source_table: proc_suppliers
+  expression: COUNT(*) FILTER (WHERE qualification = '一般纳税人')
+  time_column: created_at
+  compatible_dims:
+  - d_supplier_category
+  - d_supplier_risk_status
+  - d_supplier_qualification
+  - d_supplier_name
+  calendar: month
+  status: active

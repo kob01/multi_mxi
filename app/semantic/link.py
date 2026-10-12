@@ -5,16 +5,20 @@
 1. **同义词典精确匹配**(score 1.0×weight): 确定性, 能覆盖 80% 的高频问法;
 2. **向量召回**(score 上限 0.8): 处理没登记过的说法("报销花了多少" vs "费用发生额"),
    Ollama 不可用时这一路直接为空 —— 空不等于"没有候选", 精确路的结果仍然有效;
-3. **枚举值反查**(score 0.9): "华北/研发部" 这类值反查它属于哪个维度, 直接生成过滤条件。
-   枚举值靠库反查时**带着调用者作用域查**, 于是部门级角色看到的候选里不会长出
+3. **枚举值反查**(score 0.9 + 热度): "华北/研发部" 这类值反查它属于哪个维度, 直接生成过滤条件。
+   取值优先走语义层的 ``sem_dim_values``(带别名与热度), 没灌时再按调用者作用域从库里 DISTINCT 反查。
+   反查时**带着调用者作用域查**, 于是部门级角色看到的候选里不会长出
    别的部门的名字(那既是一次元数据泄露, 也会诱导模型造出越权的过滤条件)。
 
-融合后仍不够确定就交给澄清门: 本模块**不代替用户做决定**, 只把候选与分数交出去。
+打分除了"命中强度"还乘一个**来由槽位置信度的先验**(见 :func:`_conf_factor`): 同一个说法,
+模型自身就不把它当一个指标(置信 0.4)时, 不应该仍然拿 1.00 去闯澄清门。
+融合权重都列在下面的常量里(而不是写在算式里): 调它们是调召回行为, 应该一眼看到。
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -35,6 +39,13 @@ SCORE_ENUM = 0.9
 VECTOR_CEILING = 0.8
 MAX_ENUM_VALUES = 300
 _ENUM_TTL = 300.0
+# 热度权重与参考上限: log1p 压过"某个部门被问了 5000 次"这种长尾。
+W_POPULARITY = 0.1
+POPULARITY_REF = 100.0
+# 置信度乘进分数的力度(1.0 = 完全按模型自报置信度打折)。实测模型自报置信度
+# 系统性偏低(不确定时它自己会写 0.4), 直接相乘会把"精确命中"也推过澄清阈值,
+# 于是澄清率从"少数真正歧义"变成"大半问题都被反问" —— 那是对用户的另一种错答。
+CONF_DAMPING = 0.5
 
 _LOCK = threading.Lock()
 _ENUM_CACHE: dict[str, tuple[float, list[str]]] = {}
@@ -67,10 +78,18 @@ class Candidate:
             "score": round(float(self.score), 3),
             "channel": self.channel,
             "caliber": self.caliber,
+            # matched 一并给出: 澄清门要判"前两名是不是在争同一个说法"(真歧义)还是
+            # "各自对应同句话里的不同片段"(不是歧义, 追问只是噪声)。
+            "matched": self.matched,
             # time_aware: 这个口径要不要时间区间(年度快照型不需要) —— 澄清门用它
             # 决定"没说时间"算不算缺失, 否则会对快照指标喷一句没意义的追问。
             "time_aware": bool(self.extra.get("time_aware", True)) if self.kind == "metric" else None,
-            **({"value": self.extra.get("value")} if self.kind == "enum" else {}),
+            # unit 跟着候选走: 结果校验要用它判"百分比超出 0~100 / 天数为负"这类形状错,
+            # 而单位是语义层登记的, 不是模型写的。
+            **({"unit": self.extra.get("unit", ""), "domain": self.extra.get("domain", "")}
+               if self.kind == "metric" else {}),
+            **({"value": self.extra.get("value"), "popularity": self.extra.get("popularity", 0)}
+               if self.kind == "enum" else {}),
         }
 
 
@@ -99,6 +118,32 @@ def _norm(value: str) -> str:
     return _SPACE_RE.sub(" ", normalize_text(value or "")).strip().lower()
 
 
+def _conf_factor(conf: Any) -> float:
+    """槽位置信度 -> 分数乘子(带阻尼, 见文件头 CONF_DAMPING 的取舍说明)。
+
+    拿不到置信度时当 1.0: 不能因为上游没传 conf 就把全部候选降档(那会让
+    "链接一个都分不够高"变成默认行为)。
+    """
+    try:
+        value = float(conf)
+    except (TypeError, ValueError):
+        return 1.0
+    if value >= 1.0:
+        return 1.0
+    if value <= 0.0:
+        return 1.0 - CONF_DAMPING
+    return 1.0 - CONF_DAMPING * (1.0 - value)
+
+
+def _popularity_bonus(popularity: Any) -> float:
+    """枚举值热度 -> 加性提频(上限 W_POPULARITY): 同维度多值命中时常用值优先。"""
+    try:
+        value = max(0.0, float(popularity or 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return W_POPULARITY * min(1.0, math.log1p(value) / math.log1p(POPULARITY_REF))
+
+
 def link(
     query: str,
     *,
@@ -106,13 +151,23 @@ def link(
     scope: Any = None,
     top_n: int = 8,
     min_vector_similarity: float | None = None,
+    phrase_conf: dict[str, Any] | None = None,
 ) -> LinkResult:
-    """三路召回收敛成一份候选清单(按分数降序, 同一目标只保留最高分)。"""
+    """三路召回收敛成一份候选清单(按分数降序, 同一目标只保留最高分)。
+
+    ``phrase_conf`` 是①给出的"说法 -> 置信度", 只用来阻尼打分, 不参与是否命中的判断。
+    """
     haystack = _norm(query)
     result = LinkResult()
     if not haystack:
         return result
     fused: dict[tuple[str, str], Candidate] = {}
+    conf_map = {
+        _norm(k): v for k, v in (phrase_conf or {}).items() if isinstance(k, str) and k
+    }
+
+    def _conf_for(phrase: str) -> float:
+        return _conf_factor(conf_map.get(_norm(phrase)))
 
     # ---------------- 路 1: 词典精确匹配(含指标名/维度名/别名) ----------------
     pairs: list[tuple[str, str, str, float]] = []  # (说法, kind, target_id, weight)
@@ -130,7 +185,7 @@ def link(
         needle = _norm(phrase)
         if not needle or len(needle) < 2 or needle not in haystack:
             continue
-        candidate = _build(kind, target_id, catalog, score=SCORE_EXACT * float(weight),
+        candidate = _build(kind, target_id, catalog, score=SCORE_EXACT * float(weight) * _conf_for(phrase),
                           channel="exact", matched=phrase)
         if candidate is None:
             continue
@@ -142,15 +197,20 @@ def link(
     for candidate in vector_candidates:
         _absorb(fused, candidate)
 
-    # ---------------- 路 3: 枚举值反查 ----------------
+    # ---------------- 路 3: 枚举值反查(静态表 + 黑话别名 + 热度) ----------------
     for dim in catalog.active_dimensions:
-        for value in _dim_values(dim, catalog, scope):
-            needle = _norm(value)
-            if len(needle) < 2 or needle not in haystack:
+        for value, aliases, popularity in _dim_value_items(dim, catalog, scope):
+            needles = [_norm(value)] + [_norm(a) for a in aliases]
+            hit = next((n for n in needles if len(n) >= 2 and n in haystack), "")
+            if not hit:
                 continue
+            score = min(1.0, SCORE_ENUM + _popularity_bonus(popularity)) * _conf_factor(
+                conf_map.get(hit)
+            )
             candidate = Candidate(
                 kind="enum", target_id=dim.dim_id, label=dim.label,
-                score=SCORE_ENUM, channel="enum", extra={"value": value},
+                score=score, channel="enum", matched=hit,
+                extra={"value": value, "popularity": int(popularity or 0)},
             )
             _absorb(fused, candidate)
             # 同一个维度命中多个值时保留先命中的(长的说法在前面已排过序)。
@@ -280,10 +340,46 @@ def _embed_query_sync(query: str) -> list[float]:
         return []
 
 
+def _dim_value_items(
+    dim: Dimension, catalog: MetricCatalog, scope: Any
+) -> list[tuple[str, tuple[str, ...], int]]:
+    """ ``(取值, 别名, 热度)`` 清单: 语义层静态表优先, 再叠上按作用域的库内反查。
+
+    两路不互斥: ``sem_dim_values`` 是治理过的黑话与热度(稳定、不依赖取数权限),
+    DISTINCT 反查是当下的真实主数据(部门改名、新供应商当天就能被认出来)。
+    反查失败只意味着少一路召回, 不抹掉静态表里已有的那些。
+    """
+    out: list[tuple[str, tuple[str, ...], int]] = []
+    seen: set[str] = set()
+
+    def _push(value: str, aliases: tuple[str, ...] = (), popularity: int = 0) -> None:
+        key = _norm(value)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append((value, tuple(a for a in aliases if a), int(popularity or 0)))
+
+    for item in dim.dim_values:
+        _push(item.value, item.aliases, item.popularity)
+    for value in dim.enum_values:
+        _push(value)
+    try:
+        for value in _dim_values(dim, catalog, scope):
+            _push(value)
+    except Exception as exc:  # noqa: BLE001 - 静态表已给了一部分, 反查失败不影响那一部分
+        logger.warning("[askdata] 维度 %s 枚举反查异常(只用静态取值): %s", dim.dim_id, exc)
+    return out
+
+
 def _dim_values(dim: Dimension, catalog: MetricCatalog, scope: Any) -> list[str]:
-    """维度的取值清单: 静态枚举直接用, 动态枚举按调用者作用域反查(带 TTL 缓存)。"""
-    if dim.enum_values:
-        return list(dim.enum_values)
+    """维度的动态取值: 按 ``enum_source`` 判而不是按"有没有静态值"判。
+
+    为什么这件事得单看 enum_source: 静态表/兜底集里可能带着一个主数据型维度的几个
+    样本值(部门改名前的旧名字), 拿"它有静态值"当理由不反查, 新成立的部门就再也认不出来。
+    只有明写着 static 的维度才不反查(它就是写死的枚举, 库里也不会有更多)。
+    """
+    if (dim.enum_source or "static").startswith("static"):
+        return []
     if not dim.source_table or not dim.column:
         return []
     dept_scope = dim.dim_id + "|" + _scope_key(scope)

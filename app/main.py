@@ -18,9 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.assistant.router import router as assistant_router
@@ -262,6 +262,10 @@ async def lifespan(app: FastAPI):
     shutdown_audit()
     # Langfuse 上报是批量异步队列: 关停前 flush, 否则最后几轮对话的 trace 丢在内存里。
     shutdown_langfuse()
+    # OTel 同理( BatchSpanProcessor 自己攒批): 没启用就是空操作。
+    from app.observability import otel as askdata_otel
+
+    askdata_otel.flush()
 
 
 def create_app() -> FastAPI:
@@ -288,6 +292,25 @@ def create_app() -> FastAPI:
     # 智能问数的治理面(看板/反馈/badcase/评测集/语义层快照): 与 askdata MCP server
     # 共用 app/askdata/store.py 一份 DAO, 区别只在于这里面向页面与运维, 不由模型驱动。
     app.include_router(askdata_router)
+
+    # Prometheus 拉取面(方案 §7 可观测): 只读聚合, 无业务数据。放在 SPA 回退之前注册,
+    # 否则会被全捕获的路由抢掉。
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(request: Request, days: int = 7) -> PlainTextResponse:
+        """问数指标(Prometheus 文本格式); ``METRICS_TOKEN`` 非空时需带头或 ?token=。"""
+        settings = get_settings()
+        if not settings.metrics_enabled:
+            raise HTTPException(status_code=404, detail="metrics 未启用")
+        required = (settings.metrics_token or "").strip()
+        if required:
+            given = request.headers.get("x-metrics-token") or request.query_params.get("token") or ""
+            if given != required:
+                raise HTTPException(status_code=403, detail="metrics 口令不对")
+        from app.observability import metrics as askdata_metrics
+        from starlette.concurrency import run_in_threadpool
+
+        body = await run_in_threadpool(askdata_metrics.render, days=max(1, min(90, days)))
+        return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
     # --- Vue3 SPA 托管: 仅当存在构建产物(生产/打包)时才启用 ---
     # 开发期不跑 pnpm build, web/dist 可能不存在: 旧的写法无条件回退 index.html,

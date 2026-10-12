@@ -1,0 +1,15 @@
+# 智能问数语义层真值(由 scripts/export_semantic_defs.py 生成/维护)
+# 改这里 = 改口径: 必须走 scripts/sync_semantic_defs.py 同步进库并留版本记录。
+time_semantics:
+- cal_type: natural
+  week_start: 1
+  fiscal_year_start_month: 1
+  compare_base_rule: same_calendar_day
+  timezone: Asia/Shanghai
+  description: 自然年/自然月; 同比对齐同一日历日
+- cal_type: fiscal
+  week_start: 1
+  fiscal_year_start_month: 1
+  compare_base_rule: same_calendar_day
+  timezone: Asia/Shanghai
+  description: 财年口径(本部署与自然年一致; 预算年度切换时改这一条)

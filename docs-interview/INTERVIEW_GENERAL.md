@@ -55,8 +55,6 @@
 逐字稿：
 这是"默认行为反过来咬你"的典型案例。asyncpg 在不显式传 `ssl` 时可能自己做 TLS 协商，遇到自签证书的内网 PG 实例就会连不上，而且报错信息不指向 SSL。修复是**显式传** `ssl=settings.pg_sslmode`（`disable`/`require`），并把 `timeout`、`server_settings={"application_name": ...}` 一起走 `connect_args`——`application_name` 很实用，PG 侧 `pg_stat_activity` 里能一眼区分是网关、迁移脚本还是评测进程。
 
-顺带一条通用教训：历史注释里写过"MySQL/Milvus"、写过"knowledge_chunks 表"，代码跑得好好的但注释是错的——**数据库版本/方言这类声明不可信，必须运行时验证**（`SELECT version()`、`extversion`）。我在 `init_db` 和启动日志里都打印实际版本与对接地址快照，就是为了让"注释说什么"不重要。
-
 ### Q6. upsert / 批量写有什么方言坑？
 
 逐字稿：

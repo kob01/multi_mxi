@@ -1,18 +1,21 @@
 """Knowledge ingestion pipeline (父子双表 + 正文外置)。
 
-Stages: parse into section-level blocks -> normalize -> build structure ->
-parent/child split -> (parent full text -> Mongo) -> embed changed children ->
-single-transaction publish into ``doc_parents``/``doc_chunks`` -> BM25 rebuild.
+同步入口(脚本用)的 Stages: parse into section-level blocks -> normalize ->
+build structure -> parent/child split -> (parent full text -> Mongo) -> embed changed
+children -> single-transaction publish into ``doc_parents``/``doc_chunks``。陈旧行只标记,
+真删交后台 GC。HTTP 入库链路不再走这里的 ``ingest_file``, 而是走
+``app/docs/pipeline.py`` 的阶段函数(两边复用同一批纯计算函数), 目的是让解析产物可复用、
+重活不进请求线程。
 
 Document identity: ``doc_id = sha1(file_name + ext)`` — path-independent, so
-re-uploading the same name+type overwrites the previous copy (single-version
-semantics, no version column).
+re-uploading the same name+type overwrites the previous copy (单版本覆盖语义,
+无版本列; 新旧交接靠发布事务里的 ``deprecated_at`` 标记同瞬完成)。
 
 expand-then-contract(顺序不得违背, 见方案 2.3/2.6):
 1. 父块全文先写 Mongo(不删旧) —— PG 可见的行一定能取到正文;
 2. 只对 content_hash 变化的子块 embed(embedding 走 Ollama, 是最慢一环);
-3. PG 单事务发布父子块 + 陈旧剪除;
-4. 收缩: 删掉 PG 不再引用的父块 Mongo 正文。
+3. PG 单事务发布父子块 + 把不再引用的行标陈旧(不再主链路物理 DELETE);
+4. 收缩(清掉 PG 不再引用的父块 Mongo 正文)移出主链路, 由后台 GC 按现行引用回收。
 """
 
 from __future__ import annotations
@@ -248,7 +251,10 @@ async def ingest_blocks(
     bodies=None,
     normalized_text: str | None = None,
 ) -> int:
-    """expand-then-contract 发布一篇文档的父子块; 返回写入的子块数。"""
+    """expand-then-contract 发布一篇文档的父子块; 返回写入的子块数。
+
+    ``parent_store`` 参数已无用(父子发布在同一个 PG 事务里), 保留只为不破已有调用点。
+    """
     parent_store = parent_store or ParentStore()
     bodies = bodies or get_body_store()
     raw = "\n\n".join(b.text for b in blocks)
@@ -286,11 +292,12 @@ async def ingest_blocks(
                     len(set(changed_ids) | {c.chunk_id for c in need}), len(children), doc_id)
     vectors = [vectors_map[c.chunk_id] for c in children]
 
-    # 3) PG 单事务: 父块 + 子块 upsert + 陈旧剪除。
-    written = await store.publish_parent_child(parent_store, doc_id, parents, children, vectors)
+    # 3) PG 单事务: 父块 + 子块 upsert + 陈旧标记(不物理删, 主链路不留长事务 DELETE)。
+    written, _marked = await store.publish_and_mark(doc_id, parents, children, vectors)
 
-    # 4) contract: 清掉 PG 不再引用的父块 Mongo 正文。
-    await bodies.delete_stale_parents(doc_id, {p.parent_id for p in parents})
+    # 4) 收缩步已移出主链路: "PG 不再引用的父块正文"由后台 GC 按现行引用回收
+    #    (app/docs/pipeline.py::prune_stale_bodies), 不在入库链路里跑 delete_stale_parents
+    #    —— 那会在发布后立即做一轮全量比对删除, 把本可异步的工体接在了最慢一环后面。
     return written
 
 

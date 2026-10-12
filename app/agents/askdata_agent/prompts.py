@@ -22,6 +22,9 @@ SLOT_PROMPT = """你在为"智能问数"抽取查询槽位。用户看到的是�
 上一轮已确定的槽位(用于补全省略与指代, 可能是空):
 {prior_slots}
 
+上一轮最终定下来的查询意图(指标 id/维度/时间/已确定的限定, 可能是空):
+{prior_dsl}
+
 只输出一个 JSON 对象, 字段与含义如下(全部是**用户自己的说法**, 不要编造指标编号):
 {{
   "metric_terms": ["用户想看的指标说法, 如 报销花了多少 / 高风险合同数"],
@@ -47,12 +50,15 @@ SLOT_PROMPT = """你在为"智能问数"抽取查询槽位。用户看到的是�
 4. 环比=mom(与上一周期比), 同比=yoy(与去年同期比); 说不清就 none。
 5. "归因/预测"只有当用户明确在问"为什么/会怎么变"时才用, 否则一律"取数"。
 6. confidence 是你对自己抽出内容的把握(0~1), 不是数据质量。
+7. 上面那份"上一轮查询意图"是指代消解的依据: 用户说"换成按部门看/只看已打款的", 就把上一轮
+   对应的部分带过来并只改他提到那一项; 他没说改的口径不要自己换。
 只输出 JSON。"""
 
 
 def dsl_prompt(*, question: str, slots: str, candidates: str, schema_hint: str,
-               enum_filters: str, error_hint: str) -> str:
-    """DSL 生成提示词(含当前语义层可用集, 由快照实时渲染, 不与校验器漂移)。"""
+               enum_filters: str, error_hint: str, examples: str = "(无)",
+               prior_dsl: str = "(无)") -> str:
+    """DSL 生成提示词(含当前语义层可用集 + golden 相似问法 few-shot, 由快照实时渲染)。"""
     tail = f"\n\n上一次尝试被拒, 拒因: {error_hint}\n请只修正被拒的部分, 不要改动用户已经明确的口径。" if error_hint else ""
     return f"""把下面这份"问数槽位"编成受约束的查询 DSL(JSON), 只输出 JSON。
 
@@ -68,6 +74,13 @@ def dsl_prompt(*, question: str, slots: str, candidates: str, schema_hint: str,
 枚举值反查已确定的过滤条件(可直接采用):
 {enum_filters}
 
+上一轮已确定的查询意图(只有本轮是省略/指代时才沿用它, 否则以本轮为准):
+{prior_dsl}
+
+相似问法的真实例子(来自已标注的评测集; 只拿它们当"这类说法对应哪个口径"的参考,
+**不要把它们的 limit/order_by 当成本轮的默认值**, 本轮的口径与时间以上面的槽位与候选为准):
+{examples}
+
 {schema_hint}
 
 硬性规则:
@@ -81,6 +94,14 @@ def dsl_prompt(*, question: str, slots: str, candidates: str, schema_hint: str,
 6. time.granularity 只在用户明说"趋势/按月/按天/各月/逐周"这类意思时才填; 问"是多少"
    就是**一个聚合值**, 把 granularity 留空(画蛇添足地按年拆开会让用户拿到一张表而不是一个数)。
 7. "归因/预测"类问题本期不支持自动算: 把它按"取数"编出用户真正要的那个数, 不要虚构预测值。
+8. 上面相似例子只是口径参考: 它们用的指标 id 如果没出现在本轮候选里, 就不能用。
+9. **指标名里已经含的限定不要重复写成 filters**: 比如"一般纳税人供应商数"这个口径本身已包含
+   qualification='一般纳税人', 再写一个同样的过滤会让那些计数本应为 0 的类别从结果里消失
+   (用户看到的表就少了几行)。只有用户另外限定了不同取值时才加 filter。
+10. 用户一次提到**多个指标**时("预算总额和已用金额"), metrics 里就写几个(最多 4 个);
+    只选其中一个就是错答, 不要因为"先回答一个"而替用户做主。
+11. "最高的 N 个/前 N 名"是 topN: 必须同时给出 order_by(主指标 desc) 与 limit=N;
+    只下钻不排序拿回默认前 20 行不算回答了这个问题。
 只输出 JSON 对象。{tail}"""
 
 
@@ -101,6 +122,7 @@ NARRATOR_PROMPT = """下面是智能问数已经算好的结果, 请写成给人
 4. 最多 3 句。数据行数少就直说, 不要编趋势; 结果为空就明确说"这个范围内没有数据", 并给出可以放宽的方向。
 5. 不要复述整张表。
 6. {notice}
+7. {suspect}
 """.replace("{notice}", NOTICE_TEXT)
 
 
@@ -127,11 +149,20 @@ REFUSE_TEXT = (
 CLARIFY_LEAD = "我可能对应到多个口径, 为了不给你错的数, 请确认一下:"
 
 
-def chart_hint(column_count: int, has_period: bool, row_count: int) -> str:
+def chart_hint(
+    column_count: int, has_period: bool, row_count: int,
+    *, has_compare: bool = False, metric_count: int = 1,
+) -> str:
     """可视化规则引擎(结果 shape -> 图型), LLM 不参与选型。
 
     为什么是规则而不是模型: 图表选型是"数据形状"的确定性函数, 交给模型只会带来
     同样的数据今天出柱图明天出饼图 —— 而图型选错会直接改变可读性(时序画饼图)。
+
+    分支顺序就是可读性优先级: 时序 > 同环比分组柱 > **二维交叉热力图** > 单值 > 低基数占比 > 类目对比。
+    两个维度的情形由 graph 里的 `_chart_shape` 把第二个维度转成系列, 拿到的仍是"一维 + 多系列";
+    但图型不同: 交叉表要看的"哪个格子最热", 拿分组柱画到 6 列以上就看不出趋势。
+    ``metric_count`` 目前不参与选型(多指标时多系列走分组柱), 留着是为了让规则表与
+    方案里的判定维度一一对应, 调它时不需要重新推形状。
     """
     if row_count == 0:
         return "none"
@@ -139,6 +170,12 @@ def chart_hint(column_count: int, has_period: bool, row_count: int) -> str:
         return "line" if row_count > 1 else "none"
     if column_count <= 1 and row_count == 1:
         return "none"          # 单个数字: 画什么图都是装饰
+    if has_compare:
+        # 同环比必须是分组柱(当期/上期两根靠在一起才能看出长短), 不能退成饼图。
+        return "bar"
+    if column_count >= 2 and row_count > 1:
+        # 两个维度交叉 = 热力图(行=第二维, 列=第一维)。
+        return "heatmap"
     if row_count <= 8 and column_count <= 2:
         return "pie"
     return "bar"

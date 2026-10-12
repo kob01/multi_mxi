@@ -38,18 +38,29 @@ _CODE_TO_CATEGORY = {
     "E_TIME_INVALID": "intent",
     "E_ENUM_INVALID": "link",
     "E_NO_PERMISSION": "exec",
+    "E_COL_POLICY": "exec",
     "E_ROWS_CAP": "exec",
     "E_COMPILE": "exec",
+    "E_ENGINE": "exec",
+    "E_ENGINE_BREAKER": "exec",
+    "E_BUDGET": "exec",
+    "E_SERVICE": "exec",
+    "E_VERIFY": "exec",
+    "E_LINK": "link",
 }
 
 
 def attribute(row: dict[str, Any]) -> tuple[str, str]:
     """由留痕推出 ``(类别, 处置)``。
 
-    判定顺序是**从最确定的证据到最弱的信号**: 有错误码就按码, 没码看 verdict,
-    最后才看候选分数分布。反过来先猜"看着像链接错"会把 DSL 的结构性错误
-    误归到补词上, 那才是真正让人找不到根因的漂移。
+    判定顺序是**从最确定的证据到最弱的信号**: 先看用户改了什么(edit_dsl 的 diff 是
+    直证), 再按错误码, 没码看 verdict, 最后才看候选分数分布。反过来先猜"看着像链接错"
+    会把 DSL 的结构性错误误归到补词上, 那才是真正让人找不到根因的漂移。
     """
+    diff = dsl_diff(row.get("dsl_json"), row.get("corrected_dsl") or row.get("corrected"))
+    if diff:
+        category = _category_of_diff(diff)
+        return category, _disposition(category, row)
     codes = _as_list(row.get("error_codes"))
     verdict = str(row.get("verdict") or "").lower()
     route = str(row.get("route") or "").lower()
@@ -60,6 +71,9 @@ def attribute(row: dict[str, Any]) -> tuple[str, str]:
         category = _CODE_TO_CATEGORY.get(str(code))
         if category:
             return category, _disposition(category, row)
+    if str(row.get("feedback") or "").lower() == "rewritten":
+        # 用户改了问法而不是改口径: 说存"这句话我没听懂"(①/②), 不是 DSL 错。
+        return "intent", _disposition("intent", row)
     if verdict == "clarify":
         return "link", _disposition("link", row)
     if verdict in ("denied", "fail"):
@@ -72,6 +86,86 @@ def attribute(row: dict[str, Any]) -> tuple[str, str]:
     if scores and scores[0] <= 0:
         return "intent", _disposition("intent", row)
     return "render", _disposition("render", row)
+
+
+def dsl_diff(was: Any, now: Any) -> dict[str, tuple[Any, Any]]:
+    """比较"当时 DSL"与"用户改成后的 DSL", 输出变了哪几个顶层字段。
+
+    这是整条归因链上信息量最大的一个信号: 用户把 ``metrics[0].id`` 改了就是选错了口径(link/dsl),
+    把 ``time`` 改了就是理解错了时间(intent), 把 ``filters`` 改了就是枚举/限定问题。
+    拿不到 dict 形状(草案里只有 raw 文本)时返回空: 宁可不归因, 也不要猜一个分错的对象。
+    """
+    was_map = _flatten_dsl(was)
+    now_map = _flatten_dsl(now)
+    if not was_map or not now_map:
+        return {}
+    out: dict[str, tuple[Any, Any]] = {}
+    for key in sorted(set(was_map) | set(now_map)):
+        left, right = was_map.get(key), now_map.get(key)
+        if left != right:
+            out[key] = (left, right)
+    return out
+
+
+def _flatten_dsl(value: Any) -> dict[str, Any]:
+    import json
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict) or not value.get("metrics"):
+        return {}
+    out: dict[str, Any] = {}
+    for index, item in enumerate(value.get("metrics") or []):
+        if isinstance(item, dict):
+            out[f"metrics[{index}].id"] = item.get("id")
+            if item.get("agg"):
+                out[f"metrics[{index}].agg"] = item.get("agg")
+    for index, item in enumerate(value.get("dims") or []):
+        out[f"dims[{index}]"] = item
+    time_block = value.get("time") or {}
+    for key in ("range", "granularity", "start", "end"):
+        if time_block.get(key):
+            out[f"time.{key}"] = time_block[key]
+    for index, item in enumerate(value.get("filters") or []):
+        if isinstance(item, dict):
+            out[f"filters[{index}].dim"] = item.get("dim")
+            out[f"filters[{index}].op"] = item.get("op")
+            out[f"filters[{index}].value"] = item.get("value")
+    compare = value.get("compare") or {}
+    out["compare.type"] = compare.get("type") if isinstance(compare, dict) else compare
+    if value.get("order_by"):
+        out["order_by"] = value["order_by"]
+    if value.get("limit"):
+        out["limit"] = value["limit"]
+    return out
+
+
+# 哪些字段变了 -> 责任落在哪一段(与模块③的字段表一致)。
+_DIFF_TO_CATEGORY = {
+    "metrics": "link",      # 选错口径: 链接或候选问题
+    "dims": "dsl",          # 该不该下钻是 DSL 结构决策
+    "filters": "link",      # 枚举/限定没对上
+    "time": "intent",       # 时间理解错
+    "compare": "dsl",
+    "order_by": "render",   # 只要了排序差异: 不影响数, 影响呈现
+    "limit": "render",
+}
+# 优先级而不是字母序: 用户同时改了"口径 + 时间"时, 先归到口径 —— 否则一次改写会被
+# 归成一个次要字段的问题, 处置(补词)就永远提不出来。
+_DIFF_PRIORITY = ("metrics", "filters", "dims", "time", "compare", "order_by", "limit")
+
+
+def _category_of_diff(diff: dict[str, tuple[Any, Any]]) -> str:
+    heads = {key.split("[")[0].split(".")[0] for key in diff}
+    for head in _DIFF_PRIORITY:
+        if head in heads:
+            category = _DIFF_TO_CATEGORY.get(head)
+            if category:
+                return category
+    return "dsl"
 
 
 def _disposition(category: str, row: dict[str, Any]) -> str:
@@ -111,8 +205,106 @@ def apply_disposition(
         )
         if out.get("status") == "ok":
             result["written"] = f"askdata_golden:draft:{out['case_id']}"
+        result["sample"] = _maybe_sample(row, category=category, corrected=corrected_dsl)
         return result
+    result["sample"] = _maybe_sample(row, category=category, corrected=corrected_dsl)
     return result
+
+
+def _maybe_sample(row: dict[str, Any], *, category: str, corrected: Any = None) -> dict[str, Any]:
+    """把这一轮写成 SFT/DPO 候选(先 draft, 且诚实记两道门禁)。
+
+    只有 intent/dsl 两类产生样本: link 的正确处置是补词, exec 是权限/成本, render 是规则引擎 ——
+    它们都不是"模型应该学会这个映射"的材料, 拿它们训练等于把口径问题当语言问题治。
+    """
+    from app.askdata import store
+
+    if category not in store.TRAINABLE_CATEGORIES:
+        return {"skipped": f"类别 {category} 不是训练材料"}
+    question = str(row.get("question") or "").strip()
+    if not question:
+        return {"skipped": "缺原话"}
+    verdict = str(row.get("verdict") or "").lower()
+    feedback = str(row.get("feedback") or "").lower()
+    own_dsl = _as_dict_value(row.get("dsl_json"))
+    if corrected:
+        # dpo: 用户给出的那一版是 chosen, 模型当时的是 rejected
+        chosen = _as_dict_value(corrected)
+        rejected = own_dsl
+        kind = "dpo"
+        confirmed = True
+    elif feedback == "up" and verdict == "ok":
+        chosen, rejected, kind, confirmed = own_dsl, None, "sft", True
+    else:
+        return {"skipped": "既无用户确认也无肯定反馈"}
+    validated = _dsl_is_executable(chosen) if kind == "dpo" else (verdict == "ok" and bool(own_dsl))
+    out = store.record_sample(
+        kind=kind, question=question, chosen=chosen, rejected=rejected,
+        slots=_as_dict_value(row.get("slots_json")),
+        query_id=str(row.get("query_id") or ""), trace_id=str(row.get("trace_id") or ""),
+        user_id=str(row.get("user_id") or ""), role=str(row.get("role") or ""),
+        semver=str(row.get("semver") or ""), category=category,
+        gate_validated=bool(validated), gate_confirmed=bool(confirmed),
+        note=f"归因路由自动产生(category={category})",
+    )
+    return out
+
+
+def _as_dict_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _dsl_is_executable(dsl: Any) -> bool:
+    """这份 DSL 能不能过校验器并编成 SQL(dpo 的 chosen 必须真能跑)。
+
+    为什么能在网关做: 校验与编译都只需要语义层快照, 不碰业务数据也不代用户执行 SQL;
+    拿"看起来对"的 DSL 当 chosen 去训模型, 比不训更坏。
+    """
+    try:
+        from app.config import get_settings
+        from app.semantic import compiler, registry
+        from app.semantic.dsl import parse_dsl
+        from app.semantic.validate import CallerScope, validate
+
+        settings = get_settings()
+        spec = parse_dsl(dsl)
+        catalog = registry.get_catalog()
+        # 校验用 CallerScope(它的契约), 编译用完整 DataScope(它负责注入域谓词) ——
+        # 两个形状不能拿一个对象充, 否则 `not caller.all_depts` 会把方法当假值判。
+        check = validate(spec, catalog=catalog, scope=CallerScope(role="probe"), today=None,
+                         max_rows=settings.askdata_max_rows,
+                         max_time_span_days=settings.askdata_max_time_span_days)
+        if not check.ok:
+            return False
+        compiler.compile_analytical(spec, catalog=catalog,
+                                    scope=_probe_scope(), check=check,
+                                    max_rows=settings.askdata_max_rows)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 编不出就是不该进训练集
+        logger.debug("[askdata] chosen DSL 不可执行(不进样本): %s", str(exc)[:160])
+        return False
+
+
+def _probe_scope():
+    """构造一个真实的 `DataScope`(只用于编译期拼谓词, 本函数不执行任何 SQL)。
+
+    为什么自己手一个形状而不是复用一个人的作用域: 把"能不能编译"与"谁能看到哪些行"
+    混在一处, 日后有人改成真实身份时这道门会默默变化。
+    """
+    from app.db.scope import DataScope
+
+    return DataScope(tenant_id="__probe__", dept_ids=("__probe__",), all_depts=False,
+                     user_id="__probe__", role="probe", department="(编译探测)")
 
 
 def _pick_term(row: dict[str, Any]) -> tuple[str, str]:

@@ -36,12 +36,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _bsize(text: str) -> int:
+def byte_size(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
-def _split_text(text: str, cap_bytes: int) -> list[str]:
-    """把超长文本按 UTF-8 字节上限切成片, 只在字符边界断, 不产生半个多字节字符。"""
+def split_text(text: str, cap_bytes: int) -> list[str]:
+    """把超长文本按 UTF-8 字节上限切成片, 只在字符边界断, 不产生半个多字节字符。
+
+    公共函数(旧名 ``_split_text``): 整篇正文溢出与解析产物的 raw 溢出共用同一套
+    切分/拼回口径 —— 两边不一致会让"写进去分片、读回来少一截"这种错难查到。
+    """
     if not text:
         return []
     parts: list[str] = []
@@ -107,8 +111,8 @@ class BodyStore:
         # head 始终内联(建图只用开头, 常态无需拼分片)
         head = normalized[:8192]
 
-        norm_parts = _split_text(normalized, cap) if _bsize(normalized) > cap else []
-        raw_parts = _split_text(raw, cap) if _bsize(raw) > cap else []
+        norm_parts = split_text(normalized, cap) if byte_size(normalized) > cap else []
+        raw_parts = split_text(raw, cap) if byte_size(raw) > cap else []
 
         doc = {
             "_id": doc_key,

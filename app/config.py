@@ -19,6 +19,8 @@ _SECRET_FILES = {
     "mongo_password": "/run/secrets/mongo_password",
     "tavily_api_key": "/run/secrets/tavily_api_key",
     "serper_api_key": "/run/secrets/serper_api_key",
+    # /metrics 的拉取口令也是凭据(它能拉出流量与口径版本), 同样只允许住 secret 文件。
+    "metrics_token": "/run/secrets/metrics_token",
 }
 _SECRET_HOST_FALLBACK = {
     "pg_password": "docker/secrets/pg_password.txt",
@@ -29,6 +31,7 @@ _SECRET_HOST_FALLBACK = {
     "mongo_password": "docker/secrets/mongo_password.txt",
     "tavily_api_key": "docker/secrets/tavily_api_key.txt",
     "serper_api_key": "docker/secrets/serper_api_key.txt",
+    "metrics_token": "docker/secrets/metrics_token.txt",
 }
 
 # LLM 供应商注册表默认值(单一事实源): dotenv 的 LLM_PROVIDERS_JSON 可整体覆盖,
@@ -342,6 +345,61 @@ class Settings(BaseSettings):
     askdata_link_min_similarity: float = 0.62
     # 问数取数的语句超时(毫秒): 比写通道宽、比默认紧 —— 问数是人在等的。
     askdata_statement_timeout_ms: int = 8000
+    # ---------- 语义层真值(YAML = source of truth) ----------
+    # 定义的可 review 那一份: 相对路径按仓根解析。目录不存在时灌入退内置种子(记日志)。
+    semantic_defs_dir: str = "semantic-defs"
+    # ---------- V1→V3 对齐新增项 ----------
+    # 校验失败后回炉重写 DSL 的次数上限(方案要 ≤2; 再多就是在跟模型赌运气)。
+    askdata_validate_max_rewrites: int = 2
+    # 单轮预算熔断: 超 token 或超墙钟就降级(FALLBACK)而不是继续烧。
+    # token 上限对应当前默认模型一轮问数(四段 prompt)的 4~5 倍余量。
+    askdata_budget_max_tokens: int = 6000
+    askdata_budget_max_latency_ms: int = 25000
+    # dynamic few-shot: 从 golden 集检索几条相似问法注入 DSL 生成 prompt(0 = 关掉)。
+    # 为什么值得多花 token: 静态 schema hint 只能告"形状", 同义问法的真实例子才能告"选哪个口径"。
+    askdata_few_shot_cases: int = 3
+    # 澄清门的"前两名分差"阈值: 分差小于它就追问(方案要 0.10; 以前写死 0.08)。
+    askdata_clarify_gap: float = 0.10
+    # 结果缓存(按方案): key = normalize(DSL)+route+工号+角色+作用域+semver。为什么不拿 NL 做 key:
+    # 自然语言同义写法太多, 拿它做键就是把"算错的缓存"贴在一个新问题上反复复用。
+    # 为什么不只要角色: 同为 manager 的两个人可见行集不同, 不含工号/作用域就是一次跨部门泄露。
+    askdata_result_cache_enabled: bool = True
+    askdata_result_cache_ttl: int = 300
+    # 语义缓存(V3): 新问法与 golden 已标注问法相似度≥阈值且 semver 同版时, 直接复用它的 DSL。
+    # 复用的是**意图**而不是数据: 校验/编译/RLS/审计/结果缓存一步不少, 因此它能安全地
+    # 省掉两次 LLM 调用(槽位抽取 + DSL 生成), 也是 P95 下降的主要手段。
+    askdata_semantic_cache_enabled: bool = True
+    # 低于这个相似度宁可走完整链路: 拿一个"听起来像"的口径出数正是方案里最禁的行为。
+    askdata_semantic_cache_min_similarity: float = 0.95
+    # SFT/DPO 样本队列门禁: 只允许"过校验器且用户确认过"的轮次导出成训练样本(方案 §4⑥)。
+    # 关掉它不会报错, 但会把没验过的 DSL 当成"正确答案"喂给下一轮微调。
+    askdata_sample_gate_strict: bool = True
+    # 问数结构化日志推 Loki(空=不推; 开了 observe profile 后填 http://otel-lgtm:3100/.../push)
+    loki_url: str = ""
+    loki_timeout_ms: int = 1500
+    # 结果量级校验的历史基线 z-score: 超过这个倍数就标"数据存疑"(只标注不拦下)。
+    askdata_baseline_zscore: float = 3.0
+    # 引擎连续错误熔断: 同一张表在窗口内连错 N 次就短路这一级(不再每轮撞同一颗雷)。
+    askdata_engine_breaker_threshold: int = 3
+    askdata_engine_breaker_ttl: int = 60
+    # 评测集规模下限(低于它报告里标"样本不足, 分层结论不可信", 不阻断运行)。
+    askdata_golden_min_cases: int = 500
+    # CI 门禁: EX 比上一同模式 run 降幅超过这个百分点就退码非 0(0 = 关掉门禁)。
+    askdata_eval_gate_max_drop: float = 2.0
+    # 告警线阈值(都是百分数, 与 store.stats 同一口径): 越线就在 /metrics 上置 1。
+    askdata_alert_fail_rate: float = 15.0        # 执行/权限错误率上限
+    askdata_alert_degrade_rate: float = 20.0     # 降级到沙箱/repair 的比例上限
+    askdata_alert_p95_ms: int = 12000            # P95 延迟上限(比单轮预算紧, 体验先坏)
+    # OTel 链路导出(默认关: 开了要指一个真存在的 collector, 否则只是日志里多一行降级)。
+    askdata_otel_enabled: bool = False
+    otel_endpoint: str = ""           # 如 http://otel-collector:4318/v1/traces
+    otel_service_name: str = "mxi-askdata"
+    # /metrics 端点(Prometheus 拉取): 只暴露计数器与延迟汇总, 不暴露任何业务数据。
+    metrics_enabled: bool = True
+    # 拉取口令: 非空时 /metrics 必须带 `X-Metrics-Token` 头或 `?token=` 才给数据。
+    # 默认空 = 不校验(与本仓 /api/health 同一姿态); 公网部署请置上 —— 它是流量与
+    # 口径版本的信息面, 不是业务数据但也不该人人可拉。
+    metrics_token: str = Field(default="", repr=False)
     # 结果出口 DLP 列黑名单(逗号分隔列名): 命中列返回前打码。
     dlp_mask_columns: str = "bank_account,phone,id_card,email,id_no"
     # bge-m3 稠密向量维度; 换 embedding 模型必须同步改这里并全量重建向量表。
@@ -389,6 +447,42 @@ class Settings(BaseSettings):
     # Parent-child chunking: a section block larger than this is window-split
     # into child chunks; smaller blocks stay a single child under the parent.
     parent_chunk_max: int = 1200
+
+    # ---------- 入库流水线: 异步任务 + outbox + Redis Streams worker ----------
+    # 解析/OCR/LLM tags/embedding 都是分钟级重活, 不放在 HTTP 同步链路里;
+    # PG 任务表是认领与恢复的事实源, Redis Streams 只做低延迟 handoff。
+    # 解析器/切块行为一改必须递增 PARSER_VERSION(与 NORMALIZER_VERSION 同等待遇,
+    # 见 CONFIG_RULES.md): artifact 与已入库块都靠它判定"能不能复用"。
+    parser_version: str = "p1"
+    # 紧急回退闸: false 时 POST /ingest 在请求内顺序跑完四个阶段(不建任务不靠 worker)。
+    # 只用于排障与 worker 未部署的环内启动 —— 两条路径跑的是同一批阶段函数。
+    ingest_async_enabled: bool = True
+    ingest_stream_key: str = "mxi:stream:ingest"
+    ingest_stream_group: str = "mxi-ingest"
+    # 单 worker 并发跑的任务数: embed 走 Ollama、OCR 走 MinerU, 两者都是慢服务,
+    # 开大了只是把排队从本进程推到下游并撞它们的超时。
+    ingest_worker_concurrency: int = 2
+    # 一次认领拉取的任务数 + 每轮从 PG 补扫多少个无主任务。
+    ingest_claim_batch: int = 4
+    ingest_db_poll_seconds: int = 5
+    # 租约时长: 必须大于一阶段的最坏耗时(扫描 PDF 逐页 OCR 可以到几分钟)。
+    # 太短会出现"任务还在跑就被回收器抢走 → 同一篇文档两个 worker 同时在写块表"。
+    ingest_task_lease_seconds: int = 900
+    ingest_task_max_attempts: int = 3
+    # 租约过期扫描与重试间隔(同一 worker 内的定时器)。
+    ingest_reap_interval_seconds: int = 60
+    # 陈旧块的物理删除间隔与宽限期: 宽限期给正在跑的检索留出收敛时间,
+    # 也保证"刚刚标陈旧但投影还没做"的行不会被抢删。
+    ingest_gc_interval_seconds: int = 300
+    ingest_stale_grace_minutes: int = 30
+    ingest_gc_batch_rows: int = 2000
+    # outbox relay: 每轮拉多少条待发事件、失败重试上限与退避上限。
+    outbox_relay_interval_seconds: float = 1.0
+    outbox_poll_batch: int = 200
+    outbox_max_attempts: int = 8
+    # 上传文件与解析产物的保留时长: 到期由调度器删临时体 + artifact + 置 expired;
+    # 已入库文档不依赖它(正文已进 Mongo, 原件仅供重入库/排障)。
+    upload_retention_hours: int = 72
 
     # Assistant service
     assistant_host: str = "0.0.0.0"

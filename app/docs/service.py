@@ -1,29 +1,46 @@
-"""Document upload / ingestion / metadata service layer."""
+"""Document upload / ingestion / metadata service layer.
+
+异步入库下的分工(与 app/docs/pipeline.py 分界):
+- 本模块只处理"提交 + 查询 + 事实源事务": 落盘、建上传行、建任务、改权限/删文档,
+  以及同事务写 outbox 事件;
+- 重活(OCR/解析/LLM tags/embedding/发布/ES/KG)全部在 pipeline 的阶段函数里, 由
+  worker 跑(网关只在 ``ingest_async_enabled=false`` 的排障路径上进它们)。
+因此这里不允许再出现"在请求里循环处理整篇文档"的代码。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
-from app.bodies.store import get_body_store
-from app.db.models import DocChunkRow, DocParentRow, Document, DocumentTag, Tag
+from app.db.models import (
+    DocUpload,
+    Document,
+    DocumentTag,
+    IngestTask,
+    Tag,
+)
 from app.db.session import get_session_factory
-from app.docs.normalize import normalize_text
-from app.docs.parsers import modality_of, parse_blocks, supported_extensions
-from app.rag.embeddings import OllamaEmbedder
-from app.rag.ingest import build_structure, compute_doc_id, ingest_blocks
-from app.rag.vectorstore import ChunkStore, ParentStore
+from app.docs import pipeline
+from app.docs.artifacts import get_artifact_store
+from app.docs.parsers import supported_extensions
+from app.rag.ingest import compute_doc_id
+from app.rag.vectorstore import ChunkStore
 from app.schemas import DocVisibility
 from app.security.acl import (
     Principal,
@@ -34,8 +51,8 @@ from app.security.acl import (
 
 logger = logging.getLogger(__name__)
 
-# 后台图谱构建任务的强引用: asyncio 只弱引用 task, 不持引用会被 GC 掉。
-_kg_bg_tasks: set = set()
+# 上传行与解析产物的保留窗口由 ``upload_retention_hours`` 决定(见 cleanup_expired_uploads)：
+# 已提交入库的任务读的是 artifact，不是原件，所以原件被回收不会让任务跑不下去。
 
 TAG_PROMPT = """你是企业知识库的分类助手。基于文档内容,给出 3~5 个中文分类标签。
 优先复用已有标签: {existing}
@@ -67,6 +84,18 @@ def _upload_dir() -> Path:
     return path
 
 
+def resolve_upload_path(rel_path: str) -> Path:
+    """把存库的**相对路径**还原成当前环境的绝对路径。
+
+    为什么存相对路径: 绝对路径是容器内的 ``/data/uploads/<doc_key>/x.pdf``, 宿主侧脚本
+    读到它指向的就不是同一个位置(历史上造成过"文档已删但源文件还在")。doc_key 与相对
+    路径都跟环境无关, 拼上现场 ``upload_dir`` 才能跨宿主/容器解释。
+    """
+    if not rel_path:
+        return _upload_dir()
+    return _upload_dir() / rel_path.lstrip("/\\")
+
+
 def _safe_filename(filename: str) -> str:
     """Strip path components; keep only the bare file name."""
     name = Path(filename).name.strip()
@@ -88,8 +117,11 @@ def _validate_name(filename: str) -> tuple[str, str]:
     return name, ext
 
 
-async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
-    """流式落盘一份上传: 边读边写, 超过上限立刻断并清临时文件。
+async def stage_upload(filename: str, upload) -> tuple[str, Path, str, str, int]:
+    """流式落盘一份上传: 边读边写 + 边算 sha256, 超过上限立刻断并清临时文件。
+
+    返回 ``(doc_key, path, ext, content_sha256, size_bytes)``。内容哈希是幂等键
+    (同一份字节不重解析), 分块喂 hashlib 不额外花内存。
 
     为什么不能 ``await file.read()`` 一次读完再校大小(旧写法): 那是先把最多
     ``upload_max_mb`` 全读进内存。50MB × 几十人同时上传 = 几 GB 峰值, 在容器内存
@@ -105,6 +137,7 @@ async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
     final = target_dir / name
     staging = target_dir / (name + ".uploading")
     received = 0
+    digest = hashlib.sha256()
     try:
         await asyncio.to_thread(target_dir.mkdir, parents=True, exist_ok=True)
         with staging.open("wb") as f:
@@ -115,6 +148,7 @@ async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
                 received += len(piece)
                 if received > max_bytes:
                     raise UploadError(f"文件超过大小限制({get_settings().upload_max_mb}MB)")
+                digest.update(piece)
                 # 每一块都交给线程写: 循环里的 ``f.write`` 会把磁盘 IO 压在事件循环上,
                 # 几十 MB 文件就是几十次阻塞(全厂人的流式回复跟着卡)。
                 await asyncio.to_thread(f.write, piece)
@@ -126,14 +160,14 @@ async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
             pass
         raise
     await asyncio.to_thread(os.replace, staging, final)
-    return doc_key, final, ext
+    return doc_key, final, ext, digest.hexdigest(), received
 
 
 def save_upload(filename: str, data: bytes) -> tuple[str, Path, str]:
     """Validate and persist an uploaded file. Returns (doc_key, path, ext).
 
-    保留同步入参接口(脚本/测试在用); HTTP 上传路径请走 :func:`stage_upload`
-    的流式版本, 不要把整个文件先读到内存。大小校验两道都留: 调用方传的内存
+    保留同步入参接口(脚本/测试在用); HTTP 上传路径请走 :func:`submit_upload`
+    (流式落盘 + 异步解析), 不要把整个文件先读到内存。大小校验两道都留: 调用方传的内存
     缓冲区也得有上限, 否则这接口自己就是一个无界内存入口。
     """
     name, ext = _validate_name(filename)
@@ -214,176 +248,344 @@ def normalize_acl(
     return acl
 
 
-def _normalize_and_structure(raw: str, blocks: Sequence[Any]) -> tuple[str, Any]:
-    """入库链路里的两块纯 CPU: 文本归一化 + 父块结构(一并交给线程)。
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    两者必须同线程跳: ``build_structure`` 的 offset 是基于 ``normalize_text`` 的结果算的,
-    拆成两次线程调用只会多一次无意义的上下文切换(归一化结果还要再穿一次线)。
+
+async def _find_reusable_upload(doc_key: str, content_sha256: str) -> DocUpload | None:
+    """找同 doc_key + 同字节且产物仍可用的上传行(幂等去重的唯一入口)。
+
+    只看未过期的 ``parsed`` 行: 过了期原件与 artifact 都可能已被回收, 拿它当"已解析"
+    会让入库阶段找不到产物。
     """
-    normalized = normalize_text(raw)
-    return normalized, build_structure(blocks, normalized)
-
-
-async def _set_doc_status(doc_key: str, status: str) -> None:
-    """Best-effort 更新 documents.status(入库失败时标 failed, 供检索门禁生效)。"""
-    try:
-        async with get_session_factory()() as session:
+    now = _utcnow()
+    async with get_session_factory()() as session:
+        return (
             await session.execute(
-                update(Document).where(Document.doc_key == doc_key).values(status=status)
+                select(DocUpload)
+                .where(
+                    DocUpload.doc_key == doc_key,
+                    DocUpload.content_sha256 == content_sha256,
+                    DocUpload.status == "parsed",
+                    DocUpload.expires_at > now,
+                )
+                # 按 created_at 取最新一条: 同一份字节可能已被上传多次(旧行逐步过期),
+                # "最新的哪一个"才是应该被复用的那个; 按 update/expire 类字段排会得到
+                # 随回收节奏漂移的结果, 表现为去重时灵时不灵。
+                .order_by(DocUpload.created_at.desc())
+                .limit(1)
             )
-            await session.commit()
-    except Exception as exc:  # noqa: BLE001 - 状态刷新失败不掩盖原始异常
-        logger.warning("set doc status=%s failed for %s: %s", status, doc_key, exc)
+        ).scalar_one_or_none()
 
 
-async def ingest_confirmed(
-    doc_key: str,
-    filename: str,
+async def submit_upload(filename: str, upload, uploader: str) -> dict[str, Any]:
+    """``POST /api/docs/upload``: 流式落盘 + 建上传行 + 同事务发解析事件, 立即返回。
+
+    这里刻意不做解析: OCR / 解析 / LLM tags 都是分钟级重活, 放进请求里等于
+    "上传一篇扫描 PDF 就把一个网关进程钉住几分钟"。预览改由 ``GET /uploads/{id}``
+    轮询解析产物 —— 预览与入库读的都是那一份产物。
+    """
+    doc_key, path, ext, content_sha256, size_bytes = await stage_upload(filename, upload)
+    settings = get_settings()
+    rel = str(path.relative_to(_upload_dir()))
+    reused = await _find_reusable_upload(doc_key, content_sha256)
+    overwritten = await check_existing(doc_key) is not None
+    if reused is not None:
+        # 幂等命中: 同一份字节刚刚已经解析过了, 直接复用那个 upload_id(不重做 OCR)。
+        # 只复用**未过期**的行: 过期行的原件与 artifact 可能已被清理, 拿它当"已解析"
+        # 会让入库阶段找不到产物。
+        return {
+            "upload_id": reused.upload_id, "doc_key": doc_key,
+            "filename": reused.filename, "ext": ext, "size_bytes": size_bytes,
+            "state": reused.status, "overwritten": overwritten,
+            "reused": True,
+            "poll": f"/api/docs/uploads/{reused.upload_id}",
+        }
+    upload_id = uuid.uuid4().hex[:32]
+    now = _utcnow()
+    factory = get_session_factory()
+    async with factory() as session:
+        async with session.begin():
+            session.add(
+                DocUpload(
+                    upload_id=upload_id, doc_key=doc_key, filename=path.name[:255], ext=ext[:16],
+                    size_bytes=size_bytes, content_sha256=content_sha256,
+                    stored_rel_path=rel[:512], status="pending",
+                    parser_version=settings.parser_version[:16],
+                    uploaded_by=(uploader or "")[:64],
+                    expires_at=now + timedelta(hours=settings.upload_retention_hours),
+                    created_at=now, updated_at=now,
+                )
+            )
+            # 事件与上传行同事务: 事务回滚则事件也不存在, 不会出现"没人解析但已发事件"。
+            await pipeline.emit_event(
+                session, pipeline.TOPIC_PARSE, doc_key, {"upload_id": upload_id, "doc_key": doc_key}
+            )
+    return {
+        "upload_id": upload_id, "doc_key": doc_key, "filename": path.name,
+        "ext": ext, "size_bytes": size_bytes, "state": "pending",
+        "overwritten": overwritten, "reused": False,
+        "poll": f"/api/docs/uploads/{upload_id}",
+    }
+
+
+async def get_upload_state(upload_id: str, principal: Principal | None) -> dict[str, Any]:
+    """上传/解析状态查询(预览轮询入口)。
+
+    预览内容与建议标签都来自解析产物本身, 所以这里不重新解析文件 —— 页面看到的
+    与真正入库的就是同一份产物。
+    """
+    async with get_session_factory()() as session:
+        up = (
+            await session.execute(select(DocUpload).where(DocUpload.upload_id == upload_id))
+        ).scalar_one_or_none()
+        task = (
+            await session.execute(
+                select(IngestTask.task_id, IngestTask.stage, IngestTask.error)
+                .where(IngestTask.upload_id == upload_id)
+                .order_by(IngestTask.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+    if up is None:
+        raise UploadError("上传记录不存在或已过期, 请重新上传")
+    # 预览是文档内容: 只有上传者本人或 admin 能读(与列表同一口径的 ACL 裁剪)。
+    effective = principal or Principal(user_id="")
+    if not can_manage_document(effective, up.uploaded_by or ""):
+        raise DocumentForbidden("仅上传者本人或管理员可查看该上传的解析结果")
+    out: dict[str, Any] = {
+        "upload_id": up.upload_id, "doc_key": up.doc_key, "filename": up.filename,
+        "ext": up.ext, "modality": up.modality, "size_bytes": up.size_bytes,
+        "status": up.status, "attempt": up.attempt, "error": up.error,
+        "preview": "", "preview_len": 0, "suggested_tags": [], "warnings": [],
+        "overwritten": await check_existing(up.doc_key) is not None,
+        "ingest_task_id": task.task_id if task else "",
+        "ingest_stage": task.stage if task else "",
+    }
+    if up.status == "parsed":
+        doc = await get_artifact_store().get(up.artifact_id or up.upload_id)
+        if doc:
+            out["preview"] = doc.get("preview", "")
+            out["preview_len"] = int(doc.get("preview_len") or 0)
+            out["suggested_tags"] = list(doc.get("suggested_tags") or [])
+            out["warnings"] = list(doc.get("warnings") or [])
+            out["modality"] = doc.get("modality") or up.modality
+    return out
+
+
+async def submit_ingest(
+    upload_id: str,
     tags: list[str],
     uploader: str,
     visibility: str = "public",
     dept_id: str = "",
     allowed_roles: list[str] | str = "",
 ) -> dict[str, Any]:
-    """Phase-2 ingest: 元数据先行 + 内容后发(修掉孤儿向量)。
+    """``POST /api/docs/ingest``: 同步校参 + 建任务(幂等) + 同事务发事件, 返回 202 语义。
 
-    顺序(不得违背, 见方案 2.6):
-      1. 解析 + 归一化(raw -> normalized -> structure);
-      2. PG 事务1: upsert documents 行, status='ingesting', chunk_count=0, body_stored=false
-         (新文档也先插行, 不再"先建向量后补元数据");
-      3. Mongo save_doc_body(失败 -> status='failed' 后抛 UploadError, PG 不留无元数据行);
-      4. ingest_blocks(父块正文入 Mongo + 父子块入 PG);
-      5. PG 事务2: chunk_count=N, body_stored=true, status='ready' + tags 重写;
-      6. 仅当转为 ready 后才 refresh_knowledge + 后台建图。
+    参数校验留在同步链路: 非法可见性/缺 dept 这类错应该立刻告诉调用者, 而不应该
+    "已受理"后在后台默默失败。
+
+    幂等与并发都靠两个约束保证:
+    - ``task_id`` 由 ``(doc_key, upload_id, content_sha256)`` 决出: 连点两次得到同一行;
+    - 部分唯一索引 ``ux_ingest_tasks_active_doc``: 同一文档第二个进行中任务插不进来,
+      冲突时回名已有 task_id(受理语义不变, 不是 400)。
     """
-    path = _upload_dir() / doc_key / _safe_filename(filename)
-    if not path.exists():
-        raise UploadError("上传文件不存在, 请重新上传")
-
     acl = normalize_acl(visibility, uploader, dept_id, allowed_roles)
-    modality = modality_of(path)
-    _, blocks = await parse_blocks(path)
-    raw = "\n\n".join(b.text for b in blocks)
-    if not raw.strip():
-        raise UploadError("文档解析后无有效内容")
-    # 归一化与结构切块都是整篇文本上的纯 Python(百万字文档上是秒级 CPU), 同样离事件循环
-    normalized, structure = await asyncio.to_thread(_normalize_and_structure, raw, blocks)
-    title = path.stem
+    async with get_session_factory()() as session:
+        up = (
+            await session.execute(select(DocUpload).where(DocUpload.upload_id == upload_id))
+        ).scalar_one_or_none()
+    if up is None:
+        raise UploadError("上传记录不存在或已过期, 请重新上传")
+    if up.status == "expired":
+        raise UploadError("上传已超过保留期, 请重新上传")
+    if up.status == "failed":
+        raise UploadError(f"解析失败: {up.error or '未知原因'}")
 
+    settings = get_settings()
+    task_id = pipeline.make_task_id(up.doc_key, up.upload_id, up.content_sha256)
+    params: dict[str, Any] = {
+        "tags": [t.strip() for t in tags if t.strip()],
+        "acl": acl,
+        "uploader": (uploader or "")[:64],
+        "filename": up.filename,
+        "stored_rel_path": up.stored_rel_path,
+        "size_bytes": up.size_bytes,
+    }
+    now = _utcnow()
     factory = get_session_factory()
-    # --- 事务1: 元数据先行, 置 ingesting(幂等 upsert, 并发插入重试) ---
-    for attempt in range(3):
-        try:
-            async with factory() as session:
-                async with session.begin():
+    duplicate = False
+    try:
+        async with factory() as session:
+            async with session.begin():
+                # 先查行内主键: 同一 (doc_key, upload_id, content_sha256) 已经排过队就直接归并。
+                # 靠 ON CONFLICT DO NOTHING 也能防住重复入库, 但那样无法区分"刚新建"
+                # 与"已存在", 响应体会说谎(把已 ready 的任务报成 pending)。
+                existing_task = (
+                    await session.execute(
+                        select(IngestTask.task_id, IngestTask.stage)
+                        .where(IngestTask.task_id == task_id)
+                        .with_for_update()
+                    )
+                ).first()
+                if existing_task is not None:
+                    duplicate = True
+                else:
                     doc = (
                         await session.execute(
-                            select(Document).where(Document.doc_key == doc_key)
+                            select(Document).where(Document.doc_key == up.doc_key).with_for_update()
                         )
                     ).scalar_one_or_none()
                     if doc is None:
-                        doc = Document(doc_key=doc_key, name=title, ext=path.suffix.lower(),
-                                       modality=modality, created_by=uploader)
-                        session.add(doc)
-                        await session.flush()
-                    doc.file_path = str(path)
-                    doc.size_bytes = path.stat().st_size
-                    doc.modality = modality
-                    doc.status = "ingesting"
-                    doc.chunk_count = 0
-                    doc.body_stored = False
-                    doc.visibility = acl["visibility"]
-                    doc.owner_id = acl["owner_id"]
-                    doc.dept_id = acl["dept_id"]
-                    doc.allowed_roles = acl["allowed_roles"]
-            break
-        except IntegrityError:
-            if attempt == 2:
-                raise
-            logger.warning("doc_key %s concurrently inserted, retrying pre-ingest metadata", doc_key)
-
-    # --- 步骤3: 整篇正文入 Mongo(失败标 failed 并抛, PG 不会留下 ready 的无正文行) ---
-    bodies = get_body_store()
-    try:
-        await bodies.save_doc_body(
-            doc_key, raw=raw, normalized=normalized, structure=structure,
-            meta={"name": title, "modality": modality, "source": str(path)},
-        )
-    except Exception as exc:  # noqa: BLE001 - Mongo 写失败转 502(经 UploadError)
-        await _set_doc_status(doc_key, "failed")
-        logger.error("save_doc_body 失败 doc_key=%s: %s", doc_key, exc)
-        raise UploadError(f"正文存储不可用, 入库失败: {exc}") from exc
-
-    # --- 步骤4: 父子块发布(父块正文入 Mongo + 父子块入 PG, 增量 embed) ---
-    store = ChunkStore()
-    embedder = OllamaEmbedder()
-    try:
-        chunk_count = await ingest_blocks(
-            doc_key, path.name, title, str(path), modality, blocks, store, embedder,
-            acl=acl, parent_store=ParentStore(), bodies=bodies, normalized_text=normalized,
-        )
-    except Exception as exc:  # noqa: BLE001
-        await _set_doc_status(doc_key, "failed")
-        logger.error("ingest_blocks 失败 doc_key=%s: %s", doc_key, exc)
-        raise UploadError(f"知识块发布失败: {exc}") from exc
-    if not chunk_count:
-        await _set_doc_status(doc_key, "failed")
-        raise UploadError("文档解析后无有效内容")
-
-    # --- 事务2: 发布态转 ready + chunk_count + tags 重写(迁移期仍写 parsed_text 供回退) ---
-    for attempt in range(3):
-        try:
-            async with factory() as session:
-                async with session.begin():
-                    doc = (
-                        await session.execute(
-                            select(Document).where(Document.doc_key == doc_key)
+                        # 新文档先置 ingesting: 它本来就没有块, 挡掉零成本, 并且页面能立刻
+                        # 看到"入库中"。已在架文档不转 ingesting —— 发布是单事务原子操作,
+                        # 把它打成 ingesting 只会让一篇正在服务的文档在队列+embed 期间检不到。
+                        session.add(
+                            Document(
+                                doc_key=up.doc_key, name=Path(up.filename).stem or up.filename,
+                                ext=up.ext, modality=up.modality, file_path=up.stored_rel_path,
+                                size_bytes=up.size_bytes, created_by=uploader or "",
+                                status="ingesting", chunk_count=0, body_stored=False,
+                                visibility=acl["visibility"], owner_id=acl["owner_id"],
+                                dept_id=acl["dept_id"], allowed_roles=acl["allowed_roles"],
+                            )
                         )
-                    ).scalar_one_or_none()
-                    if doc is None:  # 极端: 事务1 后被并发删除
-                        raise UploadError("文档元数据丢失, 请重新入库")
-                    doc.parsed_text = raw
-                    doc.chunk_count = chunk_count
-                    doc.body_stored = True
-                    doc.status = "ready"
-                    await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
-                    for tag_name in dict.fromkeys(t.strip() for t in tags if t.strip()):
-                        tag_id = await _get_or_create_tag(session, tag_name)
-                        session.add(DocumentTag(doc_key=doc_key, tag_id=tag_id))
-            break
-        except IntegrityError:
-            if attempt == 2:
-                raise
-            logger.warning("doc_key %s tag concurrently inserted, retrying", doc_key)
+                    await session.execute(
+                        pg_insert(IngestTask)
+                        .values(
+                            task_id=task_id, doc_key=up.doc_key, upload_id=up.upload_id,
+                            content_sha256=up.content_sha256, stage=pipeline.STAGE_PENDING,
+                            params=params, max_attempts=settings.ingest_task_max_attempts,
+                            result_json={}, created_at=now, updated_at=now,
+                        )
+                        .on_conflict_do_nothing(index_elements=[IngestTask.task_id])
+                    )
+                    await pipeline.emit_event(
+                        session, pipeline.TOPIC_INGEST, up.doc_key,
+                        {"task_id": task_id, "doc_key": up.doc_key, "upload_id": up.upload_id},
+                    )
+    except IntegrityError:
+        # 来自部分唯一索引 ux_ingest_tasks_active_doc: 同一文档已有**另一个**进行中的任务。
+        # 把它回给调用方而不是报错(重复提交不是错误, 而是"已经排过了")。
+        duplicate = True
+        existing = await _active_task_id(up.doc_key)
+        if existing:
+            task_id = existing
+        logger.info("doc_key=%s 已有进行中的入库任务, 本次提交归并到 %s", up.doc_key, task_id)
 
-    # --- 步骤6: 仅发布成功后刷新检索缓存/ES 索引与后台建图 ---
-    try:
-        from app.assistant.graph import get_orchestrator
-
-        await get_orchestrator().refresh_knowledge()
-    except Exception as exc:  # ES index rebuilds on next startup anyway
-        logger.warning("es bm25 refresh after ingest failed: %s", exc)
-
-    if get_settings().doc_kg_enabled:
-        try:
-            # 不能再写 ``import asyncio``: 模块顶层已导入, 函数内重复导入会把 asyncio
-            # 变成本函数的局部量, 使前面那几处 ``await asyncio.to_thread(...)`` 直接
-            # UnboundLocalError(入库接口 500, 且只在走到这里时才爆)。
-            from app.kg.service import build_for_doc
-
-            task = asyncio.create_task(build_for_doc(doc_key))
-            _kg_bg_tasks.add(task)
-            task.add_done_callback(_kg_bg_tasks.discard)
-        except Exception as exc:  # noqa: BLE001 - 建图失败不影响入库结果
-            logger.warning("kg build scheduled after ingest failed: %s", exc)
-
+    # 响应里的 stage 必须是任务**当前**阶段: 归并到已存在的行时报 pending 会诱使
+    # 调用方以为排了两次队。
+    result_stage = await _current_stage(task_id)
+    chunk_count = 0
+    if duplicate:
+        state = await get_task_state(task_id, Principal(user_id=(uploader or "").strip()))
+        chunk_count = int(state.get("chunk_count") or 0)
+    if not settings.ingest_async_enabled:
+        # 紧急回退闸: 在请求内跑完四个阶段(只用于排障/未部 worker 的环内启动)。
+        await pipeline.advance_task(task_id, "gateway-inline")
+        result_stage = await _current_stage(task_id)
+        state = await get_task_state(task_id, Principal(user_id=(uploader or "").strip()))
+        chunk_count = int(state.get("chunk_count") or 0)
     return {
-        "doc_key": doc_key,
+        "task_id": task_id,
+        "doc_key": up.doc_key,
+        "upload_id": up.upload_id,
+        "accepted": settings.ingest_async_enabled,
+        "stage": result_stage,
+        "duplicate": duplicate,
         "chunk_count": chunk_count,
-        "tags": tags,
-        "modality": modality,
         "visibility": acl["visibility"],
+        "tags": params["tags"],
+        "poll": f"/api/docs/tasks/{task_id}",
     }
+
+
+async def _active_task_id(doc_key: str) -> str | None:
+    async with get_session_factory()() as session:
+        return (
+            await session.execute(
+                select(IngestTask.task_id)
+                .where(IngestTask.doc_key == doc_key, IngestTask.stage.in_(pipeline.ACTIVE_STAGES))
+                .order_by(IngestTask.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+
+async def _current_stage(task_id: str) -> str:
+    """读任务当前阶段(响应体与轮询入口同一口径, 不复用写前的字面量)。"""
+    async with get_session_factory()() as session:
+        return (
+            await session.execute(
+                select(IngestTask.stage).where(IngestTask.task_id == task_id)
+            )
+        ).scalar_one_or_none() or pipeline.STAGE_PENDING
+
+
+async def get_task_state(task_id: str, principal: Principal | None = None) -> dict[str, Any]:
+    """入库任务状态查询(前端入库轮询 + 运维排查同一入口)。
+
+    任务进度会说出一篇文档的存在与其块数/失败原因 —— 与列表、预览同一口径做 ACL 裁剪:
+    只有文档所有者或 admin 能读(无 principal 时按未登录处理, 只能读 public 文档)。
+    """
+    async with get_session_factory()() as session:
+        task = (
+            await session.execute(select(IngestTask).where(IngestTask.task_id == task_id))
+        ).scalar_one_or_none()
+        if task is None:
+            raise UploadError("入库任务不存在(可能已被清理)")
+        doc_key = task.doc_key
+        requester = str((task.params or {}).get("uploader") or "")
+        result = dict(task.result_json or {})
+        payload = {
+            "task_id": task.task_id,
+            "doc_key": doc_key,
+            "upload_id": task.upload_id,
+            "stage": task.stage,
+            "attempt": task.attempt,
+            "max_attempts": task.max_attempts,
+            "error": task.error,
+            "chunk_count": int(result.get("written") or 0),
+            "warnings": list(result.get("warnings") or []),
+            "marked": len(result.get("marked") or []),
+            "heartbeat_at": task.heartbeat_at.isoformat(timespec="seconds") if task.heartbeat_at else "",
+            "finished_at": task.finished_at.isoformat(timespec="seconds") if task.finished_at else "",
+            "updated_at": task.updated_at.isoformat(timespec="seconds") if task.updated_at else "",
+        }
+    # 提交人总是看得到自己那一单: 本次提交的权限此刻可能还没发布完(新文档行已按
+    # 提交的 ACL 建好), 拿它去裁进度的话, 给 dept/role 文档入库的人反而看不到自己刚提的任务。
+    effective = principal or Principal(user_id="")
+    if requester and effective.user_id and requester == effective.user_id:
+        return payload
+    doc = await check_existing(doc_key)
+    if doc is not None:
+        if not is_allowed_fields(
+            getattr(doc, "visibility", "") or "public",
+            getattr(doc, "owner_id", "") or (doc.created_by or ""),
+            getattr(doc, "dept_id", "") or "",
+            getattr(doc, "allowed_roles", "") or "",
+            effective,
+        ):
+            raise DocumentForbidden("无权查看该文档的入库任务进度")
+    return payload
+
+
+async def delete_upload_dir(doc_key: str) -> None:
+    """删除上传目录(由文档删除投影调用; 以当前 ``upload_dir`` + doc_key 重新定位)。
+
+    不直接信 ``documents.file_path``: 它可能是容器内绝对路径, 宿主侧直跑时与真实位置
+    不一致, rmtree 会静默失败而表现为"文档已删但源文件还在"。历史绝对路径也补删一次。
+    """
+    target = _upload_dir() / doc_key
+    await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
+    if target.exists():
+        logger.warning("upload dir still present after delete (占用/权限?): %s", target)
+
+
+# 旧 ``ingest_confirmed``(请求内跑完整条入库链路)已删除: 它的职责现在分成三处 ——
+# ``submit_ingest``(同事务建任务+事件) / ``app/docs/pipeline.py`` 的阶段函数 / worker 的
+# 认领与回收。把那些代码留在服务层会变成"第二条没人跑也没人测的入库路径"。
 
 
 async def update_document_acl(
@@ -393,11 +595,15 @@ async def update_document_acl(
     allowed_roles: list[str] | str = "",
     principal: Principal | None = None,
 ) -> dict[str, Any]:
-    """Change a document's visibility: metadata table (truth) + chunk ACL columns.
+    """Change a document's visibility: 一个事务改完元数据行 + 块表 ACL 列 + outbox 事件。
 
-    The vector rows carry the ACL used for retrieval-time filtering, so both
-    stores are updated in one call; the assistant's ES BM25 index rebuilds
-    afterwards so the sparse channel reflects the new permissions too.
+    为什么必须同事务: 向量行携带的是检索时前置裁剪用的 ACL, 与 ``documents`` 元数据分属
+    两个事务时, "元数据已提交为 private、块表还是 public" 这段窗口里全文仍然能被
+    全员检到 —— 那是越权而不是不一致。现在两边同提交, 不存在中间态。
+
+    ES 侧的决策字段(权限词元)与缓存失效不在请求里做: 它们只是事实源的投影,
+    由 worker 消费 ``doc.acl_changed`` 重索引该文档 + 定向失效。旧写法这里调
+    ``refresh_knowledge()`` 触发全库 BM25 重建 —— 改一次权限就把全库重写一遍。
 
     闸门: 改可见性会同步改写该文全部向量块的 ACL 列, 把 private/dept 改成 public
     就是把文档发给全员检索 —— 所以只有所有者本人或 admin 能做(无 principal 也拒,
@@ -405,34 +611,37 @@ async def update_document_acl(
     漂移到客户端自报的调用者身上。
     """
     factory = get_session_factory()
+    store = ChunkStore()
     async with factory() as session:
-        doc = (
-            await session.execute(select(Document).where(Document.doc_key == doc_key))
-        ).scalar_one_or_none()
-        if doc is None:
-            raise UploadError("文档不存在或已删除")
-        if principal is None or not can_manage_document(principal, doc.created_by or ""):
-            raise DocumentForbidden(
-                f"仅文档所有者({doc.created_by or '无主'})或管理员可变更可见性"
+        async with session.begin():
+            doc = (
+                await session.execute(
+                    select(Document).where(Document.doc_key == doc_key).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if doc is None:
+                raise UploadError("文档不存在或已删除")
+            if principal is None or not can_manage_document(principal, doc.created_by or ""):
+                raise DocumentForbidden(
+                    f"仅文档所有者({doc.created_by or '无主'})或管理员可变更可见性"
+                )
+            acl = normalize_acl(
+                visibility, doc.created_by or principal.user_id, dept_id, allowed_roles
             )
-        acl = normalize_acl(visibility, doc.created_by or principal.user_id, dept_id, allowed_roles)
-        doc.visibility = acl["visibility"]
-        doc.owner_id = acl["owner_id"]
-        doc.dept_id = acl["dept_id"]
-        doc.allowed_roles = acl["allowed_roles"]
-        await session.commit()
-
-    updated_chunks, updated_parents = await ChunkStore().update_acl_by_doc(
-        doc_key, acl["visibility"], acl["owner_id"], acl["dept_id"], acl["allowed_roles"]
-    )
-
-    # --- refresh the ES BM25 index of the running assistant, if any ---
-    try:
-        from app.assistant.graph import get_orchestrator
-
-        await get_orchestrator().refresh_knowledge()
-    except Exception as exc:  # ES index rebuilds on next startup anyway
-        logger.warning("es bm25 refresh after acl update failed: %s", exc)
+            doc.visibility = acl["visibility"]
+            doc.owner_id = acl["owner_id"]
+            doc.dept_id = acl["dept_id"]
+            doc.allowed_roles = acl["allowed_roles"]
+            doc.updated_at = _utcnow()
+            # 块表 ACL 列复用同一事务(不自己开事务、不自己提交)。
+            updated_chunks, updated_parents = await store.update_acl_by_doc(
+                doc_key, acl["visibility"], acl["owner_id"], acl["dept_id"],
+                acl["allowed_roles"], session=session,
+            )
+            await pipeline.emit_event(
+                session, pipeline.TOPIC_ACL, doc_key,
+                {"doc_key": doc_key, **acl, "operator": principal.user_id},
+            )
 
     logger.info(
         "document acl updated: doc_key=%s visibility=%s operator=%s",
@@ -441,6 +650,7 @@ async def update_document_acl(
     result: dict[str, Any] = {
         "doc_key": doc_key, **acl,
         "chunks_updated": updated_chunks, "parents_updated": updated_parents,
+        "projected": True,
     }
     if updated_chunks == 0:
         # 新子块表里没有该文档的任何块 (常见于表被重建/迁移后未重新入库):
@@ -456,91 +666,69 @@ async def update_document_acl(
 
 
 async def delete_document(doc_key: str, principal: Principal | None = None) -> dict[str, Any]:
-    """Delete a document: PG 父子行+元数据同事务 -> 提交成功后再删 Mongo 正文。
+    """Delete a document: 一个事务标陈旧 + 删元数据/标签 + outbox 事件, 其余交 worker 投影。
 
-    顺序: 先删子块/父块(PG), 再删元数据(PG), 同事务提交; 只有 PG 提交成功后才
-    清 Mongo。PG 是事实来源, Mongo 残留由 --prune 回收(删除中途崩溃只会产生
-    无 ACL 风险的孤儿文本, 不会产生丢元数据的孤儿向量)。
+    为什么主链路不真删块行: 一篇大文档可以上万行, 在 DELETE 请求里真删会长时间持锁,
+    与它并发的检索会卡在锁上。现在同事务把父子块标 ``deprecated_at``(行级不可见立即
+    生效)、删元数据、发 ``doc.deleted`` 事件; ES / Mongo / artifact / 上传目录 / KG 都是
+    派生存储, 由 worker 幂等重放。旧写法把这些依次 best-effort 放在请求里: 任何一步
+    失败就永久残留, 而且没人会再补。
 
     闸门: 删除不可恢复, 与改可见性同一口径(所有者本人或 admin)。
     """
     factory = get_session_factory()
-    async with factory() as session:
-        doc = (
-            await session.execute(select(Document).where(Document.doc_key == doc_key))
-        ).scalar_one_or_none()
-        if doc is None:
-            raise UploadError("文档不存在或已删除")
-        if principal is None or not can_manage_document(principal, doc.created_by or ""):
-            raise DocumentForbidden(
-                f"仅文档所有者({doc.created_by or '无主'})或管理员可删除该文档"
-            )
-        name, file_path = doc.name, doc.file_path
-
-    # 父子块与元数据同事务删除(同一 session, 不留"删了子块没删元数据"的中间态)。
+    store = ChunkStore()
     async with factory() as session:
         async with session.begin():
-            await session.execute(
-                delete(DocChunkRow).where(DocChunkRow.doc_id == doc_key)
-            )
-            await session.execute(
-                delete(DocParentRow).where(DocParentRow.doc_id == doc_key)
-            )
+            doc = (
+                await session.execute(
+                    select(Document).where(Document.doc_key == doc_key).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if doc is None:
+                raise UploadError("文档不存在或已删除")
+            if principal is None or not can_manage_document(principal, doc.created_by or ""):
+                raise DocumentForbidden(
+                    f"仅文档所有者({doc.created_by or '无主'})或管理员可删除该文档"
+                )
+            name = doc.name
+            upload_rows = (
+                await session.execute(
+                    select(DocUpload.upload_id).where(DocUpload.doc_key == doc_key)
+                )
+            ).scalars().all()
+            # 父子块标陈旧(与删元数据同事务): 检索侧立刻不可见, 真删交 GC。
+            await store.mark_deprecated_by_doc(session, doc_key)
             await session.execute(delete(DocumentTag).where(DocumentTag.doc_key == doc_key))
             await session.execute(delete(Document).where(Document.doc_key == doc_key))
+            await pipeline.emit_event(
+                session, pipeline.TOPIC_DELETE, doc_key,
+                {
+                    "doc_key": doc_key, "name": name,
+                    "upload_ids": [str(u) for u in upload_rows],
+                    "operator": principal.user_id,
+                },
+            )
+            # 上传行也标 expired: 它们的原件与产物由投影统一回收, 不再留在"可入库"集合里。
+            if upload_rows:
+                await session.execute(
+                    update(DocUpload)
+                    .where(DocUpload.upload_id.in_([str(u) for u in upload_rows]))
+                    .values(status="expired", updated_at=_utcnow())
+                )
 
-    # PG 提交成功后再清 Mongo(失败仅告警, 残留由 --prune 回收)。
-    bodies = get_body_store()
-    try:
-        await bodies.delete_parents_by_doc(doc_key)
-        await bodies.delete_doc_body(doc_key)
-    except Exception as exc:  # noqa: BLE001 - Mongo 删除失败不回滚已提交的 PG 删除
-        logger.warning("mongo body cleanup after delete failed doc_key=%s: %s", doc_key, exc)
-
-    # remove the uploaded file directory (best effort).
-    # 以"当前 upload_dir + doc_key"重新定位规范目录再删, 不直接信任 DB 里存的
-    # file_path: 它可能是容器内绝对路径(/data/uploads/...), 宿主机直跑时与真实
-    # 位置(<项目>/data/uploads/<doc_key>)不一致, rmtree 会因路径不存在而静默失败,
-    # 表现为"文档已删但源文件还在"。doc_key 跨环境稳定, 故用它重算路径最可靠。
-    upload_doc_dir = _upload_dir() / doc_key
-    await asyncio.to_thread(shutil.rmtree, upload_doc_dir, ignore_errors=True)
-    # 兼容历史数据: file_path 若指向规范目录之外(如迁移前残留), 也补删一次。
-    if file_path:
-        legacy_dir = Path(file_path).parent
-        if legacy_dir != upload_doc_dir:
-            await asyncio.to_thread(shutil.rmtree, legacy_dir, ignore_errors=True)
-    if upload_doc_dir.exists():
-        logger.warning(
-            "upload dir still present after delete (占用/权限?): %s", upload_doc_dir
-        )
-
-    # --- drop this document's nodes from the knowledge graph (best effort) ---
-    if get_settings().doc_kg_enabled:
-        try:
-            from app.kg import store as kg_store
-
-            await kg_store.delete_document_graph(doc_key)
-        except Exception as exc:  # noqa: BLE001 - 图谱删除失败不影响文档删除结果
-            logger.warning("kg delete after document delete failed: %s", exc)
-
-    # --- refresh the ES BM25 index of the running assistant, if any ---
-    try:
-        from app.assistant.graph import get_orchestrator
-
-        await get_orchestrator().refresh_knowledge()
-    except Exception as exc:  # ES index rebuilds on next startup anyway
-        logger.warning("es bm25 refresh after delete failed: %s", exc)
-
-    logger.info("document deleted: doc_key=%s name=%s", doc_key, name)
-    return {"doc_key": doc_key, "name": name}
+    logger.info("document deleted: doc_key=%s name=%s (投影由 worker 消费 doc.deleted)", doc_key, name)
+    return {"doc_key": doc_key, "name": name, "projected": True}
 
 
 async def docs_not_ready(doc_ids: Sequence[str]) -> set[str]:
     """返回 status != 'ready' 的 doc_id 集合(发布态门禁, 供检索出口一次性批量判)。
 
-    防"正在入库的半篇文档"被检索到: ingest_confirmed 先置 ingesting, 完成才转 ready,
-    故未就绪文档的块即使已进入新表也不会进入回答。调用方在 assemble_parents 后的
-    出口复核里一次性传入命中 doc_id, 不逐块查。
+    防"正在入库的首篇文档"被检索到: ``submit_ingest`` 对**新文档**先置 ingesting,
+    发布事务才转 ready, 故未就绪文档的块即使已进入新表也不会进入回答。已在架文档
+    重入库时不转 ingesting(发布是单事务原子操作, 旧行到新行的交接靠 ``deprecated_at``
+    标记同瞬完成), 所以不会出现"重入库期间整篇检不到"的可用性倒退。
+    调用方在 assemble_parents 后的出口复核里一次性传入命中 doc_id, 不逐块查。
     """
     if not doc_ids:
         return set()
@@ -629,6 +817,8 @@ async def list_documents(principal: Principal | None = None) -> list[dict[str, A
             "modality": d.modality,
             "chunk_count": d.chunk_count,
             "size_bytes": d.size_bytes,
+            # 入库是异步的: 页面得区分"在途"与"已就绪", 否则刚提交的文档看起来像丢了。
+            "status": d.status or "ready",
             "tags": meta.get(d.doc_key, {}).get("tags", []),
             "created_by": d.created_by,
             "visibility": getattr(d, "visibility", "") or "public",

@@ -35,7 +35,8 @@ _SYNONYMS: dict[str, str] = {
     "上月": "last_month", "上个月": "last_month", "上一月": "last_month",
     "本季度": "this_quarter", "本季": "this_quarter", "当季": "this_quarter",
     "上季度": "last_quarter", "上一季度": "last_quarter", "去年四季": "last_quarter",
-    "今年": "this_year", "本年度": "this_year", "年初至今": "this_year", "ytd": "this_year",
+    "今年": "this_year", "本年度": "this_year", "本年": "this_year", "这一年": "this_year",
+    "年初至今": "this_year", "ytd": "this_year",
     "去年": "last_year", "上一年": "last_year",
     "近一周": "last_7d", "最近7天": "last_7d", "近7天": "last_7d",
     "近一月": "last_30d", "最近30天": "last_30d", "近30天": "last_30d",
@@ -43,6 +44,11 @@ _SYNONYMS: dict[str, str] = {
     "近一年": "last_365d", "最近365天": "last_365d",
     "全部": "all_time", "所有": "all_time", "历史": "all_time", "总计": "all_time",
 }
+
+# 区间词 + 同义说法的全集(长说法在前, 供 :func:`detect_phrase` 做最长匹配)。
+_ALL_PHRASES: tuple[str, ...] = tuple(sorted(
+    set(_SYNONYMS) | set(RANGE_TOKENS), key=lambda phrase: (-len(phrase), phrase)
+))
 
 # 默认粒度是 "none"(整个区间一个聚合值)而不是"按天展开": 用户问"本月各部门报销总额"
 # 要的是每个部门一个数, 而不是 部门×天 的 30 行。只有明说"趋势/每天/按月"时
@@ -109,6 +115,24 @@ class ResolvedRange:
 def today_cst() -> date:
     """东八区今天(与 reports.current_cst_date 同口径)。"""
     return datetime.now(_CST).date()
+
+
+def detect_phrase(text: str) -> str:
+    """从一段自然语言里找出最长的已知区间说法(找不到返空串)。
+
+    为什么需要这一道确定判据: 槽位模型偶尔把"今年"吐进了指标说法里而不填 time,
+    于是本来很明确的问题会被澄清门反问"请确认统计区间" —— 明明用户已经说了。
+    这与"猜时间"不同: 只填原话里真的存在的区间词, 一个字符都不造。
+    """
+    haystack = (text or "").lower().replace(" ", "").strip()
+    if not haystack:
+        return ""
+    best = ""
+    for phrase in _ALL_PHRASES:
+        needle = phrase.lower().replace(" ", "")
+        if needle and needle in haystack and len(needle) > len(best):
+            best = phrase
+    return best
 
 
 def normalize_range(raw: str) -> str:

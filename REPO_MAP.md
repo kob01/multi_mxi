@@ -6,13 +6,9 @@ app/agents/analyst_agent/agent_card.py:
 
 app/agents/analyst_agent/executor.py:
 ⋮
-│def _build_role_prompt(role: Role) -> str:
-⋮
 │class AnalystAgent:
 │    """LangGraph ReAct agent over analytics MCP tools, role-aware."""
 │
-⋮
-│    async def _ensure_agent(self, role: Role = Role.MANAGER) -> Any:
 ⋮
 │    async def invoke(
 │        self, user_text: str, user_id: str, role: Role, trace_id: str = ""
@@ -24,9 +20,53 @@ app/agents/analyst_agent/executor.py:
 │    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
 ⋮
 
-app/agents/analyst_agent/server.py:
+app/agents/askdata_agent/agent_card.py:
 ⋮
-│def create_app():
+│def build_agent_card() -> AgentCard:
+⋮
+
+app/agents/askdata_agent/executor.py:
+⋮
+│def format_payload(answer: str, payload: dict[str, Any] | None) -> str:
+⋮
+│class AskDataAgent:
+│    """问数智能体本体(进程级单例; 状态机本身无状态, 每轮一个 state)。"""
+│
+⋮
+│    async def invoke(
+│        self,
+│        user_text: str,
+│        user_id: str,
+│        role: Role,
+│        trace_id: str = "",
+│        session_id: str = "",
+│        prior_slots: dict[str, Any] | None = None,
+│        prior_dsl: dict[str, Any] | None = None,
+│        prior_top_metric: str = "",
+⋮
+│class AskDataAgentExecutor(AgentExecutor):
+│    """A2A ``AgentExecutor`` 桥: A2A task -> 一轮问数状态机。"""
+│
+⋮
+│    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+⋮
+
+app/agents/askdata_agent/graph.py:
+⋮
+│def extract_json(text: str) -> dict[str, Any] | None:
+⋮
+│class AskDataPipeline:
+│    """一台跑在 askdata MCP server 之上的确定性问数流水线(按角色缓存图)。"""
+│
+⋮
+│    def build(self):
+⋮
+
+app/agents/askdata_agent/prompts.py:
+⋮
+│def chart_hint(
+│    column_count: int, has_period: bool, row_count: int,
+│    *, has_compare: bool = False, metric_count: int = 1,
 ⋮
 
 app/agents/common_tools.py:
@@ -43,15 +83,11 @@ app/agents/contract_agent/agent_card.py:
 
 app/agents/contract_agent/executor.py:
 ⋮
-│def _build_role_prompt(role: Role) -> str:
-⋮
 │class ContractAgent:
-│    """LangGraph ReAct agent over procurement MCP tools, role-aware."""
+│    """合同初审 DAG 工作流 + 办理型 ReAct 回退, 角色感知。"""
 │
 ⋮
-│    async def _ensure_agent(self, role: Role = Role.EMPLOYEE) -> Any:
-⋮
-│    async def invoke(self, user_text: str, user_id: str, role: Role) -> str:
+│    async def invoke(self, user_text: str, user_id: str, role: Role, trace_id: str = "unknown") -> 
 ⋮
 │class ContractAgentExecutor(AgentExecutor):
 │    """A2A AgentExecutor bridge: A2A task -> ContractAgent invocation."""
@@ -60,9 +96,10 @@ app/agents/contract_agent/executor.py:
 │    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
 ⋮
 
-app/agents/contract_agent/server.py:
+app/agents/contract_agent/prompts.py:
 ⋮
-│def create_app():
+│SPECIALIST_CAPABILITIES = _MANAGER = MANAGER_CAPABILITIES
+│
 ⋮
 
 app/agents/finance_agent/agent_card.py:
@@ -72,26 +109,17 @@ app/agents/finance_agent/agent_card.py:
 
 app/agents/finance_agent/executor.py:
 ⋮
-│def _build_role_prompt(role: Role) -> str:
-⋮
 │class FinanceAgent:
-│    """LangGraph ReAct agent over finance MCP tools, role-aware."""
+│    """第三代 Agentic: plan-execute-reflect 闭环 + 横向 A2A 协同, 角色感知。"""
 │
 ⋮
-│    async def _ensure_agent(self, role: Role = Role.EMPLOYEE) -> Any:
-⋮
-│    async def invoke(self, user_text: str, user_id: str, role: Role) -> str:
+│    async def invoke(self, user_text: str, user_id: str, role: Role, trace_id: str = "unknown") -> 
 ⋮
 │class FinanceAgentExecutor(AgentExecutor):
 │    """A2A AgentExecutor bridge: A2A task -> FinanceAgent invocation."""
 │
 ⋮
 │    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-⋮
-
-app/agents/finance_agent/server.py:
-⋮
-│def create_app():
 ⋮
 
 app/agents/hr_agent/agent_card.py:
@@ -101,13 +129,9 @@ app/agents/hr_agent/agent_card.py:
 
 app/agents/hr_agent/executor.py:
 ⋮
-│def _build_role_prompt(role: Role) -> str:
-⋮
 │class HRAgent:
 │    """LangGraph ReAct agent over HR MCP tools, role-aware."""
 │
-⋮
-│    async def _ensure_agent(self, role: Role = Role.EMPLOYEE) -> Any:
 ⋮
 │    async def invoke(self, user_text: str, user_id: str = "", role: Role = Role.EMPLOYEE) -> str:
 ⋮
@@ -118,11 +142,6 @@ app/agents/hr_agent/executor.py:
 │    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
 ⋮
 
-app/agents/hr_agent/server.py:
-⋮
-│def create_app():
-⋮
-
 app/analytics/charts.py:
 ⋮
 │def _text_width(label: str) -> float:
@@ -131,14 +150,10 @@ app/analytics/charts.py:
 ⋮
 │def fmt(value: float, digits: int = 2) -> str:
 ⋮
-│def _nice_ticks(hi: float, count: int = 5) -> tuple[float, float, float]:
-⋮
 │def normalize(
 │    categories: Sequence[Any],
 │    series: Sequence[Any] | None,
 │    values: Sequence[Any] | None,
-⋮
-│def _category_labels(chart: dict[str, Any]) -> list[str]:
 ⋮
 │def bar_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -> str:
 ⋮
@@ -146,13 +161,9 @@ app/analytics/charts.py:
 ⋮
 │def pie_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -> str:
 ⋮
-│def _well_formed(svg: str) -> str | None:
+│def heatmap_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -> str:
 ⋮
 │def _load_font(size: int):
-⋮
-│def _rgb(hex_color: str) -> tuple[int, int, int]:
-⋮
-│def _truncate(draw: Any, text: str, font: Any, max_px: int) -> str:
 ⋮
 │def render_png(
 │    chart_type: str,
@@ -170,33 +181,19 @@ app/analytics/charts.py:
 ⋮
 │    def y_of(v: float) -> float:
 ⋮
-│def _png_cat_labels(draw: Any, cats: list[str], slot: float, x0: float, y1: float, font: Any) -> No
-⋮
-│def _png_pie(draw: Any, cats: list[str], data: list[float], font: Any, small: Any) -> None:
-⋮
 
 app/analytics/reports.py:
 ⋮
 │def current_cst_date() -> date:
-⋮
-│def resolve_range(period: str, end: date | None = None) -> tuple[date, date, str]:
-⋮
-│def collect_metrics(start: date, end: date, scope: Any = None) -> dict[str, Any]:
 ⋮
 │def build_markdown(metrics: dict[str, Any], label: str, charts: list[tuple[str, str]]) -> str:
 ⋮
 
 app/analytics/store.py:
 ⋮
-│def media_type(name: str) -> str | None:
-⋮
 │def reports_dir() -> Path:
 ⋮
 │def artifact_url(name: str) -> str:
-⋮
-│def slugify(text: str, max_len: int = 28) -> str:
-⋮
-│def stamp(prefix: str, ext: str, title: str = "") -> str:
 ⋮
 │def is_safe_name(name: str) -> bool:
 ⋮
@@ -205,17 +202,48 @@ app/analytics/store.py:
 │def write_bytes(
 │    name: str, data: bytes, *, created_by: str = "", title: str = "", params: dict | None = None
 ⋮
-│def _register_ledger(
-│    *, name: str, kind: str, title: str, created_by: str, params: dict | None, size: int
+
+app/askdata/attribution.py:
 ⋮
-│def recent_artifacts(created_by: str = "", limit: int = 10) -> list[dict[str, Any]]:
+│def dsl_diff(was: Any, now: Any) -> dict[str, tuple[Any, Any]]:
+⋮
+│def _as_list(value: Any) -> list[Any]:
+⋮
+
+app/askdata/router.py:
+⋮
+│@router.get("/golden")
+│async def list_golden(
+│    role: str = Query(default="employee", description="调用者角色"),
+│    operator: str = Query(default="", description="调用者工号"),
+│    include_drafts: bool = Query(default=False, description="是否含未启用的草案"),
+│    limit: int = Query(default=200, ge=1, le=2000),
+⋮
+
+app/askdata/store.py:
+⋮
+│def record_event(
+│    *, query_id: str = "", trace_id: str = "", session_id: str = "", user_id: str = "",
+│    event_type: str, payload: Any = None, stage: str = "", conn=None,
+⋮
+│def sample_stats() -> dict[str, int]:
+⋮
+│def record_eval_run(summary: dict[str, Any]) -> str:
+⋮
+│def latest_eval_run(mode: str = "") -> dict[str, Any]:
+⋮
+│def list_golden(*, enabled_only: bool = True, limit: int = 500) -> list[dict[str, Any]]:
+⋮
+│def upsert_golden(
+│    *, question: str, dsl: Any = None, expected_sql: str = "", expected_result: Any = None,
+│    tags: str = "", note: str = "", created_by: str = "", enabled: bool = True,
+│    case_id: str = "", slots: Any = None, difficulty: str = "easy", intent: str = "",
+│    semver: str = "", cacheable: bool = False,
+⋮
+│def golden_cacheable_count() -> int:
 ⋮
 
 app/assistant/a2a_client.py:
-⋮
-│def is_agent_domain(domain: str) -> bool:
-⋮
-│def _pin_card_url(card, base_url: str, domain: str):
 ⋮
 │class A2AClientPool:
 │    """Lazily-resolved A2A clients keyed by agent domain.
@@ -227,42 +255,19 @@ app/assistant/a2a_client.py:
 │      (每个都一次 HTTP + 一整套卡片解析), 而且同一域名可能被写入两次不同的 client。
 │    - 有明确的关停入点: 不关就是常驻连接池在进程退出时留一堆未释放资源。
 ⋮
-│    def _lock_obj(self) -> asyncio.Lock:
-⋮
-│    def _http_client(self) -> httpx.AsyncClient:
-⋮
 │    async def _get_client(self, domain: str) -> A2AClient:
 ⋮
 │    async def aclose(self) -> None:
 ⋮
-│    @staticmethod
-│    def _extract_text(result: Any) -> str:
+
+app/assistant/askdata_bridge.py:
 ⋮
-│    async def send(
-│        self,
-│        domain: str,
-│        text: str,
-│        context_id: str | None = None,
-│        metadata: dict[str, Any] | None = None,
+│def split_askdata_payload(text: str) -> tuple[str, dict[str, Any] | None]:
 ⋮
-│async def close_a2a_pool() -> None:
+│def slots_of(payload: dict[str, Any]) -> dict[str, Any]:
 ⋮
 
 app/assistant/graph.py:
-⋮
-│class AssistantOrchestrator:
-│    """Single-entry Assistant that routes across KB / MCP / A2A layers."""
-│
-⋮
-│    async def setup(self) -> None:
-⋮
-│    async def shutdown(self) -> None:
-⋮
-│    async def refresh_knowledge(self) -> None:
-⋮
-│    def ensure_graph_for_studio(self):
-⋮
-│    async def handle_stream(self, req: ChatRequest) -> str:
 ⋮
 │def get_orchestrator() -> AssistantOrchestrator:
 ⋮
@@ -277,15 +282,9 @@ app/assistant/mcp_client.py:
 ⋮
 │    async def _lock_for(self, server: str | None) -> asyncio.Lock:
 ⋮
-│    def cache_stamp(self, server: str | None) -> float:
-⋮
 │    async def get_tools(self, server: str | None = None) -> list[BaseTool]:
 ⋮
-│    async def refresh(self, server: str | None = None) -> None:
-⋮
 │def get_mcp_pool() -> MCPClientPool:
-⋮
-│def _flatten(result: Any) -> str:
 ⋮
 
 app/assistant/memory.py:
@@ -307,8 +306,6 @@ app/assistant/memory.py:
 ⋮
 │    def _summary_key(self, session_id: str) -> str:
 ⋮
-│    def _local(self, session_id: str) -> SessionMemory:
-⋮
 │    def _local_history_text(self, session_id: str) -> str:
 ⋮
 │    async def _local_append(self, session_id: str, user: str, assistant: str) -> str:
@@ -319,21 +316,22 @@ app/assistant/memory.py:
 │        self, redis, session_id: str, turns_key: str, summary_key: str
 ⋮
 
-app/assistant/router.py:
+app/assistant/slot_store.py:
 ⋮
-│@router.post("/chat", response_model=ChatResponse)
-│async def chat(req: ChatRequest) -> ChatResponse:
+│class SlotStore:
+│    """per-session 的"上一轮问数槽位"存储(Redis 优先, 进程内 LRU 降级)。"""
+│
 ⋮
-│@router.get("/sessions")
-│async def list_sessions(user_id: str, limit: int = 50) -> list[dict]:
+│    def _redis_or_none(self):
 ⋮
-│@router.delete("/sessions/{session_id}")
-│async def delete_session(session_id: str) -> dict[str, str]:
+│    async def get(self, session_id: str) -> dict[str, Any]:
+⋮
+│    async def set(self, session_id: str, slots: dict[str, Any]) -> None:
+⋮
+│    async def clear(self, session_id: str) -> None:
 ⋮
 
 app/assistant/stream.py:
-⋮
-│class RunOverloaded(RuntimeError):
 ⋮
 │class RunBuffer:
 │    """单个 run 的事件缓冲: 自增 id + Event 唤醒, 支持多读者断点重放。
@@ -358,8 +356,6 @@ app/assistant/stream.py:
 ⋮
 │    def mark_seen(self) -> None:
 ⋮
-│    async def iterate(self, from_id: int = 0) -> AsyncIterator[tuple[int, dict[str, Any]]]:
-⋮
 │def bisect_key(events: list[tuple[int, Any]], cursor: int) -> int:
 ⋮
 │class StreamHub:
@@ -377,22 +373,13 @@ app/assistant/stream.py:
 ⋮
 │    def release_run(self) -> None:
 ⋮
-│    @property
-│    def inflight(self) -> int:
-⋮
 │    def create(self, run_id: str) -> RunBuffer:
 ⋮
 │    def get(self, run_id: str) -> RunBuffer | None:
 ⋮
 │    async def append(self, run_id: str, event: dict[str, Any]) -> int | None:
 ⋮
-│    async def finish(self, run_id: str) -> None:
-⋮
-│    def _sweep(self) -> None:
-⋮
 │def get_stream_hub() -> StreamHub:
-⋮
-│def sse_frame(event_id: int, event: dict[str, Any]) -> str:
 ⋮
 
 app/bodies/client.py:
@@ -401,16 +388,12 @@ app/bodies/client.py:
 ⋮
 │def get_mongo_client() -> AsyncIOMotorClient:
 ⋮
-│def get_db():
-⋮
-│async def init_body_schema() -> None:
-⋮
-│async def close_mongo() -> None:
-⋮
 
 app/bodies/store.py:
 ⋮
-│def _split_text(text: str, cap_bytes: int) -> list[str]:
+│def byte_size(text: str) -> int:
+⋮
+│def split_text(text: str, cap_bytes: int) -> list[str]:
 ⋮
 │@dataclass
 │class ParentTextItem:
@@ -419,43 +402,13 @@ app/bodies/store.py:
 │    """正文外置存储门面: 进程级单例, 构造零 I/O(同 PgVectorStore 约定)。"""
 │
 ⋮
-│    async def save_doc_body(
-│        self,
-│        doc_key: str,
-│        *,
-│        raw: str,
-│        normalized: str,
-│        structure: list[dict],
-│        meta: dict | None = None,
-⋮
-│    async def get_doc_body(
-│        self, doc_key: str, *, field: str = "normalized", head_only: bool = False
-⋮
-│    async def delete_doc_body(self, doc_key: str) -> None:
-⋮
 │    async def save_parent_texts(self, items: Sequence[ParentTextItem]) -> int:
 ⋮
 │    async def get_parent_texts(self, parent_ids: Sequence[str]) -> dict[str, str]:
 ⋮
-│    async def delete_parents_by_doc(self, doc_id: str) -> int:
-⋮
-│    async def delete_stale_parents(self, doc_id: str, keep_ids: set[str]) -> int:
-⋮
 │    async def count(self) -> dict[str, int]:
 ⋮
-│    async def prune_orphans(
-│        self, live_doc_keys: set[str], live_parent_ids: set[str]
-⋮
 │def get_body_store() -> BodyStore:
-⋮
-
-app/cache/prompt_cache.py:
-⋮
-│async def cached_llm_call(
-│    model: str,
-│    temperature: float,
-│    prompt: str,
-│    invoke: Callable[[], Awaitable[str]],
 ⋮
 
 app/cache/redis_client.py:
@@ -468,12 +421,12 @@ app/cache/redis_client.py:
 │    default: T | None = None,
 │    what: str = "redis op",
 ⋮
-│async def close_redis() -> None:
-⋮
 
 app/cache/retrieval_cache.py:
 ⋮
 │def acl_signature(principal: Principal | None) -> str:
+⋮
+│async def get_doc_gens(doc_keys: list[str]) -> dict[str, int]:
 ⋮
 │async def invalidate_all() -> None:
 ⋮
@@ -497,14 +450,6 @@ app/chat_store.py:
 │
 ⋮
 │    def _sessions(self) -> async_sessionmaker[AsyncSession]:
-⋮
-│    async def list_sessions(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
-⋮
-│    async def get_messages(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
-⋮
-│    async def delete_session(self, session_id: str) -> None:
-⋮
-│def get_chat_store() -> ChatStore:
 ⋮
 
 app/config.py:
@@ -542,33 +487,127 @@ app/config.py:
 │def get_settings() -> Settings:
 ⋮
 
+app/db/ast_guard.py:
+⋮
+│class ASTGuardError(ValueError):
+⋮
+│def _is_tautology(node: exp.Expression | None) -> bool:
+⋮
+│def _has_tautological_term(node: exp.Expression | None) -> bool:
+⋮
+│def validate_sql(
+│    sql: str,
+│    *,
+│    allowed_tables: set[str],
+│    mode: str = READ_MODE,
+│    max_rows: int | None = None,
+│    normalize: bool = True,
+⋮
+│def estimate_scan_rows(conn: Any, sql: str, params: dict | None = None) -> int | None:
+⋮
+
+app/db/datadsl.py:
+⋮
+│class DslError(ValueError):
+⋮
+│class FilterOp(str, Enum):
+⋮
+│def parse_plan(payload: dict | str) -> DataOpPlan:
+⋮
+│def predicate_sql(filt: Filter, placeholder: str) -> tuple[str, list[str], list[Any]]:
+⋮
+
+app/db/dataops.py:
+⋮
+│def decide_tier(est_rows: int) -> tuple[str, str]:
+⋮
+│def record_audit(
+│    *,
+│    trace_id: str,
+│    scope: DataScope | None,
+│    user_id: str,
+│    role: str,
+│    nl_question: str,
+│    generated: str,
+│    final_sql: str,
+│    decision: str,
+⋮
+│def plan_data_op(
+│    payload: dict | str,
+│    *,
+│    caller_user_id: str,
+│    caller_role: str,
+│    nl_question: str = "",
+│    trace_id: str = "",
+⋮
+│def approval_allowed(approver_role: str, approver_user_id: str, actor_user_id: str) -> str | None:
+⋮
+
 app/db/models.py:
 ⋮
 │class Document(Base):
 ⋮
-│class DocumentTag(Base):
-⋮
-│class Employee(Base):
-⋮
-│class HRTicket(Base):
-⋮
-│class LeaveRecord(Base):
-⋮
 │class Reimbursement(Base):
-⋮
-│class DepartmentBudget(Base):
-⋮
-│class Supplier(Base):
-⋮
-│class PurchaseRequest(Base):
-⋮
-│class ContractReview(Base):
 ⋮
 │class LongTermMemoryRow(Base):
 ⋮
 │class ChatMessage(Base):
 ⋮
 │class ReportArtifact(Base):
+⋮
+
+app/db/policy.py:
+⋮
+│class PolicyError(ValueError):
+⋮
+│def table_columns(table: str) -> frozenset[str]:
+⋮
+│def checked_ident(name: str) -> str:
+⋮
+│class WriteSpec:
+⋮
+│def spec_for(entity: str) -> WriteSpec:
+⋮
+
+app/db/rls.py:
+⋮
+│class RlsError(RuntimeError):
+⋮
+│def read_role() -> str | None:
+⋮
+│def write_role() -> str | None:
+⋮
+│async def ensure_db_principals() -> None:
+⋮
+│async def ensure_rls_policies() -> None:
+⋮
+│async def ensure_audit_immutability() -> None:
+⋮
+│async def rls_status() -> dict[str, object]:
+⋮
+
+app/db/scope.py:
+⋮
+│class ScopeError(ValueError):
+⋮
+│@dataclass(frozen=True)
+│class DataScope:
+│    """一次调用被授权触达的数据范围。"""
+│
+⋮
+│    def dept_scope_text(self) -> str:
+⋮
+│    def session_settings(self) -> dict[str, str]:
+⋮
+│    def scope_params(self) -> dict[str, object]:
+⋮
+│    def scope_clause(self, alias: str = "") -> str:
+⋮
+│def all_dept_roles() -> frozenset[str]:
+⋮
+│def resolve_scope_sync(user_id: str, role: str) -> DataScope:
+⋮
+│async def ensure_data_scope_backfill() -> None:
 ⋮
 
 app/db/sequences.py:
@@ -585,11 +624,7 @@ app/db/sequences.py:
 
 app/db/session.py:
 ⋮
-│def _password() -> str:
-⋮
 │def async_database_url() -> str:
-⋮
-│def _connect_args() -> dict:
 ⋮
 │def get_engine() -> AsyncEngine:
 ⋮
@@ -609,18 +644,7 @@ app/db/sql_guard.py:
 
 app/db/sync.py:
 ⋮
-│def _validated_role(db_role: str | None) -> str | None:
-⋮
-│def _attach_role_events(engine: Engine, db_role: str) -> None:
-⋮
-│def _jsonify(value):
-⋮
-│def _ensure_password() -> str:
-⋮
 │def get_sync_engine(db_role: str | None = None) -> Engine:
-⋮
-│def _apply_session_settings(
-│    conn, session_settings: dict[str, str] | None, timeout_ms: int
 ⋮
 │@contextmanager
 │def scoped_connection(
@@ -645,6 +669,7 @@ app/db/sync.py:
 │    db_role: str | None = None,
 │    session_settings: dict[str, str] | None = None,
 │    max_scan_rows: int | None = None,
+│    timeout_ms: int | None = None,
 ⋮
 
 app/docgen/docx_builder.py:
@@ -656,17 +681,11 @@ app/docgen/genstore.py:
 ⋮
 │def new_token() -> str:
 ⋮
-│def _upload_dir() -> Path:
-⋮
 │def gen_root() -> Path:
 ⋮
 │def new_file_name(ext: str, title: str = "") -> str:
 ⋮
 │def build_path(token: str, file_name: str) -> Path | None:
-⋮
-│def mime_of(ext: str) -> str:
-⋮
-│def cleanup_expired() -> int:
 ⋮
 │def parse_spec(raw: Any) -> tuple[dict[str, Any] | None, str]:
 ⋮
@@ -676,32 +695,12 @@ app/docgen/images.py:
 │async def resolve_images(spec_images: Any, dest_dir: Path) -> tuple[list[dict[str, Any]], list[str]
 ⋮
 
-app/docgen/md_builder.py:
-⋮
-│def _table_md(table: dict[str, Any]) -> list[str]:
-⋮
-
-app/docgen/pdf_builder.py:
-⋮
-│def _ensure_font() -> None:
-⋮
-│def _table_flowable(table: dict[str, Any]) -> Table | None:
-⋮
-│def build_pdf(path: Path, spec: dict[str, Any]) -> None:
-⋮
-│def _append_images(story: list[Any], images: list[dict[str, Any]]) -> None:
-⋮
-
 app/docgen/pptx_builder.py:
-⋮
-│def _bullet_text(item: Any) -> tuple[str, int]:
 ⋮
 │def _add_images(prs: Any, images: list[dict[str, Any]]) -> None:
 ⋮
 
 app/docgen/xlsx_builder.py:
-⋮
-│def _normalize_sheets(spec: dict[str, Any]) -> list[dict[str, Any]]:
 ⋮
 │def _add_images(wb: Any, images: list[dict[str, Any]]) -> None:
 ⋮
@@ -715,14 +714,8 @@ app/docs/normalize.py:
 
 app/docs/parsers.py:
 ⋮
-│def _get_mineru_client() -> httpx.AsyncClient:
-⋮
-│async def close_mineru_client() -> None:
-⋮
 │@dataclass
 │class ParsedBlock:
-⋮
-│def supported_extensions() -> set[str]:
 ⋮
 │def modality_of(path: Path) -> str:
 ⋮
@@ -731,67 +724,17 @@ app/docs/parsers.py:
 ⋮
 │    def flush() -> None:
 ⋮
-│def _page_image_pngs(page) -> list[bytes]:
-⋮
-│async def _parse_pdf(path: Path) -> list[ParsedBlock]:
-⋮
 │def _parse_docx(path: Path) -> list[ParsedBlock]:
 │    """Split docx by Heading styles (supports EN/CN style names)."""
 ⋮
 │    def flush() -> None:
-⋮
-│async def _mineru_parse(filename: str, data: bytes) -> str:
-⋮
-│async def _parse_image(path: Path) -> list[ParsedBlock]:
-⋮
-│async def parse_blocks(path: Path) -> tuple[str, list[ParsedBlock]]:
 ⋮
 
 app/docs/service.py:
 ⋮
 │class UploadError(ValueError):
 ⋮
-│class DocumentForbidden(PermissionError):
-⋮
-│def _upload_dir() -> Path:
-⋮
-│async def stage_upload(filename: str, upload) -> tuple[str, Path, str]:
-⋮
 │async def check_existing(doc_key: str) -> Document | None:
-⋮
-│async def suggest_tags(text: str) -> list[str]:
-⋮
-│def normalize_acl(
-│    visibility: str, owner_id: str, dept_id: str, allowed_roles: list[str] | str
-⋮
-│async def ingest_confirmed(
-│    doc_key: str,
-│    filename: str,
-│    tags: list[str],
-│    uploader: str,
-│    visibility: str = "public",
-│    dept_id: str = "",
-│    allowed_roles: list[str] | str = "",
-⋮
-│async def update_document_acl(
-│    doc_key: str,
-│    visibility: str,
-│    dept_id: str = "",
-│    allowed_roles: list[str] | str = "",
-│    principal: Principal | None = None,
-⋮
-│async def delete_document(doc_key: str, principal: Principal | None = None) -> dict[str, Any]:
-⋮
-│async def get_meta_map(doc_keys: list[str]) -> dict[str, dict[str, Any]]:
-⋮
-│async def list_documents(principal: Principal | None = None) -> list[dict[str, Any]]:
-⋮
-│async def list_tags() -> list[dict[str, Any]]:
-⋮
-
-app/kg/extract.py:
-⋮
-│async def extract_doc_graph(title: str, tags: list[str], text: str) -> DocKG:
 ⋮
 
 app/kg/router.py:
@@ -823,22 +766,6 @@ app/kg/store.py:
 ⋮
 │async def ensure_schema() -> None:
 ⋮
-│async def upsert_document_graph(
-│    doc_key: str,
-│    name: str,
-│    ext: str,
-│    modality: str,
-│    entities: Sequence[dict],
-│    relations: Sequence[dict],
-⋮
-│async def delete_document_graph(doc_key: str) -> None:
-⋮
-│async def query_subgraph(
-│    allowed_doc_keys: Sequence[str],
-│    focus: str | None = None,
-│    hops: int | None = None,
-│    limit: int | None = None,
-⋮
 
 app/kg/vocab.py:
 ⋮
@@ -846,20 +773,12 @@ app/kg/vocab.py:
 ⋮
 │def normalize_entity_type(raw: object) -> str:
 ⋮
-│def pick_type(types: object) -> str:
-⋮
 │def normalize_relation(raw: object, *, enabled: bool = True) -> tuple[str, bool]:
-⋮
-│def relation_is_controlled(relation: str) -> bool:
 ⋮
 │def entity_type_hint() -> str:
 ⋮
-│def relation_vocab_hint() -> str:
-⋮
 
 app/llm.py:
-⋮
-│def _load_model_class(dotted: str):
 ⋮
 │def _render_extra_body(thinking: bool, template: str, effort: str) -> dict[str, Any]:
 ⋮
@@ -870,28 +789,8 @@ app/llm.py:
 │    json_mode: bool = False,
 │    thinking: bool | None = None,
 ⋮
-│def extract_reasoning(msg: AIMessage | AIMessageChunk) -> str:
-⋮
-
-app/main.py:
-⋮
-│def create_app() -> FastAPI:
-⋮
 
 app/mcp_servers/analytics_server.py:
-⋮
-│def _parse_date(value: str, fallback: date) -> date:
-⋮
-│def denied_reason(denial: list[dict[str, Any]]) -> str:
-⋮
-│@mcp.tool()
-│def render_chart(
-│    title: str,
-│    chart_type: str = "bar",
-│    categories: list[Any] | None = None,
-│    series: list[dict[str, Any]] | None = None,
-│    values: list[Any] | None = None,
-│    caller_user_id: str = "",
 ⋮
 │@mcp.tool()
 │def plan_data_op(
@@ -901,35 +800,8 @@ app/mcp_servers/analytics_server.py:
 │    caller_intent_text: str = "",
 │    trace_id: str = "",
 ⋮
-│@mcp.tool()
-│def confirm_data_op(
-│    op_id: str,
-│    caller_user_id: str = "",
-│    caller_role: str = "",
-│    trace_id: str = "",
-⋮
-
-app/mcp_servers/procurement_server.py:
-⋮
-│@mcp.tool()
-│def precheck_purchase_order(
-│    order_no: str, caller_user_id: str = "", caller_role: str = ""
-⋮
-
-app/memory/extraction.py:
-⋮
-│def _parse_date(raw: object) -> datetime | None:
-⋮
-│@dataclass
-│class EpisodeRecord:
-⋮
-│@dataclass
-│class MemoryExtraction:
-⋮
 
 app/memory/graph_store.py:
-⋮
-│def _iso_utc(value: datetime | None) -> str | None:
 ⋮
 │def get_driver() -> AsyncDriver | None:
 ⋮
@@ -943,18 +815,7 @@ app/memory/graph_store.py:
 │    source: str = "turn",
 │    user_aliases: Iterable[str] = (),
 ⋮
-│async def related_facts(
-│    user_id: str,
-│    entity_names: Sequence[str],
-│    hops: int | None = None,
-│    *,
-│    include_expired: bool = False,
-⋮
-│async def entity_names(user_id: str, limit: int = 200) -> list[str]:
-⋮
 │async def user_subgraph(user_id: str, limit: int = 60) -> dict[str, list[dict]]:
-⋮
-│async def close_driver() -> None:
 ⋮
 
 app/memory/graph_vocab.py:
@@ -968,8 +829,6 @@ app/memory/graph_vocab.py:
 │def entity_type(raw: object) -> str | None:
 ⋮
 │def entity_type_hint() -> str:
-⋮
-│def relation_hint() -> str:
 ⋮
 │def type_label(kind: str) -> str:
 ⋮
@@ -997,8 +856,6 @@ app/memory/graph_vocab.py:
 ⋮
 │    def blocked_endpoint(name: str) -> bool:
 ⋮
-│def anchor(plan_result: GraphPlan, existing_names: Iterable[str] = ()) -> GraphPlan:
-⋮
 
 app/memory/personal.py:
 ⋮
@@ -1019,8 +876,6 @@ app/memory/personal.py:
 │        *,
 │        source: str = SOURCE_TURN,
 ⋮
-│    async def consolidate_stable_buckets(self, user_id: str) -> int:
-⋮
 │    async def delete(self, user_id: str, item_id: int) -> bool:
 ⋮
 │    async def clear(self, user_id: str, bucket: MemoryBucket | str) -> int:
@@ -1039,8 +894,6 @@ app/memory/profile_store.py:
 │def is_measurement(key: str) -> bool:
 ⋮
 │def is_correction(key: str) -> bool:
-⋮
-│def _clean(value: Any, max_len: int = 120) -> str:
 ⋮
 │def _as_list(value: Any) -> list[Any]:
 ⋮
@@ -1074,8 +927,6 @@ app/memory/profile_store.py:
 ⋮
 │    async def get(self, user_id: str) -> dict[str, Any]:
 ⋮
-│    async def merge(self, user_id: str, items: list[dict]) -> dict[str, int]:
-⋮
 │    async def clear(self, user_id: str) -> bool:
 ⋮
 │def get_profile_store() -> UserProfileStore:
@@ -1104,13 +955,6 @@ app/memory/temporal.py:
 │def parse_event_time(raw: object) -> datetime | None:
 ⋮
 │def parse_embedded_date(text: str) -> tuple[str, datetime | None]:
-│    """从"值"文本里抽出内嵌时间并剥离, 返回 ``(干净值, 生效时间或 None)``。
-│
-│    存在的理由是老数据自愈: 画像里已经写成了 ``64kg（2015年秋）`` 这种把时间塞进
-│    value 的形式, 升级后必须能自己把时间挪到 ``valid_at`` 轴上 —— 否则这条值看上去
-│    是"今天刚听到的", 会一直压住真正的新值。
-⋮
-│    def _replace_paren(match: re.Match[str]) -> str:
 ⋮
 │@dataclass(frozen=True)
 │class TimedValue:
@@ -1119,9 +963,6 @@ app/memory/temporal.py:
 │    ``explicit`` 标记时间是不是用户明说的: 只有明说的才会在画像摘要里渲染成
 │    "（自 2015-09）" —— 未明说的按"当下生效"处理, 给每个值都挂上记录时间既噪声也大
 │    地挤占 ``profile_max_chars`` 预算。
-⋮
-│    @property
-│    def effective_at(self) -> datetime | None:
 ⋮
 │    def to_dict(self) -> dict[str, Any]:
 ⋮
@@ -1138,14 +979,10 @@ app/memory/temporal.py:
 ⋮
 │def format_month(stamp: datetime | None) -> str:
 ⋮
-│def format_day(stamp: datetime | None) -> str:
-⋮
 │def today_cst() -> datetime:
 ⋮
 
 app/memory/vector_store.py:
-⋮
-│def _is_same_observation(existing: datetime | None, incoming: datetime | None, window_days: int) ->
 ⋮
 │@dataclass
 │class MemoryHit:
@@ -1170,13 +1007,6 @@ app/memory/vector_store.py:
 │    async def search_memories(
 │        self, user_id: str, query: str, top_k: int | None = None
 ⋮
-│    async def search_by_buckets(
-│        self,
-│        user_id: str,
-│        query: str,
-│        kinds: Sequence[str],
-│        limit: int | None = None,
-⋮
 │    async def list_recent(
 │        self,
 │        user_id: str,
@@ -1185,17 +1015,8 @@ app/memory/vector_store.py:
 │        *,
 │        order_by: str = "last_accessed_at",
 ⋮
-│    async def count_by_kind(self, user_id: str) -> dict[str, int]:
-⋮
-│    async def delete_items(self, user_id: str, memory_ids: Sequence[int]) -> int:
-⋮
-│    async def merge_group(
-│        self, user_id: str, keep_id: int, content: str, drop_ids: Sequence[int]
-⋮
 │    async def update_memory_content(
 │        self, user_id: str, memory_id: int, content: str, title: str = ""
-⋮
-│    async def clear_bucket(self, user_id: str, kind: str) -> int:
 ⋮
 │def get_long_term_store() -> LongTermMemoryStore:
 ⋮
@@ -1216,14 +1037,6 @@ app/procurement/rules.py:
 ⋮
 │    def to_dict(self) -> dict[str, Any]:
 ⋮
-│def _parse_date(value: Any) -> date | None:
-⋮
-│def _to_decimal(value: Any) -> Decimal:
-⋮
-│def _risk_of(findings: list[Finding]) -> str:
-⋮
-│def _conclusion(risk_level: str, findings: list[Finding]) -> str:
-⋮
 │def precheck_contract(
 │    *,
 │    content: str = "",
@@ -1235,26 +1048,10 @@ app/procurement/rules.py:
 │    sign_date: Any = None,
 │    effective_date: Any = None,
 ⋮
-│def precheck_purchase_order(
-│    *,
-│    amount: Any,
-│    department: str = "",
-│    supplier_name: str = "",
-│    quotes_count: int = 1,
-│    category: str = "",
-│    budget: dict[str, Any] | None = None,
-│    supplier: dict[str, Any] | None = None,
-⋮
 
 app/rag/bm25.py:
 ⋮
 │def tokenize(text: str) -> list[str]:
-⋮
-│def _token_field(text: str) -> str:
-⋮
-│def _acl_filter(principal: Principal | None) -> list[dict]:
-⋮
-│def _doc_source(chunk: KnowledgeChunk) -> dict:
 ⋮
 │class ElasticBM25Retriever:
 │    """BM25 lexical channel backed by Elasticsearch.
@@ -1270,27 +1067,21 @@ app/rag/bm25.py:
 ⋮
 │    async def ensure_index(self) -> None:
 ⋮
-│    async def _create_index(self) -> None:
-⋮
 │    async def rebuild(self, chunks_or_iter) -> None:
 ⋮
 │    async def index_chunks(self, chunks: Sequence[KnowledgeChunk], refresh: bool = True) -> None:
+⋮
+│    async def count(self) -> int:
 ⋮
 │    async def search(
 │        self, query: str, top_k: int, principal: Principal | None = None
 ⋮
 │def get_es_bm25() -> ElasticBM25Retriever:
 ⋮
-│async def close_es_client() -> None:
-⋮
 
 app/rag/embeddings.py:
 ⋮
-│def _get_query_gate() -> asyncio.Semaphore:
-⋮
 │def get_embedder_client() -> httpx.AsyncClient:
-⋮
-│async def close_embedder_client() -> None:
 ⋮
 │class OllamaEmbedder:
 │    """Thin async client for Ollama's /api/embed endpoint.
@@ -1299,52 +1090,12 @@ app/rag/embeddings.py:
 │    multilingual + long-context (8k) inputs, which fits enterprise
 │    Chinese/English mixed documents.
 ⋮
-│    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-⋮
 │    async def embed_query(self, text: str) -> list[float]:
-⋮
-│    async def _embed_one(self, text: str, timeout: float) -> list[list[float]]:
 ⋮
 
 app/rag/ingest.py:
 ⋮
 │def compute_doc_id(name: str, ext: str) -> str:
-⋮
-│def split_chunks(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-⋮
-│def build_structure(blocks: Sequence[ParsedBlock], normalized_text: str) -> list[dict]:
-⋮
-│def build_parent_child(
-│    doc_id: str,
-│    title: str,
-│    source: str,
-│    modality: str,
-│    blocks: Sequence[ParsedBlock],
-│    normalized_text: str,
-│    parent_max: int | None = None,
-│    acl: dict[str, str] | None = None,
-⋮
-│async def ingest_blocks(
-│    doc_id: str,
-│    filename: str,
-│    title: str,
-│    source: str,
-│    modality: str,
-│    blocks: Sequence[ParsedBlock],
-│    store: ChunkStore,
-│    embedder: OllamaEmbedder,
-│    acl: dict[str, str] | None = None,
-⋮
-│async def ingest_file(
-│    path: Path, store: ChunkStore, embedder: OllamaEmbedder, bodies=None
-⋮
-│async def ingest_directory(
-│    dir_path: Path,
-│    store: ChunkStore,
-│    embedder: OllamaEmbedder,
-│    failures: list[tuple[str, str]] | None = None,
-⋮
-│async def collect_corpus(store: ChunkStore, limit: int = 100000) -> list[KnowledgeChunk]:
 ⋮
 
 app/rag/reranker.py:
@@ -1353,19 +1104,7 @@ app/rag/reranker.py:
 ⋮
 │async def close_reranker_client() -> None:
 ⋮
-│def _parse_scores(payload: object, n: int) -> list[float]:
-⋮
 │class TeiReranker:
-│    """Score (query, chunk) relevance with a real cross-encoder served by TEI."""
-│
-⋮
-│    @staticmethod
-│    def _doc_text(chunk: KnowledgeChunk, max_chars: int) -> str:
-⋮
-│    async def rerank(
-│        self, query: str, chunks: Sequence[KnowledgeChunk], top_n: int
-⋮
-│    async def probe(self) -> bool:
 ⋮
 │def get_reranker() -> TeiReranker:
 ⋮
@@ -1378,23 +1117,25 @@ app/rag/retriever.py:
 ⋮
 │    async def rebuild_bm25(self) -> None:
 ⋮
-│    async def retrieve(
-│        self,
-│        query: str,
-│        top_k: int | None = None,
-│        top_n: int | None = None,
-│        principal: Principal | None = None,
-⋮
 │    async def assemble_parents(self, chunks: Sequence[KnowledgeChunk]) -> list[KnowledgeChunk]:
+⋮
+│    def format_context(
+│        self,
+│        chunks: Sequence[KnowledgeChunk],
+│        meta_map: dict[str, dict[str, Any]] | None = None,
 ⋮
 
 app/rag/vectorstore.py:
 ⋮
-│def _acl_predicate(R: Any, principal: Principal | None) -> ColumnElement[bool] | None:
+│async def upsert_rows(
+│    session: AsyncSession, dialect_insert, rows: list[dict], pk_col, upsert_cols
 ⋮
-│def _chunks_from_narrow(row: Any, score: float) -> KnowledgeChunk:
-⋮
-│def _chunk_row(c: KnowledgeChunk, v: Sequence[float] | None) -> dict[str, Any]:
+│async def publish_in_session(
+│    session: AsyncSession,
+│    doc_id: str,
+│    parent_rows: Sequence[ParentBlock],
+│    chunks: Sequence[KnowledgeChunk],
+│    vectors: Sequence[Sequence[float] | None],
 ⋮
 │class ChunkStore:
 │    """子块持久化 + ANN 检索(doc_chunks)。构造零 I/O。"""
@@ -1410,36 +1151,16 @@ app/rag/vectorstore.py:
 ⋮
 │    async def get_texts(self, chunk_ids: Sequence[str]) -> dict[str, str]:
 ⋮
-│    async def attach_texts(self, chunks: Sequence[KnowledgeChunk]) -> list[KnowledgeChunk]:
-⋮
-│    async def existing_hashes(self, doc_id: str) -> dict[str, str]:
-⋮
-│    async def get_embeddings(self, chunk_ids: Sequence[str]) -> dict[str, list[float]]:
-⋮
 │    async def iter_chunk_corpus(
 │        self, page_size: int | None = None
 ⋮
-│    async def iter_child_chunks(self, limit: int = 100000) -> list[KnowledgeChunk]:
-⋮
-│    @staticmethod
-│    def _row_with_vec(c: KnowledgeChunk, v: Sequence[float] | None) -> dict[str, Any]:
-⋮
-│    @staticmethod
-│    async def _upsert_batch(
-│        session: AsyncSession, dialect_insert, rows: list[dict], pk_col, upsert_cols
-⋮
-│    async def publish_parent_child(
+│    async def publish_and_mark(
 │        self,
-│        parent_store: "ParentStore",
 │        doc_id: str,
 │        parent_rows: Sequence[ParentBlock],
 │        chunks: Sequence[KnowledgeChunk],
 │        vectors: Sequence[Sequence[float] | None],
-⋮
-│    async def update_acl_by_doc(
-│        self, doc_id: str, visibility: str, owner_id: str, dept_id: str, allowed_roles: str
-⋮
-│    async def counts(self) -> dict[str, int]:
+│        session: AsyncSession | None = None,
 ⋮
 │    async def count(self) -> int:
 ⋮
@@ -1449,18 +1170,10 @@ app/rag/vectorstore.py:
 ⋮
 │    def _sessions(self) -> async_sessionmaker[AsyncSession]:
 ⋮
-│    async def get_blocks(self, parent_ids: Sequence[str]) -> dict[str, ParentBlock]:
-⋮
-│def _parent_row(p: ParentBlock) -> dict[str, Any]:
-⋮
 
 app/schemas.py:
 ⋮
 │class Role(str, Enum):
-⋮
-│class DocVisibility(str, Enum):
-⋮
-│class IntentType(str, Enum):
 ⋮
 │class IntentResult(BaseModel):
 ⋮
@@ -1481,13 +1194,6 @@ app/security/acl.py:
 ⋮
 │@dataclass(frozen=True)
 │class Principal:
-│    """Caller identity resolved from the unified identity system."""
-│
-⋮
-│    @property
-│    def is_admin(self) -> bool:
-⋮
-│def format_allowed_roles(roles: list[str] | tuple[str, ...] | str) -> str:
 ⋮
 │def parse_allowed_roles(stored: str) -> list[str]:
 ⋮
@@ -1498,14 +1204,10 @@ app/security/acl.py:
 │    allowed_roles: str,
 │    principal: Principal,
 ⋮
-│def is_allowed(chunk: KnowledgeChunk, principal: Principal) -> bool:
-⋮
 │def can_manage_document(principal: Principal, created_by: str) -> bool:
 ⋮
 
 app/security/audit.py:
-⋮
-│class _Barrier:
 ⋮
 │def new_trace_id() -> str:
 ⋮
@@ -1521,12 +1223,6 @@ app/security/audit.py:
 │        detail: dict[str, Any] | None = None,
 │        session_id: str | None = None,
 ⋮
-│    def _enqueue(self, line: str) -> None:
-⋮
-│    def _ensure_thread(self) -> None:
-⋮
-│    def _consume(self, item: Any, buf: list[str]) -> bool:
-⋮
 │    def _flush_buf(self, buf: list[str]) -> None:
 ⋮
 │    def flush(self, timeout: float = 2.0) -> bool:
@@ -1535,8 +1231,6 @@ app/security/audit.py:
 ⋮
 │def get_audit_logger() -> AuditLogger:
 ⋮
-│def shutdown_audit(timeout: float = 2.0) -> None:
-⋮
 
 app/security/auth.py:
 ⋮
@@ -1544,7 +1238,7 @@ app/security/auth.py:
 ⋮
 │def analytics_whitelist(role: Role) -> set[str]:
 ⋮
-│def _capability_roles() -> frozenset[str]:
+│def askdata_whitelist(role: Role) -> set[str]:
 ⋮
 │def capability_allowed(capability: str) -> set[str]:
 ⋮
@@ -1555,18 +1249,8 @@ app/security/auth.py:
 
 app/security/caller.py:
 ⋮
-│def _clip(text: str, limit: int = 500) -> str:
-⋮
 │@dataclass(frozen=True)
 │class Caller:
-│    """服务端解析出的调用者主体(与 app.security.acl.Principal 同字段口径)。"""
-│
-⋮
-│    @property
-│    def is_privileged(self) -> bool:
-⋮
-│    @property
-│    def is_admin(self) -> bool:
 ⋮
 │def set_caller(caller: Caller | None) -> Token:
 ⋮
@@ -1577,16 +1261,6 @@ app/security/caller.py:
 │def caller_tool_args() -> dict[str, str]:
 ⋮
 │def bind_caller(tool):
-│    """包一层: 调用前用当前上下文的调用者覆盖工具里的 ``caller_*`` 参数。
-│
-│    给**不经 Tool Cache 的工具集**用(专业智能体自己的 MCP 客户端); 编排层的工具走
-│    :func:`app.cache.tool_cache.wrap_tools_for_cache`, 那一层为了把调用者算进缓存 key
-│    已经自己合一次了。两边都只从 :func:`caller_tool_args` 取份, 注入字段不会两处漂移。
-│
-│    参数表里没有 ``caller_user_id`` 的工具(如进程内的 web/docgen 工具)原样返回,
-│    否则它们的签名会拿到意料之外的关键字参数。
-⋮
-│    async def _coro(**kwargs):
 ⋮
 │def bind_caller_tools(tools: list) -> list:
 ⋮
@@ -1614,15 +1288,16 @@ app/security/caller.py:
 
 app/security/masking.py:
 ⋮
-│def _mask_plain(text: str) -> str:
-⋮
 │def mask_text(text: str) -> str:
 ⋮
 │def mask_sensitive(data: Any) -> Any:
 ⋮
-│def dlp_columns() -> set[str]:
+│def mask_round_trip(
+│    text: str,
+│    *,
+│    extra_patterns: Sequence[tuple[str, re.Pattern[str]]] | None = None,
 ⋮
-│def mask_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+│def dlp_columns() -> set[str]:
 ⋮
 
 app/security/quota.py:
@@ -1630,19 +1305,181 @@ app/security/quota.py:
 │def resolve_daily_limit() -> int:
 ⋮
 
+app/security/spotlight.py:
+⋮
+│def is_suspicious(text: str) -> bool:
+⋮
+│def scan_rows(rows: list[dict[str, Any]], *, max_cells: int = 10) -> list[str]:
+⋮
+│def mark_payload(payload: Any, *, scope_note: str = "") -> Any:
+⋮
+
 app/security/url_guard.py:
 ⋮
 │class UrlBlocked(ValueError):
 ⋮
-│def _host_allowed_by_allowlist(host: str, allowlist: list[str]) -> bool:
-⋮
-│def _parse_allowlist() -> list[str]:
-⋮
-│def _is_denied_literal(host: str) -> bool:
-⋮
-│def _all_global(ips: list[str]) -> bool:
-⋮
 │async def resolve_and_validate(url: str) -> list[str]:
+⋮
+
+app/semantic/catalog.py:
+⋮
+│def fingerprint(parts: list[str]) -> str:
+⋮
+│@dataclass(frozen=True)
+│class DimCompat:
+⋮
+│@dataclass(frozen=True)
+│class TimeSemantic:
+⋮
+│@dataclass(frozen=True)
+│class RowPolicy:
+⋮
+│@dataclass(frozen=True)
+│class ColPolicy:
+⋮
+│@dataclass(frozen=True)
+│class Metric:
+│    """一个指标定义(与 ``sem_metrics`` 表列一一对应)。"""
+│
+⋮
+│    def caliber_note(self) -> str:
+⋮
+│@dataclass(frozen=True)
+│class Dimension:
+│    """一个维度定义(维度身份 = 语义概念 + 落在哪张表, 所以"部门"会有多行)。"""
+│
+⋮
+│    def sample_values(self, limit: int = 6) -> str:
+⋮
+│@dataclass
+│class MetricCatalog:
+│    """一次语义层快照(进程级缓存的单位; 构建成本 = 几张元数据表的几条 SELECT)。"""
+│
+⋮
+│    def compat_for(self, metric_id: str, dim_id: str) -> DimCompat | None:
+⋮
+│    def compatible_dim_ids(self, metric: Metric) -> frozenset[str]:
+⋮
+│    def denied_columns_for(self, role: str, table: str) -> frozenset[str]:
+⋮
+│    def get_metric(self, metric_id: str) -> Metric | None:
+⋮
+│    def domains(self) -> list[str]:
+⋮
+│    def metrics_in_domain(self, domain: str) -> list[Metric]:
+⋮
+│    def render_metrics(self, domain: str = "all", limit: int = 80) -> str:
+⋮
+│    def render_dimensions(self, limit: int = 60) -> str:
+⋮
+
+app/semantic/compiler.py:
+⋮
+│class CompileError(ValueError):
+⋮
+│@dataclass
+│class Compiled:
+⋮
+│def compile_analytical(
+│    spec: QuerySpec,
+│    *,
+│    catalog: MetricCatalog,
+│    scope: Any,
+│    check: ValidationResult | None = None,
+│    allowed_tables: set[str] | None = None,
+│    max_rows: int = 100,
+⋮
+│def transpile_sql(sql: str, dialect: str) -> str:
+⋮
+
+app/semantic/dsl.py:
+⋮
+│class DslError(ValueError):
+⋮
+│class SpecTime(BaseModel):
+⋮
+│def parse_dsl(payload: dict | str) -> QuerySpec:
+⋮
+
+app/semantic/link.py:
+⋮
+│@dataclass(frozen=True)
+│class Candidate:
+│    """一条链接候选(指标/维度/枚举归属)。"""
+│
+⋮
+│    def to_dict(self) -> dict[str, Any]:
+⋮
+│def _build(kind: str, target_id: str, catalog: MetricCatalog, *, score: float, channel: str,
+⋮
+
+app/semantic/registry.py:
+⋮
+│def get_catalog(force_refresh: bool = False) -> MetricCatalog:
+⋮
+│def load_definitions():
+⋮
+│async def ensure_seeded() -> dict[str, int]:
+⋮
+│def table_obj(name: str):
+⋮
+
+app/semantic/seed.py:
+⋮
+│def build_catalog(origin: str = "seed", built_at: float = 0.0) -> MetricCatalog:
+⋮
+
+app/semantic/timesem.py:
+⋮
+│class TimeError(ValueError):
+⋮
+│@dataclass(frozen=True)
+│class ResolvedRange:
+⋮
+│def today_cst() -> date:
+⋮
+│def detect_phrase(text: str) -> str:
+⋮
+│def normalize_range(raw: str) -> str:
+⋮
+│def _month_start(d: date) -> date:
+⋮
+│def _quarter_start(d: date) -> date:
+⋮
+│def _add_months(d: date, months: int) -> date:
+⋮
+│def _add_years(d: date, years: int) -> date:
+⋮
+│def resolve(
+│    time: SpecTime | dict | None,
+│    *,
+│    compare: str = "none",
+│    today: date | None = None,
+│    default_gran: str = "none",
+│    max_span_days: int | None = None,
+⋮
+│def _with_compare(r: ResolvedRange, compare: str) -> ResolvedRange:
+⋮
+
+app/semantic/validate.py:
+⋮
+│@dataclass(frozen=True)
+│class Issue:
+│    """一条校验结论: 错误码 + 可读原因 + 出问题的字段。"""
+│
+⋮
+│    def to_dict(self) -> dict[str, str]:
+⋮
+│@dataclass(frozen=True)
+│class CallerScope:
+│    """校验需要的最小作用域信息(从 ``DataScope`` 投影, 避免本模块依赖 DB 层)。"""
+│
+⋮
+│    @classmethod
+│    def from_scope(cls, scope: Any) -> "CallerScope":
+⋮
+│@dataclass
+│class ValidationResult:
 ⋮
 
 app/tools/_http.py:
@@ -1651,112 +1488,78 @@ app/tools/_http.py:
 ⋮
 │def get_search_client() -> httpx.AsyncClient:
 ⋮
-│async def close_web_client() -> None:
-⋮
-
-app/tools/docgen.py:
-⋮
-│async def _generate(
-│    kind: str, spec_raw: Any, builder, title_fallback: str, *, resolve_imgs: bool = True
-⋮
-
-app/tools/web.py:
-⋮
-│def _extract_text(html: str) -> tuple[str, str]:
-⋮
 
 app/tracing.py:
 ⋮
-│def init_tracing() -> bool:
-⋮
 │def init_langfuse() -> bool:
 ⋮
-│def shutdown_langfuse() -> None:
+
+scripts/askdata_eval/__main__.py:
+⋮
+│def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+⋮
+│def load_cases_for(args: argparse.Namespace) -> list[dict[str, Any]]:
 ⋮
 
-main.py:
-│def main():
+scripts/askdata_eval/cases.py:
+⋮
+│def load_cases(*, limit: int | None = None, tag: str = "") -> list[dict[str, Any]]:
 ⋮
 
-scripts/bench_doc_stores.py:
+scripts/askdata_eval/judge.py:
 ⋮
-│async def main() -> None:
+│def compare_columns(expected: list[str], actual: list[str]) -> tuple[bool, str]:
+⋮
+│def compare_rows(expected: list[dict[str, Any]], actual: list[dict[str, Any]],
+⋮
+│def judge_with_llm(case: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
+⋮
+│def dsl_exact_match(expected: dict[str, Any], actual: dict[str, Any]) -> tuple[bool, str]:
+⋮
+│def mis_clarified(case: dict[str, Any], actual: dict[str, Any]) -> bool:
 ⋮
 
-scripts/build_doc_kg.py:
+scripts/askdata_eval/report.py:
 ⋮
-│async def main() -> None:
+│def reports_dir(base: Path | None = None) -> Path:
+⋮
+│def render_markdown(summary: dict[str, Any]) -> str:
+⋮
+│def write_reports(summary: dict[str, Any], base: Path | None = None) -> tuple[Path, Path]:
+⋮
+
+scripts/askdata_eval/runner.py:
+⋮
+│def eval_scope() -> DataScope:
+⋮
+│async def run_agent(case: dict[str, Any], *, agent: Any = None) -> dict[str, Any]:
+⋮
+│async def probe_agent_mode() -> str:
 ⋮
 
 scripts/clean_personal_graph.py:
 ⋮
 │def should_drop_node(name: str, etype: str) -> str:
 ⋮
-│def clean_user(url: str, uid: str, *, apply: bool) -> dict[str, int]:
-⋮
-│def main() -> int:
-⋮
 
 scripts/demo_reimburse.py:
 ⋮
 │async def turn(client: httpx.AsyncClient, session: str, message: str) -> dict:
 ⋮
-│async def main() -> None:
-⋮
 
-scripts/dev_services.py:
+scripts/gen_arch_xmind.py:
 ⋮
-│class Check:
-│    """一条检查: 目标地址 + 探测协程 + 失败时的修复提示。"""
-│
-⋮
-│    async def run(self) -> "Check":
-⋮
-│def _read_env_pairs(rel: str) -> dict[str, str]:
-⋮
-│def main(argv: list[str] | None = None) -> int:
+│def add_node(parent: ET.Element, text: str, children=None, color=None, folded=False):
 ⋮
 
 scripts/gen_repo_map.py:
 ⋮
 │def collect_fnames(root: Path, io: InputOutput, all_files: bool) -> list[str]:
 ⋮
-│def main() -> int:
-⋮
-
-scripts/ingest_knowledge.py:
-⋮
-│async def main() -> None:
-⋮
-
-scripts/init_db.py:
-⋮
-│async def main() -> None:
-⋮
-
-scripts/migrate_doc_stores.py:
-⋮
-│def seq_hint(chunk_id: str) -> int | None:
-⋮
-│async def verify_only() -> int:
-⋮
-│async def drop_legacy() -> None:
-⋮
-│async def main() -> None:
-⋮
-
-scripts/migrate_kg_edges.py:
-⋮
-│async def main() -> None:
-⋮
 
 scripts/msmarco_eval/__main__.py:
 ⋮
 │def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-⋮
-│async def run(args: argparse.Namespace) -> int:
-⋮
-│def main(argv: list[str] | None = None) -> int:
 ⋮
 
 scripts/msmarco_eval/chunking_ab.py:
@@ -1786,11 +1589,7 @@ scripts/msmarco_eval/chunking_ab.py:
 ⋮
 │def write_ab(ab: dict, arms: dict, args) -> tuple[Path, Path]:
 ⋮
-│async def run(args) -> int:
-⋮
 │def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-⋮
-│def main(argv: list[str] | None = None) -> int:
 ⋮
 
 scripts/msmarco_eval/dataset.py:
@@ -1814,11 +1613,6 @@ scripts/msmarco_eval/dataset.py:
 ⋮
 
 scripts/msmarco_eval/harness.py:
-⋮
-│def corpus_to_chunks(
-│    corpus: dict[str, dict],
-⋮
-│def _connect_args() -> dict:
 ⋮
 │async def provision_eval_database(database: str = DEFAULT_EVAL_DB) -> AsyncEngine:
 ⋮
@@ -1856,17 +1650,7 @@ scripts/msmarco_eval/harness.py:
 
 scripts/msmarco_eval/metrics.py:
 ⋮
-│def hit_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
-⋮
-│def precision_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
-⋮
-│def recall_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
-⋮
-│def mrr_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
-⋮
 │def dcg_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
-⋮
-│def ndcg_at_k(ranked: Sequence[str], relevant: set[str], k: int) -> float:
 ⋮
 │def evaluate_run(
 │    rankings: dict[str, Sequence[str]],
@@ -1889,50 +1673,9 @@ scripts/msmarco_eval/report.py:
 │def write_reports(report: dict, out_dir: Path | None = None) -> tuple[Path, Path]:
 ⋮
 
-scripts/package.py:
-⋮
-│def build_frontend(skip_install: bool) -> None:
-⋮
-│def write_deploy_doc(staging: Path, name: str) -> None:
-⋮
-│def scan_staged(staging: Path) -> list[str]:
-⋮
-│def make_archive(staging: Path, out_root: Path, use_tar: bool) -> Path:
-⋮
-│def write_manifest(staging: Path, meta: dict) -> dict:
-⋮
-│def validate_compose(staging: Path) -> None:
-⋮
-│def main(argv: list[str] | None = None) -> int:
-⋮
-
-scripts/smoke_langfuse.py:
-⋮
-│async def main() -> int:
-⋮
-
 scripts/smoke_rerank.py:
 ⋮
-│async def run(args: argparse.Namespace) -> int:
-⋮
 │def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-⋮
-
-scripts/smoke_tools.py:
-⋮
-│async def check_url_guard() -> None:
-⋮
-│async def check_tools_surface() -> None:
-⋮
-│async def check_fetch_guard() -> None:
-⋮
-│def check_builders(keep: bool) -> None:
-⋮
-│def check_capability_routing() -> None:
-⋮
-│def check_masking_and_routes() -> None:
-⋮
-│def main(argv: list[str] | None = None) -> int:
 ⋮
 
 scripts/stress_concurrency.py:
@@ -1942,66 +1685,64 @@ scripts/stress_concurrency.py:
 ⋮
 │async def probe_readiness(client: httpx.AsyncClient, base: str) -> dict[str, Any]:
 ⋮
-│async def main() -> int:
+
+scripts/test_askdata.py:
+⋮
+│def gateway_base() -> str:
+⋮
+│def chat(text: str, *, targets: list[str] | None = None, session: str = "", user: str = USER) -> di
+⋮
+│def askdata_of(data: dict) -> dict:
 ⋮
 
-scripts/test_concurrency_offline.py:
+scripts/test_askdata_offline.py:
 ⋮
-│def check(name: str, ok: bool, detail: str = "") -> None:
+│class _CatalogWith:
+│    """测试替身: 只换 metrics, 其他查表逻辑走真目录。"""
+│
 ⋮
-│async def read_all(buf: RunBuffer, from_id: int = 0, limit: int = 100000) -> list[int]:
+│    def get_metric(self, metric_id: str):
 ⋮
-│async def test_run_buffer_bounded() -> None:
+│def test_compiler() -> None:
+│    print("\n4) 编译器: 作用域注入 / 绑参 / AST 自校验 / 同环比形状")
 ⋮
-│async def test_run_buffer_no_polling_scan() -> None:
-│    print("\n2) RunBuffer: 空闲读者不再轮询扫描(靠 Event 唤醒)")
+│    def compile(raw: dict, *, mode: str = "analytical") -> compiler.Compiled:
 ⋮
-│    async def reader() -> None:
+│def test_clarify_gate() -> None:
+│    print("\n7) 澄清门与开关")
 ⋮
-│async def test_run_buffer_many_readers() -> None:
-│    print("\n3) RunBuffer: 多读者独立续流(断线重放)")
-⋮
-│    async def reader(name: str, from_id: int) -> None:
-⋮
-│async def test_hub_gate() -> None:
-⋮
-│async def test_overload_raises() -> None:
-⋮
-│async def test_audit_batched() -> None:
-⋮
-│async def test_audit_sync_fallback_after_close() -> None:
-⋮
-│async def test_masking_still_applied() -> None:
-⋮
-│async def main() -> int:
-⋮
-│async def test_fetch_url_streaming() -> None:
+│    async def run_gate(slots: dict, candidates: list[dict]) -> dict:
 ⋮
 
-scripts/test_graph_vocab_offline.py:
+scripts/test_ast_guard_offline.py:
 ⋮
-│def test_entity_types() -> None:
+│def denied(name: str, sql: str, mode: str = READ_MODE) -> None:
 ⋮
-│def test_relation_vocab() -> None:
+
+scripts/test_contract_workflow_offline.py:
 ⋮
-│def test_artifact_names() -> None:
+│def test_agent_card() -> None:
 ⋮
-│def test_plan_drops_world_knowledge_and_artifacts() -> None:
+│def test_prompts_format() -> None:
 ⋮
-│def test_plan_keeps_user_relations() -> None:
+│def test_config_fields() -> None:
 ⋮
-│def test_anchor_requires_connectivity() -> None:
+
+scripts/test_dataops_dsl_offline.py:
 ⋮
-│def test_isolated_entities_are_not_written() -> None:
+│def plan_rejected(name: str, payload: dict) -> None:
 ⋮
-│def test_prompt_renders_vocab() -> None:
+
+scripts/test_finance_agentic_offline.py:
 ⋮
-│def main() -> int:
+│def test_agent_card() -> None:
+⋮
+│def test_prompts_format() -> None:
+⋮
+│def test_config_fields() -> None:
 ⋮
 
 scripts/test_kg_edges_offline.py:
-⋮
-│def _payload(entities: list[dict], relations: list[dict]) -> str:
 ⋮
 │def test_entity_identity() -> None:
 ⋮
@@ -2021,31 +1762,6 @@ scripts/test_kg_edges_offline.py:
 ⋮
 │def test_migration_grouping() -> None:
 ⋮
-│def main() -> int:
-⋮
-
-scripts/test_memory_temporal_offline.py:
-⋮
-│def test_temporal_parse() -> None:
-⋮
-│def test_measure_keys_never_overwritten_by_past_statements() -> None:
-⋮
-│def test_single_statement_semantics_per_key_class() -> None:
-⋮
-│def test_recent_dated_change_beats_same_day_statement() -> None:
-⋮
-│def test_legacy_row_self_heals() -> None:
-⋮
-│def test_render_summary() -> None:
-⋮
-│def test_extraction_time_fields() -> None:
-⋮
-│def test_episode_bucket_rejects_conversation_products() -> None:
-⋮
-│def test_observation_window_and_no_time_regression() -> None:
-⋮
-│def main() -> int:
-⋮
 
 scripts/test_multi_agent.py:
 ⋮
@@ -2063,45 +1779,16 @@ scripts/test_multi_agent.py:
 ⋮
 │def status_texts(events: list[dict], stage: str) -> list[str]:
 ⋮
-│def sections(answer: str) -> list[str]:
-⋮
 │def agent_intervals(trace_id: str, expect: int = 0, wait_s: float | None = None) -> list[dict]:
 ⋮
 │async def get_agents(client: httpx.AsyncClient, role: str) -> list[dict]:
 ⋮
 │def domains_of(items: list[dict]) -> set[str]:
 ⋮
-│async def main() -> int:
-⋮
-
-scripts/test_multi_agent_offline.py:
-⋮
-│def test_request_normalization() -> None:
-⋮
-│def test_normalize_targets() -> None:
-⋮
-│def test_agent_display() -> None:
-⋮
-│def test_merge_answers() -> None:
-⋮
-│def test_build_response() -> None:
-⋮
-│def test_graph_wiring() -> None:
-⋮
-│def test_domain_registry_coherence() -> None:
-⋮
-│def test_settings_defaults() -> None:
-⋮
-│def test_kill_switch() -> None:
-⋮
-│def main() -> int:
-⋮
 
 scripts/test_sse_resume.py:
 ⋮
 │def parse_frame(frame: str) -> tuple[int | None, dict | None]:
-⋮
-│async def main() -> None:
 ⋮
 
 scripts/test_stream_hub.py:
@@ -2109,9 +1796,6 @@ scripts/test_stream_hub.py:
 │async def replay_test() -> None:
 ⋮
 │async def live_test() -> None:
-│    hub = get_stream_hub()
-⋮
-│    async def reader() -> None:
 ⋮
 │async def main_all() -> None:
 ⋮
@@ -2119,10 +1803,6 @@ scripts/test_stream_hub.py:
 scripts/test_tools_flow.py:
 ⋮
 │def parse_frame(frame: str) -> dict | None:
-⋮
-│async def chat(client: httpx.AsyncClient, message: str, session_id: str, role: str = ROLE) -> dict:
-⋮
-│async def main() -> int:
 ⋮
 
 web-ui/src/composables/useEmployee.js:
@@ -2135,17 +1815,6 @@ web-ui/src/composables/useEmployee.js:
 │    /* localStorage 不可用时降级为默认值 */
 │  }
 │  return EMPLOYEES.find((e) => e.empId === saved) || EMPLOYEES.find((e) => e.empId === DEFAULT_EMP_
-⋮
-│export function useEmployee() {
-│  function switchEmployee(empId) {
-│    const emp = EMPLOYEES.find((e) => e.empId === empId)
-│    if (!emp) return
-│    Object.assign(state.current, emp)
-│    try {
-│      localStorage.setItem(STORAGE_KEY, emp.empId)
-│    } catch {
-│      /* 忽略存储失败 */
-│    }
 ⋮
 
 web-ui/src/router.js:

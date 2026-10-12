@@ -48,7 +48,7 @@ glob:
 
 ## 3. 存储分工：动之前先确认是哪一层
 
-- **PostgreSQL + pgvector**：文档/业务元数据、窄标量、ACL、向量、子块 `chunk_text`（取代原 MySQL + Milvus）。
+- **PostgreSQL + pgvector**：文档/业务元数据、窄标量、ACL、向量、子块 `chunk_text`。
 - **MongoDB**：正文外置存储——整篇 `raw_text`/`normalized_text`/`structure` 与父块全文。`mongo_enabled` 默认 `true`，compose 里 `mongo` 服务与 `mongo_data` 卷都在跑，**这是现行架构，不是遗留项**。
 - **Elasticsearch**：BM25 稀疏检索的派生倒排（`content_tokens`）。
 
@@ -101,7 +101,7 @@ uv run python -m scripts.dev_services check --gateway   # 只看对接结果(含
 uv run python -m scripts.dev_services env-check         # 容器轨防覆盖专项(无需 docker 在跑)
 ```
 
-compose 里的全部服务（**assistant** / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent / contract-agent）都只在容器内跑；宿主机只跑 vite dev + Ollama。**宿主直跑网关做验证已禁止**（展开正文见 `container-first-verification.md`），旧约定“宿主网关 bind ASSISTANT_PORT、assistant 不进 dev 主轨”已作废：`DEV_SERVICES` 默认含 assistant，不得为让端口而 `compose stop assistant`。改过 `app/` 后 docker 侧跑的是镜像快照，不重建则请求被旧镜像接走，表现为“改了代码不生效”。
+compose 里的全部服务（**assistant** / **ingest-worker**（入库后台进程，与网关同镜像不同 command，不开端口）/ postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / hr-agent / finance-agent / analyst-agent / contract-agent）都只在容器内跑；宿主机只跑 vite dev + Ollama。**宿主直跑网关做验证已禁止**（展开正文见 `container-first-verification.md`），旧约定“宿主网关 bind ASSISTANT_PORT、assistant 不进 dev 主轨”已作废：`DEV_SERVICES` 默认含 assistant，不得为让端口而 `compose stop assistant`。改过 `app/` 后 docker 侧跑的是镜像快照，不重建则请求被旧镜像接走，表现为“改了代码不生效”。
 
 ## 7. 容器轨防覆盖：红线键在 compose 里是字面量
 

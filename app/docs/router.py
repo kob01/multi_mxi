@@ -1,9 +1,13 @@
-"""Document management API: upload -> tag suggestion -> confirm ingest.
+"""Document management API: upload(异步解析) -> 预览轮询 -> ingest(异步入库) -> 任务轮询。
 
 权限口径(与 /api/memory 一致): 本系统没有 token, 身份由请求里的
 ``uploader``/``operator`` + ``role`` + ``department`` 声明, 因此服务层只能做两件事:
 改可见性/删除限"所有者本人或 admin", 列表按调用者的文档 ACL 裁剪。它挡住的是
 误操作与伪造角色越权改写, 不是伪造工号本身(那需要真正的认证)。
+
+为什么两个写接口都是 202 + 轮询: OCR/解析/LLM tags/embedding 都是分钟级重活, 把它们
+卡在 HTTP 请求里会同时出现三个问题: 网关进程被钉住、请求超时后重试会重复入库、
+并发几篇就把下游(OCR/Ollama)压到雪崩。现在提交只建任务, 进度的唯一事实源是任务表。
 """
 
 from __future__ import annotations
@@ -12,7 +16,6 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.docs import service
-from app.docs.parsers import modality_of, parse_blocks
 from app.schemas import Role
 from app.security.acl import Principal
 from app.security.audit import get_audit_logger, new_trace_id
@@ -38,10 +41,14 @@ def _require_identity(operator: str) -> str:
 
 
 class IngestRequest(BaseModel):
-    """Phase-2 confirmation payload from the upload page."""
+    """Phase-2 confirmation payload from the upload page.
 
-    doc_key: str
-    filename: str
+    ``upload_id`` 取代旧的 ``(doc_key, filename)`` 二元组: 入库要绑到具体的那一次上传与其
+    解析产物, 而不是"同名文件的最新一份" —— 后者会让预览与入库读到不同产物。
+    """
+
+    upload_id: str
+    doc_key: str = ""            # 兼容旧前端: 传了就与上传行校验一致
     tags: list[str] = Field(default_factory=list)
     uploader: str = "anonymous"
     # 文档级权限: public/dept/role/private (dept 需 dept_id, role 需 allowed_roles)
@@ -61,61 +68,90 @@ class AclRequest(BaseModel):
     department: str = ""
 
 
-@router.post("/upload")
+@router.post("/upload", status_code=202)
 async def upload_doc(file: UploadFile = File(...), uploader: str = Form("anonymous")) -> dict:
-    """Phase 1: save + parse + duplicate check + LLM tag suggestion.
+    """Phase 1(异步): 流式落盘 + 建上传行 + 同事务发解析事件, 立即 202。
 
-    上传走流式落盘(:func:`service.stage_upload`), 不再一次把整个文件读进内存:
-    多人同时传几十 MB 时, ``await file.read()`` 会同时握住所有体(内存尖峰直
-    接 OOM), 而流式版本内存恒等于一个分块。
+    预览不再在本请求里生成: 前端拿 ``poll`` 地址轮询 :func:`get_upload`。
+    上传走流式落盘(:func:`service.stage_upload`), 不落内存(旧写法一次读完整个文件,
+    多人同时传几十 MB 就是几 GB 峰值内存)。
     """
     trace_id = new_trace_id()
     try:
-        doc_key, path, ext = await service.stage_upload(file.filename or "unnamed", file)
-        _, blocks = await parse_blocks(path)
+        result = await service.submit_upload(file.filename or "unnamed", file, uploader)
     except service.UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:  # e.g. MinerU service unavailable
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    existing = await service.check_existing(doc_key)
-    preview = "\n\n".join(b.text for b in blocks)
-    tags = await service.suggest_tags(preview)
     get_audit_logger().log(
         trace_id, "docs", "upload_received",
-        {"doc_key": doc_key, "filename": path.name, "ext": ext,
-         "overwrite": existing is not None, "uploader": uploader},
+        {"doc_key": result["doc_key"], "upload_id": result["upload_id"],
+         "filename": result["filename"], "ext": result["ext"],
+         "reused": result.get("reused", False), "overwritten": result["overwritten"],
+         "uploader": uploader},
     )
-    return {
-        "doc_key": doc_key,
-        "filename": path.name,
-        "ext": ext,
-        "modality": modality_of(path),
-        "overwritten": existing is not None,
-        "suggested_tags": tags,
-        "preview_len": len(preview),
-        "preview": preview[:500],
-    }
+    return result
 
 
-@router.post("/ingest")
+@router.get("/uploads/{upload_id}")
+async def get_upload(
+    upload_id: str,
+    operator: str = "", user_id: str = "",
+    role: str = "employee", department: str = "",
+) -> dict:
+    """解析状态与预览(轮询入口): 预览内容直接读解析产物, 不重新解析文件。"""
+    principal = _principal(operator or user_id, role, department)
+    try:
+        return await service.get_upload_state(upload_id, principal)
+    except service.UploadError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    operator: str = "", user_id: str = "",
+    role: str = "employee", department: str = "",
+) -> dict:
+    """入库任务状态(轮询入口): 阶段/重试次数/错误/块数/告警。
+
+    与预览同一个权限口径: 进度会说话出一篇文档的存在与它的块数/失败原因。
+    """
+    try:
+        return await service.get_task_state(
+            task_id, _principal(operator or user_id, role, department)
+        )
+    except service.UploadError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.post("/ingest", status_code=202)
 async def ingest_doc(req: IngestRequest) -> dict:
-    """Phase 2: chunk + embed + pgvector overwrite + document metadata."""
+    """Phase 2(异步): 同步校参 + 建入库任务, 返回 202 + task_id。
+
+    参数错误(非法可见性/缺 dept/上传已过期或解析失败)仍然是 400: 这类错应该当场
+    告诉调用者, 而不是"已受理"后在后台默默失败。
+    """
     trace_id = new_trace_id()
     try:
-        result = await service.ingest_confirmed(
-            req.doc_key, req.filename, req.tags, req.uploader,
+        result = await service.submit_ingest(
+            req.upload_id, req.tags, req.uploader,
             visibility=req.visibility, dept_id=req.dept_id, allowed_roles=req.allowed_roles,
         )
     except service.UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if req.doc_key and req.doc_key != result["doc_key"]:
+        raise HTTPException(status_code=400, detail="doc_key 与 upload_id 不对应")
     get_audit_logger().log(
-        trace_id, "docs", "ingest_completed",
-        {"doc_key": req.doc_key, "filename": req.filename, "tags": req.tags,
-         "chunk_count": result["chunk_count"], "uploader": req.uploader,
-         "visibility": result["visibility"]},
+        trace_id, "docs", "ingest_accepted",
+        {"doc_key": result["doc_key"], "task_id": result["task_id"],
+         "upload_id": result["upload_id"], "tags": result["tags"],
+         "duplicate": result["duplicate"], "stage": result["stage"],
+         "uploader": req.uploader, "visibility": result["visibility"]},
     )
     return result
 

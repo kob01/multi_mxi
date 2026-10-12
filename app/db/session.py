@@ -107,6 +107,10 @@ _BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
         "status": "VARCHAR(16) NOT NULL DEFAULT 'ready'",
         "body_stored": "BOOLEAN NOT NULL DEFAULT false",
     },
+    # 发布事务不再物理删旧块, 改成标记 + 后台 GC: create_all 不会给已存在的表加列,
+    # 存量父子块表必须在这里补, 否则所有检索 SQL 直接报 column does not exist。
+    "doc_chunks": {"deprecated_at": "TIMESTAMPTZ"},
+    "doc_parents": {"deprecated_at": "TIMESTAMPTZ"},
     "long_term_memories": {
         "title": "VARCHAR(128) NOT NULL DEFAULT ''",
         "source": "VARCHAR(32) NOT NULL DEFAULT 'turn'",
@@ -121,12 +125,80 @@ _BACKFILL_COLUMNS: dict[str, dict[str, str]] = {
         # docgen 创作产物 [{name,url,title}]: 可空 —— 历史轮次本来就没有产物。
         "artifacts": "JSON",
     },
+    # 智能问数 V1→V3 对齐新增列(存量 pg_data 卷上表已存在, create_all 不会补列):
+    # 缺 semver 就等于“badcase 无法回溯当时口径”, 缺 slots_json 就算不了 slot-F1。
+    "sem_metrics": {"owner": "VARCHAR(64) NOT NULL DEFAULT ''"},
+    "sem_dimensions": {
+        "hierarchy": "JSON",
+        "version": "INTEGER NOT NULL DEFAULT 1",
+    },
+    "askdata_query_log": {
+        "semver": "VARCHAR(32) NOT NULL DEFAULT ''",
+        "catalog_origin": "VARCHAR(16) NOT NULL DEFAULT ''",
+        "llm_calls": "INTEGER NOT NULL DEFAULT 0",
+        "retry_count": "INTEGER NOT NULL DEFAULT 0",
+        "cache_hit": "BOOLEAN NOT NULL DEFAULT false",
+        "metric_summary": "JSON",
+    },
+    "askdata_golden": {
+        "slots_json": "JSON",
+        "difficulty": "VARCHAR(16) NOT NULL DEFAULT 'easy'",
+        "intent": "VARCHAR(16) NOT NULL DEFAULT ''",
+        "semver": "VARCHAR(32) NOT NULL DEFAULT ''",
+        # 默认不可缓存: 语义缓存只服人工批准的高频问法(否则 agent 评测会直接拿到标准答案)。
+        "cacheable": "BOOLEAN NOT NULL DEFAULT false",
+        # 语义缓存的基底: 存量卷上补向量列(默认 NULL = 这一条不参与语义缓存,
+        # 跑 scripts/embed_askdata_golden 回填后才生效; 不回填也不会报错)。
+        "embedding": f"vector({get_settings().embedding_dim})",
+    },
+    "askdata_eval_run": {
+        "dsl_exact_match": "NUMERIC(5,2) NOT NULL DEFAULT 0",
+        "slot_f1": "NUMERIC(5,2) NOT NULL DEFAULT 0",
+        "mis_clarify_rate": "NUMERIC(5,2) NOT NULL DEFAULT 0",
+        "fallback_rate": "NUMERIC(5,2) NOT NULL DEFAULT 0",
+        "gate_status": "VARCHAR(16) NOT NULL DEFAULT ''",
+        "gate_note": "VARCHAR(256) NOT NULL DEFAULT ''",
+        "baseline_run_id": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "semver": "VARCHAR(32) NOT NULL DEFAULT ''",
+    },
 }
+
+# 已存在表上要加宽的 varchar 列: ``(表, 列, 目标长度)``。
+# 为什么单独开一类: ``create_all`` 不 ALTER 已存在表, 而"模型里的宽度"与"存量库里的宽度"
+# 会因历史版本而不一致 —— 实打实碰过: sem_change_log.object_id 早先登记的是 16,
+# 而同步脚本往里写的是 `m_expense_total|d_expense_employee_name` 这种复合主键,
+# 结果是整个同步事务在写版本日志时报 value too long(前面改的定义行全部回滚,
+# 表现为"YAML 改了、库里没变、semver 也没动"。
+# 拿 information_schema 先比长度再决定是否 ALTER: 不拿 ALTER 当空转(大表改宽度会重写)。
+_BACKFILL_WIDEN = (
+    ("sem_change_log", "object_id", 96),
+    ("sem_change_log", "object_kind", 32),
+)
 
 # 已存在表的新增索引同理: create_all 跳过已存在的表, 表上的新索引也不会建。
 _BACKFILL_INDEXES = (
+    # 陈旧块的 GC 扫描索引(部分索引: 不进热路径, 只装已标陈旧的行)。
+    "CREATE INDEX IF NOT EXISTS ix_doc_chunks_deprecated "
+    "ON doc_chunks (deprecated_at) WHERE deprecated_at IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_doc_parents_deprecated "
+    "ON doc_parents (deprecated_at) WHERE deprecated_at IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS ix_long_term_memories_user_kind_access "
     "ON long_term_memories (user_id, kind, last_accessed_at)",
+    # 存量表补列后需要自己补索引(下面两条服务于本次新增列):
+    "CREATE INDEX IF NOT EXISTS ix_askdata_query_log_semver "
+    "ON askdata_query_log (semver)",
+    "CREATE INDEX IF NOT EXISTS ix_askdata_golden_difficulty "
+    "ON askdata_golden (difficulty)",
+    "CREATE INDEX IF NOT EXISTS ix_askdata_golden_intent "
+    "ON askdata_golden (intent)",
+    # 语义缓存每轮都要按这个列筛一遍(不建索引就是每轮全表扫)。
+    "CREATE INDEX IF NOT EXISTS ix_askdata_golden_cacheable "
+    "ON askdata_golden (cacheable) WHERE cacheable",
+    # 向量列补上后还要自己补 HNSW 索引(create_all 对已存在的表不会动索引):
+    # 没索引时 similar_intent 会退成全表扫, 几百行不致事但语义缓存应当与 sem_terms 同一形状。
+    "CREATE INDEX IF NOT EXISTS ix_askdata_golden_embedding_hnsw "
+    "ON askdata_golden USING hnsw (embedding vector_cosine_ops) "
+    "WITH (m = 16, ef_construction = 64)",
 )
 
 # ---------------------------------------------------------------------------
@@ -221,6 +293,18 @@ async def init_schema() -> None:
             for name, ddl in columns.items():
                 if name not in have:
                     await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        for table, column, target in _BACKFILL_WIDEN:
+            # `await conn.execute(...).first()` 会被解析成 `await (coroutine.first())`:
+            # 先把结果拿到手再取 first(), 否则就是 'coroutine' object has no attribute 'first'。
+            found = await conn.execute(
+                text("SELECT character_maximum_length FROM information_schema.columns "
+                     "WHERE table_name = :table AND column_name = :column"),
+                {"table": table, "column": column},
+            )
+            current = found.first()
+            if current is not None and (current[0] is None or int(current[0]) >= target):
+                continue
+            await conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR({target})"))
         for ddl in _BACKFILL_INDEXES:
             await conn.execute(text(ddl))
 

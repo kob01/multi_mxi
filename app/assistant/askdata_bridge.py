@@ -33,11 +33,15 @@ _FENCE_RE = re.compile(
 # 载荷里进 metadata 的字段: 刻意**不含 rows 与 sql**。
 # 表格正文已经在 answer 里(前端 Markdown 渲染), 再把 50 行数据塞进每个 SSE 事件与
 # 会话历史等于把同一份数据传两遍; SQL 是排障用的, 已经在 askdata_query_log 里留痕。
+# 但 **dsl / slots 要带**: 它们是"查询意图"不是业务数据, 而 edit_dsl 反馈与多轮指代
+# 继承都要拿得到本轮到底编成了什么(不带就得让用户重述一遍)。
 _VIEW_KEYS = (
     "kind", "query_id", "question", "route", "verdict", "range", "columns",
     "column_labels", "rowcount", "caliber_notes", "scope_note", "chart",
     "clarify", "metrics", "times", "dims", "reason", "lead", "allow_none",
     "error_codes", "attempts", "catalog_origin", "vector_channel", "trace_id",
+    "dsl", "slots", "semver", "ticket", "cache_hit", "policies",
+    "token_cost", "llm_calls", "latency_ms",
 )
 
 
@@ -93,6 +97,30 @@ def slots_of(payload: dict[str, Any]) -> dict[str, Any]:
     """取下一轮要做确定性继承用的槽位(没有就空 dict, 空 dict 等于"不继承")。"""
     slots = payload.get("slots")
     return slots if isinstance(slots, dict) else {}
+
+
+def prior_of(payload: dict[str, Any]) -> dict[str, Any]:
+    """下一轮需要的全份"上一定稿": 槽位 + DSL + 当时最高分口径 + 原话。
+
+    为什么存三样而不是只存槽位(方案 §3 的指代消解要的是"上一轮 DSL 摘要"):
+    槽位里是用户自己的说法, 而"换成按部门看/只看已打款的"要覆写的是**已经选定的 id 与
+    已确定的过滤条件** —— 只给说法的话, 模型得重新猜一次口径, 上一轮已经付过的澄清成本白付。
+    top_metric 不为继承而存, 它是为了判"误澄清": 下一轮用户点的正是它, 说明本可以不问。
+    """
+    slots = slots_of(payload)
+    dsl = payload.get("dsl") if isinstance(payload.get("dsl"), dict) else {}
+    metrics = [m for m in (payload.get("metrics") or []) if isinstance(m, dict)]
+    chosen = ""
+    for item in (dsl.get("metrics") or []):
+        if isinstance(item, dict) and item.get("id"):
+            chosen = str(item["id"])
+            break
+    return {
+        "slots": slots,
+        "dsl": dsl,
+        "top_metric": str(metrics[0].get("id") or "") if metrics else chosen,
+        "question": str(payload.get("question") or "")[:500],
+    }
 
 
 def _fallback_text(payload: dict[str, Any]) -> str:

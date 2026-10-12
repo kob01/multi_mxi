@@ -1,0 +1,21 @@
+# Prometheus 抓取配置(只在 `--profile observe` 起栈时生效)。
+# 指标源只有一个: 网关容器的 /metrics。它暴露的是**问数留痕表的聚合**(比率/延迟分位/
+# token 合计/语义层版本/告警线是否越线), 因此:
+# - 与 /api/askdata/stats 看板同源, 不会出现两套口径互相打脸;
+# - 进程重启不丢历史(数在库里, 不在内存计数器里);
+# - 新鲜度等于抓取周期, 不适合亚秒级告警(那要在 MCP 进程内加计数器, 本期不做)。
+#
+# 网关口令 METRICS_TOKEN 一旦设置, 这里就得同步填同一个值(它只存在于
+# docker/secrets/metrics_token.txt, 不进本文件)。
+global:
+  scrape_interval: 30s
+  external_labels:
+    stack: mxi
+
+scrape_configs:
+  - job_name: mxi-gateway
+    static_configs:
+      - targets: ["assistant:8000"]
+        labels:
+          service: assistant
+    metrics_path: /metrics

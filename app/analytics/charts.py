@@ -361,6 +361,93 @@ def pie_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -
     return _wrap(parts)
 
 
+def _heat_color(ratio: float) -> str:
+    """归一化后的颜色 -> 单色相蓝渐变(浅到深)。
+
+    热力图只用一个色相而不拿 _PALETTE 循环: 颜色在这里承担的是**量级**而不是分类,
+    多色相会让读者把"颜色不同"误读成"类别不同"。
+    """
+    clamped = min(1.0, max(0.0, float(ratio)))
+    start, end = (239, 243, 255), (30, 64, 158)  # 浅蓝 -> 深蓝
+    rgb = tuple(round(a + (b - a) * clamped) for a, b in zip(start, end))
+    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+
+def heatmap_chart(title: str, categories: list[str], series: list[dict[str, Any]]) -> str:
+    """热力图: 行=系列(第二个维度), 列=类目(第一个维度), 格颜色=量级。
+
+    为什么需要它而不是分组柱: 方案 §4⑤ 的形状规则里,"两个维度交叉"在柱图上要拿
+    颜色区分系列, 列一多(>6)就看不住趋势; 而"哪个交叉格最热"正是这类问法要的答案。
+    格子不超过 8 行 x 12 列: 再多就不是一眼能读完的图, 而是一张噪声表。
+    格内始终写数值(颜色只给"大概多少"的提示, 具体数字不能靠读者目测深浅)。
+    """
+    cats = [str(c) for c in (categories or [])][:12]
+    rows = [s for s in (series or [])][:8]
+    if not cats or not rows:
+        return _wrap([f'<text x="{_MARGIN["left"]}" y="{_MARGIN["top"]}" font-size="13" '
+                      f'fill="#6B7280" {_FONT_ATTR}>没有可画的交叉数据</text>'])
+    aligned = [list(s["data"]) + [0.0] * (len(cats) - len(s["data"])) for s in rows]
+    flat = [v for row in aligned for v in row]
+    hi = max(flat) if flat else 0.0
+    lo = min(flat) if flat else 0.0
+    span = (hi - lo) or 1.0
+
+    x0, y0 = _MARGIN["left"], _MARGIN["top"]
+    x1, y1 = _WIDTH - _MARGIN["right"], _HEIGHT - _MARGIN["bottom"]
+    label_w = 8.0  # 行名占用的左侧宽度(在 x0 左边写不进去, 所以把绘图区往右推)
+    grid_x0 = x0 + label_w
+    cell_w = (x1 - grid_x0) / len(cats)
+    cell_h = (y1 - y0) / len(rows)
+    parts: list[str] = [
+        f'<text x="{x0}" y="26" font-size="16" fill="#111827" {_FONT_ATTR}>'
+        f'{html.escape((title or "交叉分析")[:60])}</text>'
+    ]
+    for ri, row_name in enumerate([str(s["name"]) for s in rows]):
+        y = y0 + ri * cell_h
+        short = row_name if len(row_name) <= 10 else row_name[:9] + "…"
+        parts.append(
+            f'<text x="{x0 - 2}" y="{y + cell_h / 2 + 4}" font-size="12" fill="#4B5563" '
+            f'{_FONT_ATTR}>{html.escape(short)}</text>'
+        )
+        for ci, value in enumerate(aligned[ri]):
+            ratio = (value - lo) / span
+            x = grid_x0 + ci * cell_w
+            fill = _heat_color(ratio)
+            parts.append(
+                f'<rect x="{x + 1:.1f}" y="{y + 1:.1f}" width="{max(1.0, cell_w - 2):.1f}" '
+                f'height="{max(1.0, cell_h - 2):.1f}" fill="{fill}" stroke="#FFFFFF"/>'
+            )
+            # 深色底上改成白色字, 否则数值看不出来; 字号随格子高度适当退回。
+            ink = "#FFFFFF" if ratio > 0.55 else "#1F2933"
+            size = 12 if cell_h > 26 else 10
+            parts.append(
+                f'<text x="{x + cell_w / 2:.1f}" y="{y + cell_h / 2 + 4:.1f}" font-size="{size}" '
+                f'fill="{ink}" text-anchor="middle" {_FONT_ATTR}>{html.escape(fmt(value, 1))}</text>'
+            )
+    need_rotate = any(_text_width(c) > cell_w - 4 for c in cats) or len(cats) > 8
+    for ci, cat in enumerate(cats):
+        cx = grid_x0 + ci * cell_w + cell_w / 2
+        short = cat if len(cat) <= 8 else cat[:7] + "…"
+        if need_rotate:
+            parts.append(
+                f'<text x="{cx:.1f}" y="{y1 + 14}" font-size="12" fill="#4B5563" '
+                f'text-anchor="end" transform="rotate(-35 {cx:.1f} {y1 + 14})" '
+                f'{_FONT_ATTR}>{html.escape(short)}</text>'
+            )
+        else:
+            parts.append(
+                f'<text x="{cx:.1f}" y="{y1 + 18}" font-size="12" fill="#4B5563" '
+                f'text-anchor="middle" {_FONT_ATTR}>{html.escape(short)}</text>'
+            )
+    # 色标: 不写就没人知道"深蓝是多大"。
+    parts.append(
+        f'<text x="{x0}" y="{_HEIGHT - 16}" font-size="11" fill="#6B7280" {_FONT_ATTR}>'
+        f'浅={html.escape(fmt(lo, 1))} 深={html.escape(fmt(hi, 1))} ；行/列均为维度，'
+        f'只画前 {len(rows)}×{len(cats)}</text>'
+    )
+    return _wrap(parts)
+
+
 def _well_formed(svg: str) -> str | None:
     """出图前的良构 XML 自检; 有问题返回错因, 干净返回 None。
 
@@ -392,12 +479,14 @@ def render(
     cats, ser, dropped = normalize(categories, series, values)
     if not cats or not ser:
         return {"error": "图表无数据: 请提供 categories 与 series(或 values)"}
-    if kind not in ("bar", "line", "pie"):
-        return {"error": f"不支持的图表类型: {kind}; 可选 bar/line/pie"}
+    if kind not in ("bar", "line", "pie", "heatmap"):
+        return {"error": f"不支持的图表类型: {kind}; 可选 bar/line/pie/heatmap"}
     if kind == "pie":
         svg = pie_chart(title or "占比分布", cats, ser)
     elif kind == "line":
         svg = line_chart(title or "趋势", cats, ser)
+    elif kind == "heatmap":
+        svg = heatmap_chart(title or "交叉分析", cats, ser)
     else:
         svg = bar_chart(title or "对比", cats, ser)
     bad = _well_formed(svg)
@@ -493,8 +582,15 @@ def render_png(
         Pillow 不可用时也返回 ``{error}`` 而不是抛出(调用方据此只出 SVG)。
     """
     kind = (chart_type or "bar").strip().lower()
-    if kind not in ("bar", "line", "pie"):
-        return {"error": f"不支持的图表类型: {kind}; 可选 bar/line/pie"}
+    if kind not in ("bar", "line", "pie", "heatmap"):
+        return {"error": f"不支持的图表类型: {kind}; 可选 bar/line/pie/heatmap"}
+    if kind == "heatmap":
+        # office 文档里嵌不了 SVG, 而重画一份位图热力图不值当引新依赖:
+        # 降级成分组柱并**在返回里明写降级**, 不能默默交一张与请求不同的图。
+        kind = "bar"
+        png_fallback_note = "heatmap_png_fallback"
+    else:
+        png_fallback_note = ""
     cats, ser, _ = normalize(categories, series, values)
     if not cats or not ser:
         return {"error": "图表无数据: 请提供 categories 与 series(或 values)"}
@@ -557,7 +653,11 @@ def render_png(
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return {"png": buf.getvalue(), "chart_type": kind, "categories_count": len(cats)}
+    out: dict[str, Any] = {"png": buf.getvalue(), "chart_type": kind, "categories_count": len(cats)}
+    if png_fallback_note:
+        # 调用方(写 office 文档那一路)要把"实际是分组成 bar"写进图注, 不能假装画了热力图。
+        out["png_fallback"] = png_fallback_note
+    return out
 
 
 def _png_cat_labels(draw: Any, cats: list[str], slot: float, x0: float, y1: float, font: Any) -> None:

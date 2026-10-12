@@ -7,11 +7,14 @@ key 必须包含 ACL 签名(user_id + department + role): 命中时整条检索�
 泄露。进 Context Builder 前那道最终授权(``acl.is_allowed``)在调用点照常执行、不受命中
 影响 —— 纵深防御始终在位。
 
-必须在文档重新入库时 ``invalidate_all()``: 缓存里存的是 ``chunk_id`` 列表,
-单文档重入库会先删后建(``delete_by_doc``), 旧 ``chunk_id`` 可能已不存在或指向
-重建后的新块, 不失效就会拿到脏数据 —— 这一时机已经由
-``AssistantOrchestrator.refresh_knowledge()`` 在 ``app/docs/service.py`` 的
-入库路径上触发, 无需另设失效通道。
+失效按**文档粒度**做, 不再 ``invalidate_all()``: 缓存里存的是 ``chunk_id`` 列表, 重入库后
+旧 ``chunk_id`` 可能已标陈旧或被新行覆盖, 不失效就会拿到脏数据; 但全清会让一次入库把
+整站热查询的缓存一起打掉(缓存击空后全量回源 embedding + 两通道 + rerank)。
+这里的做法是给每篇文档一个递增计数 ``docgen:{doc_key}``, 写缓存时把本次命中的文档
+版本快照存进 payload, 读时一次 MGET 比对: 任一不符即当未命中并自删该 key。受影响
+的只有"真的命中了那篇文档"的查询, 其余继续命中。
+
+``invalidate_all()`` 保留, 只用于运维路径(整库 BM25 重建、存储层迁移后收敛)。
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 from app.cache.redis_client import CACHE_PREFIX, get_redis, try_redis
 from app.config import get_settings
@@ -27,6 +30,9 @@ from app.schemas import KnowledgeChunk
 from app.security.acl import Principal
 
 logger = logging.getLogger(__name__)
+
+# 每篇文档一个递增计数: 发布完成/权限变更/文档删除三个时机 bump 它。
+DOCGEN_PREFIX = f"{CACHE_PREFIX}:retrieval:docgen"
 
 
 def acl_signature(principal: Principal | None) -> str:
@@ -40,6 +46,54 @@ def _key(query: str, top_k: int, top_n: int, principal: Principal | None) -> str
     material = f"{query}|{top_k}|{top_n}|{acl_signature(principal)}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return f"{CACHE_PREFIX}:retrieval:{digest}"
+
+
+def _docgen_key(doc_key: str) -> str:
+    return f"{DOCGEN_PREFIX}:{doc_key}"
+
+
+async def get_doc_gens(doc_keys: list[str]) -> dict[str, int]:
+    """一次 MGET 拿回若干文档的当前版本号(缺键=0, 读失败=空 dict 让调用方当未命中)。
+
+    读失败必须归到"未命中"而不是"版本全都等于 0": 后者会让 Redis 抖动期间
+    把陈旧 payload 当成有效结果返回(越新越危险的那种降级)。
+    """
+    redis = get_redis()
+    if redis is None or not doc_keys:
+        return {}
+    uniq = list(dict.fromkeys(doc_keys))
+
+    async def _do() -> dict[str, int]:
+        raw = await redis.mget([_docgen_key(k) for k in uniq])
+        return {
+            k: int(v) if v is not None else 0 for k, v in zip(uniq, raw or [])
+        }
+
+    out = await try_redis(_do, default={}, what="retrieval docgen mget")
+    return out or {}
+
+
+async def bump_doc_gen(doc_keys: Sequence[str]) -> None:
+    """定向失效: 把这批文档的缓存版本号 +1(等价于"含它们的缓存项下次当未命中")。
+
+    O(文档数) 次 INCR, 不 SCAN 不 KEYS —— Redis 里缓存项上万条时也不会因一篇
+    文档入库而扫全库。Redis 不可用时什么都不做: 降级语义是"没失效"而不是
+    "报错", TTL 到期会自然收敛(与 try_redis 同一口径)。
+    """
+    redis = get_redis()
+    if redis is None:
+        return
+    uniq = [k for k in dict.fromkeys(doc_keys) if k]
+    if not uniq:
+        return
+
+    async def _do() -> None:
+        pipe = redis.pipeline()
+        for key in uniq:
+            pipe.incr(_docgen_key(key))
+        await pipe.execute()
+
+    await try_redis(_do, what="retrieval docgen bump")
 
 
 async def cached_retrieve(
@@ -64,7 +118,18 @@ async def cached_retrieve(
             try:
                 payload = json.loads(raw)
                 chunks = [KnowledgeChunk.model_validate(c) for c in payload["chunks"]]
-                return chunks, payload["score_mode"], True
+                cached_gens = payload.get("doc_gens") or {}
+                # 旧版本 payload(无 doc_gens)一律当未命中: 宁可多一次回源, 也不能
+                # 把"升级前写的脏条目"当成已验证结果。
+                if cached_gens:
+                    current = await get_doc_gens(list(cached_gens))
+                    if current and all(current.get(k, 0) == v for k, v in cached_gens.items()):
+                        return chunks, payload["score_mode"], True
+                    await try_redis(
+                        lambda: redis.delete(key), what="retrieval cache invalidate(stale gen)"
+                    )
+                else:
+                    await try_redis(lambda: redis.delete(key), what="retrieval cache invalidate(legacy)")
             except Exception as exc:  # 脏缓存数据不能阻断本次检索
                 logger.warning("retrieval cache payload invalid, re-retrieving: %s", exc)
                 await try_redis(lambda: redis.delete(key), what="retrieval cache invalidate")
@@ -72,8 +137,16 @@ async def cached_retrieve(
     chunks, score_mode = await invoke()
 
     if redis is not None:
+        doc_ids = list(dict.fromkeys(c.doc_id for c in chunks if c.doc_id))
+        # 零命中的结果也值得缓存(带 TTL 的空结果能挡住反复追问同一不存在的知识);
+        # 此时 doc_gens 为空, 命中校验直接通过 —— 它的失效只能靠全局 invalidate_all。
+        gens = await get_doc_gens(doc_ids) if doc_ids else {}
         payload = json.dumps(
-            {"chunks": [c.model_dump() for c in chunks], "score_mode": score_mode},
+            {
+                "chunks": [c.model_dump() for c in chunks],
+                "score_mode": score_mode,
+                "doc_gens": gens,
+            },
             ensure_ascii=False,
         )
         await try_redis(
@@ -84,7 +157,10 @@ async def cached_retrieve(
 
 
 async def invalidate_all() -> None:
-    """清空全部 Retrieval Cache (文档重新入库 / BM25 索引重建时调用)。"""
+    """清空全部 Retrieval Cache —— **仅运维路径使用**(整库 BM25 重建/存储层迁移)。
+
+    入库热路径请用 :func:`bump_doc_gen`: 全清在缓存项上万条时本身就是性能事故。
+    """
     redis = get_redis()
     if redis is None:
         return

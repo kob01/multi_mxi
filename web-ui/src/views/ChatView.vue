@@ -484,20 +484,18 @@ function askdataNone(item) {
             </div>
             <div v-if="item.status" class="status-line">{{ item.status }}</div>
             <!-- 智能问数: 选项式澄清面板 + 反馈条(载荷由 metadata.askdata 驱动) -->
-            <ClarifyPanel
-              v-if="item.askdata && item.askdata.kind === 'clarify'"
-              :payload="item.askdata"
-              :disabled="sending"
-              @choose="(c) => askdataChoose(item, c)"
-              @none="() => askdataNone(item)"
-            />
-            <AskDataFeedback
-              v-else-if="item.askdata && item.askdata.query_id"
-              :query-id="item.askdata.query_id"
-              :payload="item.askdata"
-              :user-id="current.empId"
-              :disabled="sending"
-            />
+            <ClarifyPanel v-if="item.askdata && item.askdata.kind === 'clarify'" :payload="item.askdata"
+              :disabled="sending" @choose="(c) => askdataChoose(item, c)" @none="() => askdataNone(item)" />
+            <AskDataFeedback v-else-if="item.askdata && item.askdata.query_id" :query-id="item.askdata.query_id"
+              :payload="item.askdata" :user-id="current.empId" :trace-id="item.askdata.trace_id"
+              :session-id="sessionId" :disabled="sending" />
+            <!-- 本轮用的语义层版本与工单号: 口径能不能回查、球有没有接住, 在对话里就能看到 -->
+            <div v-if="item.askdata && (item.askdata.semver || item.askdata.ticket)" class="askdata-meta">
+              <span v-if="item.askdata.semver">口径版本 {{ item.askdata.semver }}</span>
+              <span v-if="item.askdata.cache_hit">· 本次为缓存结果</span>
+              <span v-if="item.askdata.ticket && item.askdata.ticket.ticket_id">· 已开人工工单
+                {{ item.askdata.ticket.ticket_id }}</span>
+            </div>
             <div v-if="item.cites && item.cites.length" class="cites">
               📎 参考来源：{{ item.cites.join(' ; ') }}
             </div>
@@ -508,17 +506,8 @@ function askdataNone(item) {
           <div class="sender-toolbar">
             <el-switch v-model="thinkingOn" size="small" active-text="深度思考" />
             <!-- 多智能体并发委派: 点选后本轮同一个问题并发下发给这些智能体 -->
-            <el-select
-              v-model="selectedAgents"
-              class="agent-select"
-              size="small"
-              multiple
-              collapse-tags
-              collapse-tags-tooltip
-              clearable
-              placeholder="点选专业智能体并发办理（可多选）"
-              :disabled="sending || !agents.length"
-            >
+            <el-select v-model="selectedAgents" class="agent-select" size="small" multiple collapse-tags
+              collapse-tags-tooltip clearable placeholder="点选专业智能体并发办理（可多选）" :disabled="sending || !agents.length">
               <el-option v-for="a in agents" :key="a.domain" :value="a.domain" :label="a.name">
                 <span class="agent-opt-name">{{ a.name }}</span>
                 <span class="agent-blurb">{{ a.description }}</span>
@@ -696,6 +685,16 @@ function askdataNone(item) {
   color: #888;
   margin-top: 6px;
   line-height: 1.5;
+}
+
+/* 口径版本/缓存/工单这些治理标识: 比正文小且不抢注意, 但必须看得见 */
+.askdata-meta {
+  font-size: 11px;
+  color: #9aa0a6;
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .sender-wrap {

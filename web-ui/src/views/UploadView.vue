@@ -30,6 +30,34 @@ const files = reactive([])
 const dropHover = ref(false)
 const fileInput = ref()
 
+// 入库已改成异步任务（提交即返回 202 + task_id），所以进度靠轮询拿。
+// 上限给到 15 分钟：扫描版 PDF 逐页 OCR 本来就可能是分钟级；超时只提示不报错，
+// 因为任务还在后台跑，报「失败」会诱使用户重复提交。
+const POLL_MS = 1500
+const POLL_MAX_MS = 15 * 60 * 1000
+
+const STAGE_TEXT = {
+  pending: '排队中',
+  parsing: '解析中（OCR/切块）…',
+  embedding: '向量化中…',
+  publishing: '发布知识块中…',
+  indexing: '建索引/图谱中…',
+  ready: '入库成功',
+  failed: '入库失败',
+}
+const UPLOAD_STATUS_TEXT = {
+  pending: '排队解析中…',
+  parsing: '解析中（OCR/切块）…',
+  parsed: '解析完成，请选择标签',
+  failed: '解析失败',
+  expired: '上传已过期，请重新上传',
+}
+const DOC_STATUS_TEXT = { ready: '已就绪', ingesting: '入库中', failed: '入库失败', pending: '待入库' }
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function pickFiles() {
   fileInput.value?.click()
 }
@@ -49,9 +77,14 @@ async function handleFiles(fileList) {
     const item = reactive({
       key: file.name + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
       filename: file.name,
-      status: '上传解析中…',
-      state: 'parsing', // parsing | parsed | ingesting | done | error
-      data: null,
+      status: '上传中…',
+      state: 'uploading', // uploading | parsing | parsed | ingesting | done | error
+      uploadId: '',
+      taskId: '',
+      modality: '',
+      overwritten: false,
+      preview: '',
+      previewLen: 0,
       tags: [],
       customTag: '',
       visibility: 'public',
@@ -66,17 +99,56 @@ async function handleFiles(fileList) {
       const resp = await fetch('/api/docs/upload', { method: 'POST', body: fd })
       const data = await resp.json()
       if (!resp.ok) throw new Error(data.detail || resp.status)
-      item.data = data
-      item.tags = [...(data.suggested_tags || [])]
-      item.state = 'parsed'
-      item.status = data.overwritten
-        ? '已存在同名文档，确认后将覆盖更新'
-        : '解析完成，请选择标签'
+      // 202：此时只有 upload_id，预览与建议标签要等 worker 把解析产物写出来
+      item.uploadId = data.upload_id
+      item.overwritten = !!data.overwritten
+      item.state = 'parsing'
+      item.status = UPLOAD_STATUS_TEXT.pending
+      pollUpload(item)
     } catch (e) {
       item.state = 'error'
       item.status = '失败: ' + e.message
     }
   }
+}
+
+async function pollUpload(item) {
+  const started = Date.now()
+  while (Date.now() - started < POLL_MAX_MS) {
+    await sleep(POLL_MS)
+    let data
+    try {
+      const resp = await fetch(
+        `/api/docs/uploads/${encodeURIComponent(item.uploadId)}?${authQuery()}`
+      )
+      data = await resp.json()
+      if (!resp.ok) throw new Error(data.detail || resp.status)
+    } catch (e) {
+      // 单次轮询失败不判死：网络抖动很常见，下一轮接着问
+      item.status = '解析状态查询失败（重试中）: ' + e.message
+      continue
+    }
+    item.modality = data.modality || item.modality
+    item.overwritten = !!data.overwritten
+    if (data.status === 'parsed') {
+      item.preview = data.preview || ''
+      item.previewLen = data.preview_len || 0
+      item.tags = [...(data.suggested_tags || [])]
+      item.state = 'parsed'
+      const warn = (data.warnings || []).length ? `（${data.warnings.length} 条告警）` : ''
+      item.status =
+        (data.overwritten ? '已存在同名文档，确认后将覆盖更新' : UPLOAD_STATUS_TEXT.parsed) + warn
+      return
+    }
+    if (data.status === 'failed' || data.status === 'expired') {
+      item.state = 'error'
+      const base = UPLOAD_STATUS_TEXT[data.status] || '解析未成功'
+      item.status = data.error ? `${base}: ${data.error}` : base
+      return
+    }
+    item.status = UPLOAD_STATUS_TEXT[data.status] || data.status
+  }
+  item.status = '仍在后台解析中（扫描 PDF 可能需数分钟），可稍后在列表查看'
 }
 
 function addCustomTag(item) {
@@ -90,14 +162,13 @@ function removeTag(item, tag) {
 
 async function confirmIngest(item) {
   item.state = 'ingesting'
-  item.status = '入库中（切分+向量化）…'
+  item.status = STAGE_TEXT.pending
   try {
     const resp = await fetch('/api/docs/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        doc_key: item.data.doc_key,
-        filename: item.data.filename,
+        upload_id: item.uploadId,
         tags: item.tags,
         uploader: current.empId,
         visibility: item.visibility,
@@ -109,14 +180,48 @@ async function confirmIngest(item) {
     })
     const res = await resp.json()
     if (!resp.ok) throw new Error(res.detail || resp.status)
-    item.state = 'done'
-    item.status = `入库成功：${res.chunk_count} 个知识块，标签[${(res.tags || []).join(', ')}]`
+    // 202 + task_id：入库进度由任务表给，不再靠这一个请求的返回体
+    item.taskId = res.task_id
+    pollTask(item)
     loadDocs()
   } catch (e) {
     item.state = 'parsed'
-    item.status = '入库失败: ' + e.message
-    ElMessage.error('入库失败: ' + e.message)
+    item.status = '入库提交失败: ' + e.message
+    ElMessage.error('入库提交失败: ' + e.message)
   }
+}
+
+async function pollTask(item) {
+  const started = Date.now()
+  while (Date.now() - started < POLL_MAX_MS) {
+    await sleep(POLL_MS)
+    let data
+    try {
+      const resp = await fetch(`/api/docs/tasks/${encodeURIComponent(item.taskId)}?${authQuery()}`)
+      data = await resp.json()
+      if (!resp.ok) throw new Error(data.detail || resp.status)
+    } catch (e) {
+      item.status = '入库状态查询失败（重试中）: ' + e.message
+      continue
+    }
+    if (data.stage === 'ready') {
+      item.state = 'done'
+      const warn = (data.warnings || []).length ? `，告警[${data.warnings.join('; ')}]` : ''
+      item.status = `入库成功：${data.chunk_count} 个知识块，标签[${item.tags.join(', ')}]${warn}`
+      loadDocs()
+      return
+    }
+    if (data.stage === 'failed') {
+      item.state = 'parsed'
+      item.status = `入库失败（第 ${data.attempt} 次）: ${data.error || '未知原因'}`
+      ElMessage.error('入库失败: ' + (data.error || '未知原因'))
+      loadDocs()
+      return
+    }
+    item.status = `${STAGE_TEXT[data.stage] || data.stage}（第 ${data.attempt} 次尝试）`
+  }
+  item.status = '仍在后台入库中，可稍后在列表查看状态'
+  loadDocs()
 }
 
 function splitRoles(s) {
@@ -143,6 +248,11 @@ async function loadDocs() {
     ElMessage.error('文档列表加载失败: ' + e.message)
   } finally {
     loadingDocs.value = false
+  }
+  // 入库是异步的: 列表里有「入库中」的文档时自动继续刷新，
+  // 否则用户会看到一个不动的中间态，只能靠手动反复点刷新。
+  if (docs.value.some((d) => d.status && d.status !== 'ready')) {
+    setTimeout(loadDocs, 4000)
   }
 }
 
@@ -220,6 +330,13 @@ function visTagType(v) {
 function visLabel(v) {
   return { public: '全员', dept: '部门', role: '角色', private: '仅自己' }[v] || v
 }
+// 旧文档没有 status 列值时按「已就绪」看（后端默认值也走这个口径）。
+function statusLabel(v) {
+  return DOC_STATUS_TEXT[v || 'ready'] || v
+}
+function statusTagType(v) {
+  return { ready: 'success', ingesting: 'warning', failed: 'danger', pending: 'info' }[v || 'ready'] || 'info'
+}
 
 onMounted(loadDocs)
 </script>
@@ -243,6 +360,11 @@ onMounted(loadDocs)
             <template #default="{ row }">{{ row.name }}{{ row.ext }}</template>
           </el-table-column>
           <el-table-column prop="modality" label="模态" width="80" />
+          <el-table-column label="状态" width="84">
+            <template #default="{ row }">
+              <el-tag size="small" :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="chunk_count" label="块数" width="64" />
           <el-table-column label="标签" min-width="140">
             <template #default="{ row }">
@@ -293,17 +415,17 @@ onMounted(loadDocs)
         <div class="file-head">
           <span class="file-name">{{ item.filename }}</span>
           <div class="file-head-right">
-            <el-tag v-if="item.data" size="small" :type="item.data.overwritten ? 'warning' : 'success'">
-              {{ item.data.overwritten ? '覆盖更新' : '新文档' }}
+            <el-tag v-if="item.uploadId" size="small" :type="item.overwritten ? 'warning' : 'success'">
+              {{ item.overwritten ? '覆盖更新' : '新文档' }}
             </el-tag>
-            <el-tag v-if="item.data" size="small" type="info">{{ item.data.modality }}</el-tag>
+            <el-tag v-if="item.modality" size="small" type="info">{{ item.modality }}</el-tag>
           </div>
         </div>
         <div class="status" :class="{ err: item.state === 'error' }">{{ item.status }}</div>
 
-        <el-collapse v-if="item.data && item.data.preview" class="preview">
+        <el-collapse v-if="item.preview" class="preview">
           <el-collapse-item title="内容预览" name="p">
-            <pre>{{ item.data.preview }}{{ item.data.preview_len > 500 ? ' …' : '' }}</pre>
+            <pre>{{ item.preview }}{{ item.previewLen > 500 ? ' …' : '' }}</pre>
           </el-collapse-item>
         </el-collapse>
 

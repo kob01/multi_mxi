@@ -7,8 +7,8 @@
 
 与 ``scripts/test_askdata_offline.py`` 的分工: 离线那份测的是纯函数(形状/错误码/
 编译产物), 这份测的是只有真栈才暴露的东西 —— A2A metadata 里的身份与槽位、载荷剥离、
-留痕落库、治理端点的权限、反馈到归因的闭环。宿主 .env 的 ``ASSISTANT_HOST_PORT``
-变了就自动跟随, 不用改这里的常量。
+留痕落库(含 semver/token_cost)、结果缓存、治理端点的权限、事件→diff→归因、
+人工工单与可观测面。宿主 .env 的 ``ASSISTANT_HOST_PORT`` 变了就自动跟随。
 """
 
 from __future__ import annotations
@@ -89,7 +89,8 @@ def main() -> int:
     multi = chat("各部门今年差旅费金额", targets=["askdata"], session="selftest-multi")
     ask = askdata_of(multi)
     check("多智能体点选路径带出结构化载荷", ask.get("kind") == "result",
-          json.dumps(ask, ensure_ascii=False)[:200])
+          json.dumps({"kind": ask.get("kind"), "reason": ask.get("reason"),
+                      "metrics": ask.get("metrics")}, ensure_ascii=False)[:400])
     check("多智能体正文没漏围栏", "```askdata" not in (multi.get("answer") or ""))
     check("下钻返回了数据行", int(ask.get("rowcount") or 0) > 0, f"rowcount={ask.get('rowcount')}")
     check("口径与可见范围随答案回来",
@@ -139,6 +140,36 @@ def main() -> int:
     sem = httpx.get(f"{BASE}/api/askdata/semantic", params={"role": ROLE, "operator": USER}, timeout=30).json()
     check("语义层快照来自库(不是兜底集)", (sem.get("catalog") or {}).get("origin") == "db",
           json.dumps(sem.get("catalog"), ensure_ascii=False)[:200])
+    # 版本与细分面: badcase 能回溯当时口径(G1)与策略到底有没有灌进去都靠这一面
+    check("快照给出 semver 与定义版本表",
+          bool(sem.get("semver")) and isinstance(sem.get("object_versions"), dict)
+          and bool(sem.get("object_versions")), json.dumps(sem, ensure_ascii=False)[:200])
+    check("细分面已装载(枚举/兼容规则/列策略)",
+          int((sem.get("catalog") or {}).get("compat_rules") or 0) > 0
+          and int((sem.get("catalog") or {}).get("col_policies") or 0) > 0,
+          json.dumps(sem.get("catalog"), ensure_ascii=False)[:240])
+    check("没读不出的细分表(missing 为空)",
+          not (sem.get("catalog") or {}).get("missing_tables"),
+          str((sem.get("catalog") or {}).get("missing_tables")))
+
+    # 结果缓存(B1): 同一身份同一意图的第二轮不应该再打库
+    repeat_a = chat("报销总额今年一共多少", targets=["askdata"], session="selftest-cache")
+    repeat_b = chat("报销总额今年一共多少", targets=["askdata"], session="selftest-cache")
+    ask_a, ask_b = askdata_of(repeat_a), askdata_of(repeat_b)
+    both_result = ask_a.get("kind") == "result" and ask_b.get("kind") == "result"
+    same_dsl = ask_a.get("dsl") == ask_b.get("dsl")
+    check("重复同口径问数命中结果缓存",
+          (not both_result) or (not same_dsl) or ask_b.get("cache_hit") is True,
+          json.dumps({"a_kind": ask_a.get("kind"), "b_kind": ask_b.get("kind"),
+                      "same_dsl": same_dsl, "hit": ask_b.get("cache_hit"),
+                      "a_dsl": ask_a.get("dsl"), "b_dsl": ask_b.get("dsl")},
+                     ensure_ascii=False)[:600])
+    check("本轮问数带回了 semver",
+          bool(ask_b.get("semver")) or ask_b.get("kind") != "result",
+          json.dumps(ask_b, ensure_ascii=False)[:200])
+
+    check("本轮带回了 DSL 载荷(edit_dsl 反馈的前提)", bool(ask1.get("dsl")),
+          json.dumps(ask1, ensure_ascii=False)[:160])
 
     qid = ask1.get("query_id") or ""
     if qid:
@@ -158,8 +189,160 @@ def main() -> int:
               int(bad.get("count") or 0) >= 1
               and not str((bad.get("badcases") or [{}])[0].get("question")).startswith("对话背景"),
               json.dumps(bad, ensure_ascii=False)[:200])
+
+        # 结构化事件(G8): edit_dsl 的 diff 直接定到字段, 不再靠自由文字猜
+        ev = httpx.post(f"{BASE}/api/askdata/events", json={
+            "query_id": qid, "user_id": USER, "event_type": "edit_dsl",
+            "payload": {"dsl": {"metrics": [{"id": "m_expense_count"}],
+                                "time": (ask1.get("dsl") or {}).get("time") or {"range": "this_year"}}},
+        }, timeout=30)
+        ebody = ev.json()
+        check("edit_dsl 事件能带出 diff 与归因",
+              ev.status_code == 200 and bool(ebody.get("diff")),
+              json.dumps(ebody, ensure_ascii=False)[:240])
+        check("改指标的 diff 归到 link(补词草案)",
+              ebody.get("category") == "link", json.dumps(ebody, ensure_ascii=False)[:200])
+        evs = httpx.get(f"{BASE}/api/askdata/events",
+                        params={"role": ROLE, "operator": USER, "query_id": qid, "event_type": "edit_dsl"},
+                        timeout=30).json()
+        check("事件可回查", int(len(evs.get("events") or [])) >= 1, json.dumps(evs)[:160])
+        bad_event = httpx.post(f"{BASE}/api/askdata/events", json={
+            "query_id": qid, "user_id": USER, "event_type": "teleport"}, timeout=30)
+        check("词表外的事件类型被拒", bad_event.status_code == 400, f"HTTP {bad_event.status_code}")
+
+        # 人工工单(G13): 降级链的最后出口, 开单后能在治理面看到
+        tk = httpx.post(f"{BASE}/api/askdata/tickets", params={"role": "employee"}, json={
+            "question": "上周每一单外卖的金额中位数", "reason": "no_metric", "query_id": qid,
+            "requested_by": USER}, timeout=30)
+        tkbody = tk.json()
+        check("用户可主动开人工工单",
+              tk.status_code == 200 and bool(tkbody.get("ticket_id")),
+              json.dumps(tkbody, ensure_ascii=False)[:200])
+        listed = httpx.get(f"{BASE}/api/askdata/tickets",
+                           params={"role": ROLE, "operator": USER, "status": "open", "limit": 5},
+                           timeout=30).json()
+        check("工单列表只对治理角色开放且能看到刚开的单",
+              any(t.get("ticket_id") == tkbody.get("ticket_id") for t in listed.get("tickets") or []),
+              json.dumps(listed, ensure_ascii=False)[:200])
+        denied_tk = httpx.get(f"{BASE}/api/askdata/tickets",
+                              params={"role": "employee", "operator": "E9"}, timeout=30)
+        check("普通员工不能看全量工单", denied_tk.status_code == 403, f"HTTP {denied_tk.status_code}")
+        if tkbody.get("ticket_id"):
+            patched = httpx.post(f"{BASE}/api/askdata/tickets/{tkbody['ticket_id']}",
+                                 params={"role": ROLE},
+                                 json={"status": "resolved", "resolution": "自检收尾",
+                                       "assigned_to": USER}, timeout=30)
+            check("工单可推进状态", patched.status_code == 200, patched.text[:160])
     else:
         check("反馈链路(缺 query_id 无法验证)", False)
+
+    # 语义缓存(V3): 合成 golden 默认**不可复用**, 否则评测题会直接拿到标准答案。
+    listed = httpx.get(f"{BASE}/api/askdata/golden", params={"role": ROLE, "operator": USER,
+                                                            "limit": 2000}, timeout=60).json()
+    cases = [item for item in (listed.get("cases") or [])
+             if item.get("enabled") and (item.get("dsl_json") or {}).get("metrics")
+             and str(item.get("question") or "").strip()]
+    target_case = cases[0] if cases else None
+    if target_case:
+        cache_q = str(target_case["question"]).strip()
+        cid = target_case["case_id"]
+        ask_c1 = askdata_of(chat(cache_q, targets=["askdata"], session="selftest-semcache"))
+        reused_by_default = "复用" in json.dumps(ask_c1, ensure_ascii=False)
+        check("未批准的问法不走语义缓存(拿到的不是复用来的意图)",
+              ask_c1.get("kind") in ("result", "clarify", "degraded") and not reused_by_default,
+              json.dumps({"q": cache_q[:24], "kind": ask_c1.get("kind"),
+                          "reused": reused_by_default}, ensure_ascii=False)[:240])
+        approve = httpx.post(f"{BASE}/api/askdata/golden/{cid}/cacheable",
+                             params={"cacheable": "true", "role": ROLE, "operator": USER},
+                             timeout=30)
+        check("批准一条问法参与语义缓存", approve.status_code == 200, approve.text[:160])
+        ask_c2 = askdata_of(chat(cache_q, targets=["askdata"], session="selftest-semcache-b"))
+        check("批准后同一问法会复用意图(不要求本轮一定出数)",
+              "复用" in json.dumps(ask_c2, ensure_ascii=False),
+              json.dumps({"kind": ask_c2.get("kind"),
+                          "notes": (ask_c2.get("caliber_notes") or [])[-2:]},
+                         ensure_ascii=False)[:260])
+        revoke = httpx.post(f"{BASE}/api/askdata/golden/{cid}/cacheable",
+                            params={"cacheable": "false", "role": ROLE, "operator": USER},
+                            timeout=30)
+        check("可以收回复用资格", revoke.status_code == 200, revoke.text[:160])
+        denied_cache = httpx.post(f"{BASE}/api/askdata/golden/{cid}/cacheable",
+                                  params={"cacheable": "true", "role": "employee",
+                                          "operator": "E9"}, timeout=30)
+        check("普通员工不能批准缓存", denied_cache.status_code == 403,
+              f"HTTP {denied_cache.status_code}")
+    else:
+        check("评测集里找得到可用的问法", False, json.dumps(listed, ensure_ascii=False)[:200])
+
+    # 带限定词的指标名(口径本身就是一个登记名)不该被拆成"短语 + 过滤词"后变成反问
+    qual = chat("按供应商类别看本年IT设备的一般纳税人供应商数", targets=["askdata"],
+                session="selftest-qualifier")
+    ask_q = askdata_of(qual)
+    check("口径名里含限定词时直接出数(不反问)",
+          ask_q.get("kind") == "result" or ask_q.get("kind") == "degraded",
+          json.dumps({"kind": ask_q.get("kind"), "reason": ask_q.get("reason"),
+                      "columns": ask_q.get("columns")}, ensure_ascii=False)[:280])
+
+    # topN 形状: 用户说了"最高的 3 个部门"就不能给 20 行, 也不能给模型猜的 5 行
+    topq = chat("今年报销总额最高的 3 个部门", targets=["askdata"], session="selftest-topn")
+    ask_top = askdata_of(topq)
+    check("topN 问法按用户说的 N 返回",
+          ask_top.get("kind") != "result" or int(ask_top.get("rowcount") or 0) <= 3,
+          json.dumps({"kind": ask_top.get("kind"), "rowcount": ask_top.get("rowcount"),
+                      "dsl": ask_top.get("dsl")}, ensure_ascii=False)[:260])
+
+    # 二维交叉走热力图(可视化规则表里最后一档形状)
+    cross = chat("本年按部门看费用类别的报销总额", targets=["askdata"], session="selftest-heatmap")
+    ask_h = askdata_of(cross)
+    chart_kind = (ask_h.get("chart") or {}).get("chart_type") or ""
+    cols = list(ask_h.get("columns") or [])
+    two_dims = ask_h.get("kind") == "result" and len([c for c in cols if not str(c).startswith("m_")]) >= 2
+    check("两个维度交叉出图就是热力图",
+          (not two_dims) or chart_kind == "heatmap",
+          json.dumps({"kind": ask_h.get("kind"), "cols": cols, "chart": chart_kind},
+                     ensure_ascii=False)[:240])
+
+    # 样本队列(V3 治理面): 可读、权限门、kind 词表
+    samples = httpx.get(f"{BASE}/api/askdata/samples",
+                        params={"role": ROLE, "operator": USER, "status": "", "limit": 20},
+                        timeout=30).json()
+    check("样本队列可读且带门禁统计",
+          "stats" in samples and "trainable_categories" in samples,
+          json.dumps(samples, ensure_ascii=False)[:200])
+    denied_samples = httpx.get(f"{BASE}/api/askdata/samples",
+                               params={"role": "employee", "operator": "E9"}, timeout=30)
+    check("普通员工不能看训练样本队列", denied_samples.status_code == 403,
+          f"HTTP {denied_samples.status_code}")
+    bad_kind = httpx.post(f"{BASE}/api/askdata/samples?role={ROLE}", json={
+        "kind": "ppo", "question": "自检", "chosen": {"metrics": [{"id": "m_expense_total"}]},
+        "reviewer": USER}, timeout=30)
+    check("词表外的样本 kind 被拒", bad_kind.status_code == 400, f"HTTP {bad_kind.status_code}")
+    good_sample = httpx.post(f"{BASE}/api/askdata/samples?role={ROLE}", json={
+        "kind": "sft", "question": "自检补录: 本月报销总额",
+        "chosen": {"metrics": [{"id": "m_expense_total"}], "time": {"range": "this_month"}},
+        "reviewer": USER, "note": "自检"}, timeout=30)
+    gs = good_sample.json()
+    check("补录样本时 chosen 会真过校验+编译",
+          good_sample.status_code == 200 and gs.get("gate_validated") is True,
+          json.dumps(gs, ensure_ascii=False)[:200])
+
+    # 可观测面(B5): /metrics 与告警线都从同一份留痕聚合出来
+    metrics = httpx.get(f"{BASE}/metrics", params={"days": 2}, timeout=30)
+    text_body = metrics.text
+    check("/metrics 可拉且是 Prometheus 文本格式",
+          metrics.status_code == 200 and "# TYPE askdata_queries counter" in text_body,
+          text_body[:200])
+    check("指标里带 semver、告警与样本队列指标",
+          "askdata_semantic_info{" in text_body and "askdata_alert_firing{" in text_body
+          and "askdata_sample_queue" in text_body,
+          text_body[-400:])
+    alerts = httpx.get(f"{BASE}/api/askdata/alerts",
+                      params={"role": ROLE, "operator": USER, "days": 2}, timeout=30).json()
+    rules = {item.get("rule") for item in alerts.get("alerts") or []}
+    check("四条告警线都在",
+          {"fail_rate", "clarify_rate", "degrade_rate", "p95_latency_ms"} <= rules, str(rules))
+    denied_metrics = httpx.get(f"{BASE}/api/askdata/stats", params={"role": "employee"}, timeout=30)
+    check("看板对普通员工 403(重申)", denied_metrics.status_code == 403, f"HTTP {denied_metrics.status_code}")
 
     print(f"\n合计: PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0

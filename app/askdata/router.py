@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.askdata import attribution, store
 from app.config import get_settings
+from app.observability import logsink
 from app.security.audit import get_audit_logger
 
 router = APIRouter(prefix="/api/askdata", tags=["askdata"])
@@ -43,6 +44,7 @@ class GoldenIn(BaseModel):
 
     question: str
     dsl: dict[str, Any] | None = None
+    slots: dict[str, Any] | None = None
     expected_sql: str = ""
     expected_result: dict[str, Any] | None = None
     tags: str = ""
@@ -50,6 +52,36 @@ class GoldenIn(BaseModel):
     created_by: str = ""
     enabled: bool = True
     case_id: str = ""
+    difficulty: str = "easy"
+    intent: str = ""
+
+
+class EventIn(BaseModel):
+    """一条结构化反馈事件(方案 §4⑥ 的事件表)。"""
+
+    query_id: str = Field(default="", description="对应那一轮留痕")
+    trace_id: str = Field(default="", description="链路号(没 query_id 时靠它回查)")
+    session_id: str = Field(default="", description="会话号")
+    user_id: str = Field(default="", description="事件人(自报)")
+    event_type: str = Field(description="like/dislike/edit_query/edit_dsl/copy/drill/ticket/noanswer")
+    payload: dict[str, Any] | None = Field(default=None, description="事件载荷(edit_dsl 存改后的 DSL)")
+    stage: str = Field(default="", description="前端可选: 当时卡在哪个阶段")
+    attribute: bool = Field(default=True, description="是否顺手跑一次归因并产出草案")
+
+
+class TicketIn(BaseModel):
+    """人工工单(页面侧主动开单/处理)。"""
+
+    question: str = ""
+    reason: str = Field(default="user_request", description="开单原因码")
+    query_id: str = ""
+    trace_id: str = ""
+    dsl: dict[str, Any] | None = None
+    semver: str = ""
+    requested_by: str = ""
+    assigned_to: str = ""
+    status: str = ""
+    resolution: str = ""
 
 
 def _privileged(role: str) -> bool:
@@ -119,6 +151,13 @@ async def submit_feedback(req: FeedbackIn) -> dict[str, Any]:
          "disposition": disposition, "written": routed.get("written", ""),
          "user_id": caller or "anonymous"},
     )
+    # Loki 是可选副本(默认不推): 推的是治理信号而不是数据内容，失败不影响本轮反馈已落库。
+    logsink.push_async("feedback", {
+        "query_id": req.query_id, "kind": req.kind, "category": category,
+        "disposition": disposition, "sample": str(routed.get("sample") or ""),
+        "route": str(row.get("route") or ""), "verdict": str(row.get("verdict") or ""),
+        "semver": str(row.get("semver") or ""),
+    }, labels={"user_id": caller or "anonymous"})
     return {
         "status": "ok", "query_id": req.query_id, "feedback": req.kind,
         "category": category, "disposition": disposition,
@@ -166,6 +205,148 @@ async def list_golden(
     }
 
 
+@router.post("/events")
+async def submit_event(req: EventIn) -> dict[str, Any]:
+    """收一条结构化反馈事件(edit_query/edit_dsl/copy/drill/...), 并尽量归因。
+
+    与 ``/feedback`` 的区别不是历史包袋: feedback 只能表达"好/不好", 而这里要拿
+    "用户到底改了什么"当证据 —— edit_dsl 的 diff 能把责任直接定到某个字段。
+    普通角色只能给自己的问数轮记事件(与 /feedback 同一口径)。
+    """
+    if req.event_type not in store.EVENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"event_type 只允许 {list(store.EVENT_TYPES)}")
+    row = {}
+    if req.query_id:
+        row = await run_in_threadpool(store.get_query, req.query_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="没找到这条问数记录")
+        caller = (req.user_id or "").strip()
+        if caller and str(row.get("user_id") or "") not in (caller, ""):
+            raise HTTPException(status_code=403, detail="只能对自己问过的记录给反馈")
+    event_id = await run_in_threadpool(
+        store.record_event,
+        query_id=req.query_id, trace_id=req.trace_id or str(row.get("trace_id") or ""),
+        session_id=req.session_id or str(row.get("session_id") or ""),
+        user_id=req.user_id or str(row.get("user_id") or ""),
+        event_type=req.event_type, payload=req.payload or {}, stage=req.stage,
+    )
+    out: dict[str, Any] = {"status": "ok" if event_id else "degraded", "event_id": event_id}
+    corrected = (req.payload or {}).get("dsl") if req.event_type == "edit_dsl" else None
+    # 事件类型 -> feedback 的映射只在这一处: copy/drill 是中性行为信号(拿走了数据/想看明细),
+    # 不能当成"满意"也不能当成"不满", 否则点踩率会被一堆无关点击拉低。
+    kind = {"like": "up", "dislike": "down", "noanswer": "down"}.get(req.event_type, "")
+    if row and kind and str(req.query_id or ""):
+        await run_in_threadpool(store.set_feedback, req.query_id, kind, user_id=req.user_id or "")
+    if row and corrected and req.query_id:
+        await run_in_threadpool(
+            store.set_feedback, req.query_id, "rewritten",
+            corrected_dsl=corrected, note="由 edit_dsl 事件产生", user_id=req.user_id or "",
+        )
+    if row and req.attribute and (req.query_id or kind or corrected):
+        signal = "rewritten" if corrected else (kind or req.event_type)
+        category, disposition = attribution.attribute(
+            {**row, "feedback": signal, "corrected_dsl": corrected}
+        )
+        routed = await run_in_threadpool(
+            attribution.apply_disposition,
+            {**row, "feedback": signal},
+            category=category, disposition=disposition, corrected_dsl=corrected,
+        )
+        out.update({
+            "category": category, "disposition": disposition,
+            "draft": routed.get("written", ""),
+            "diff": {k: [v[0], v[1]] for k, v in attribution.dsl_diff(
+                row.get("dsl_json"), corrected).items()},
+        })
+    _audit.log(req.trace_id or str(row.get("trace_id") or ""), "assistant", "askdata_event",
+               {"query_id": req.query_id, "event_type": req.event_type,
+                "user_id": req.user_id or "anonymous", "event_id": event_id})
+    logsink.push_async("event", {
+        "query_id": req.query_id, "event_type": req.event_type,
+        "category": str(out.get("category") or ""),
+        "disposition": str(out.get("disposition") or ""),
+        "diff_keys": ",".join(sorted((out.get("diff") or {}).keys())),
+        "semver": str(row.get("semver") or ""),
+    }, labels={"user_id": req.user_id or "anonymous"})
+    return out
+
+
+@router.get("/events")
+async def list_events(
+    role: str = Query(default="employee", description="调用者角色"),
+    operator: str = Query(default="", description="调用者工号"),
+    query_id: str = Query(default="", description="按那一轮回查"),
+    event_type: str = Query(default="", description="按事件类型过滤"),
+    days: int = Query(default=30, ge=1, le=90),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    """事件列表(治理面): 看"哪类事件最多"来定下一个该修什么。"""
+    _require_privileged(role, operator, "反馈事件")
+    return {"events": await run_in_threadpool(
+        store.list_events, query_id=query_id, event_type=event_type, days=days, limit=limit
+    )}
+
+
+@router.post("/tickets")
+async def open_ticket(req: TicketIn, role: str = Query(default="employee")) -> dict[str, Any]:
+    """开一张人工工单(页面上的"这个问题要人看"按钮)。
+
+    状态机在超预算/引擎熔断时会自己开(走 MCP 工具), 这里给的是"用户主动要人"的入口。
+    """
+    if req.reason not in store.TICKET_REASONS:
+        raise HTTPException(status_code=400, detail=f"reason 只允许 {list(store.TICKET_REASONS)}")
+    out = await run_in_threadpool(
+        store.create_ticket,
+        question=req.question, reason=req.reason, trace_id=req.trace_id, query_id=req.query_id,
+        dsl=req.dsl, semver=req.semver, requested_by=req.requested_by,
+    )
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    _audit.log(req.trace_id, "assistant", "askdata_ticket", {**out, "role": role})
+    return out
+
+
+@router.get("/tickets")
+async def get_tickets(
+    role: str = Query(default="employee", description="调用者角色"),
+    operator: str = Query(default="", description="调用者工号"),
+    status: str = Query(default="open", description="open/processing/resolved/rejected, 空串=全部"),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """工单列表(只有治理角色能看全量; 普通角色的自己开的单暂时不单独开接口)。"""
+    _require_privileged(role, operator, "工单列表")
+    return {"tickets": await run_in_threadpool(store.list_tickets, status=status, limit=limit)}
+
+
+@router.post("/tickets/{ticket_id}")
+async def patch_ticket(
+    ticket_id: str, req: TicketIn, role: str = Query(default="employee"),
+) -> dict[str, Any]:
+    """推进一张工单(处理人/状态/结论): 治理动作, 需要特权角色。"""
+    _require_privileged(role, req.assigned_to, "工单处理")
+    out = await run_in_threadpool(
+        store.update_ticket, ticket_id, status=req.status or "processing",
+        resolution=req.resolution, assigned_to=req.assigned_to,
+    )
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    return out
+
+
+@router.get("/alerts")
+async def alert_lines(
+    role: str = Query(default="employee", description="调用者角色"),
+    operator: str = Query(default="", description="调用者工号"),
+    days: int = Query(default=7, ge=1, le=90),
+) -> dict[str, Any]:
+    """告警线: 执行错误率/澄清率突增/降级率/EX 掉分 四条规则现在是否越线。"""
+    _require_privileged(role, operator, "告警线")
+    from app.observability import alerts
+
+    stats = await run_in_threadpool(store.stats, days=days)
+    return {"window_days": days, "alerts": alerts.evaluate(stats), "stats": stats}
+
+
 @router.post("/golden")
 async def add_golden(req: GoldenIn, role: str = Query(default="employee")) -> dict[str, Any]:
     """新增/更新一条评测用例(草案应由归因路由产生, 这里给页面/脚本手工补录用)。"""
@@ -175,6 +356,7 @@ async def add_golden(req: GoldenIn, role: str = Query(default="employee")) -> di
         question=req.question, dsl=req.dsl, expected_sql=req.expected_sql,
         expected_result=req.expected_result, tags=req.tags, note=req.note,
         created_by=req.created_by, enabled=req.enabled, case_id=req.case_id,
+        slots=req.slots, difficulty=req.difficulty, intent=req.intent,
     )
     if out.get("error"):
         raise HTTPException(status_code=400, detail=out["error"])
@@ -184,25 +366,147 @@ async def add_golden(req: GoldenIn, role: str = Query(default="employee")) -> di
     return out
 
 
+@router.post("/golden/{case_id}/cacheable")
+async def approve_golden_cache(
+    case_id: str,
+    cacheable: bool = Query(description="true=允许这条问法被语义缓存复用"),
+    role: str = Query(default="employee"),
+    operator: str = Query(default=""),
+) -> dict[str, Any]:
+    """批准/收回某条问法参与语义缓存(治理动作)。
+
+    为什么默认全部不可复用: 缓存一旦命中就是"拿 A 的口径回答 B"。
+    golden 里批量生成的合成问法只当尺子, 要拿它服务真实用户必须逐条批准。
+    """
+    _require_privileged(role, operator, "语义缓存批准")
+    out = await run_in_threadpool(store.set_golden_cacheable, case_id, cacheable=cacheable)
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    _audit.log("", "assistant", "askdata_golden_cacheable",
+               {**out, "operator": operator, "role": role})
+    return out
+
+
+@router.get("/samples")
+async def list_samples(
+    role: str = Query(default="employee", description="调用者角色"),
+    operator: str = Query(default="", description="调用者工号"),
+    status: str = Query(default="draft", description="draft/approved/rejected/exported, 空=全部"),
+    kind: str = Query(default="", description="sft / dpo"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    """SFT/DPO 样本队列(只给治理角色): 看"哪些轮次可以当训练材料"。
+
+    队列里的每一行都带着两道门禁的结论, 所以"为什么不导出这条"能在数据里看到,
+    不用人去读 note 猜。
+    """
+    _require_privileged(role, operator, "训练样本队列")
+    return {
+        "samples": await run_in_threadpool(
+            store.list_samples, status=status, kind=kind, limit=limit
+        ),
+        "stats": await run_in_threadpool(store.sample_stats),
+        "trainable_categories": list(store.TRAINABLE_CATEGORIES),
+        "gate_strict": bool(get_settings().askdata_sample_gate_strict),
+    }
+
+
+@router.post("/samples/{sample_id}")
+async def review_sample_endpoint(
+    sample_id: str,
+    status: str = Query(description="approved / rejected / draft"),
+    role: str = Query(default="employee"),
+    operator: str = Query(default=""),
+    note: str = Query(default=""),
+) -> dict[str, Any]:
+    """人工复核一条样本(批准/驳回)。导出脚本只读 approved 且两道门禁都过的。"""
+    _require_privileged(role, operator, "样本复核")
+    out = await run_in_threadpool(
+        store.review_sample, sample_id, status=status, reviewer=operator, note=note,
+    )
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    _audit.log("", "assistant", "askdata_sample_review",
+               {**out, "role": role, "operator": operator})
+    return out
+
+
+class SampleIn(BaseModel):
+    """手工补录一条训练样本(治理面用; 自动产生走归因路由)。"""
+
+    kind: str = "sft"
+    question: str
+    chosen: dict[str, Any]
+    rejected: dict[str, Any] | None = None
+    query_id: str = ""
+    semver: str = ""
+    category: str = "dsl"
+    note: str = ""
+    reviewer: str = ""
+
+
+@router.post("/samples")
+async def add_sample(req: SampleIn, role: str = Query(default="employee")) -> dict[str, Any]:
+    """补录样本。chosen 必须真能过校验+编译(不靠人口头保证)。"""
+    _require_privileged(role, req.reviewer, "训练样本写入")
+    from app.askdata.attribution import _dsl_is_executable
+
+    executable = await run_in_threadpool(_dsl_is_executable, req.chosen)
+    out = await run_in_threadpool(
+        store.record_sample,
+        kind=req.kind, question=req.question, chosen=req.chosen, rejected=req.rejected,
+        query_id=req.query_id, semver=req.semver, category=req.category or "dsl",
+        user_id=req.reviewer, gate_validated=executable, gate_confirmed=True,
+        note=req.note or "治理面手工补录",
+    )
+    if out.get("error"):
+        raise HTTPException(status_code=400, detail=out["error"])
+    out["gate_validated"] = executable
+    return out
+
+
 @router.get("/semantic")
 async def semantic_snapshot(
     role: str = Query(default="employee", description="调用者角色"),
     operator: str = Query(default="", description="调用者工号"),
     refresh: bool = Query(default=False, description="强制重读语义层快照"),
 ) -> dict[str, Any]:
-    """语义层快照概览(排查用): 现在用的是库里版本还是内置兜底集。"""
+    """语义层快照概览(排查用): 现在用的是库里版本还是内置兜底集, 以及各细分面的情况。"""
     _require_privileged(role, operator, "语义层快照")
     from app.semantic import registry
 
     if refresh:
         registry.invalidate()
     catalog = await run_in_threadpool(registry.get_catalog)
+    changes = await run_in_threadpool(_recent_changes)
     return {
         "catalog": catalog.to_payload(),
+        "semver": catalog.semver,
+        "object_versions": catalog.object_versions(),
+        "recent_changes": changes,
         "golden_enabled": await run_in_threadpool(store.golden_count),
+        "golden_min_required": int(get_settings().askdata_golden_min_cases or 0),
         "metrics": catalog.render_metrics(),
         "dimensions": catalog.render_dimensions(),
     }
+
+
+def _recent_changes(limit: int = 20) -> list[dict[str, Any]]:
+    """最近的语义层版本记录(看"口径是谁什么时候改的")。"""
+    from sqlalchemy import text
+
+    from app.db import sync as dbsync
+
+    sql = (
+        "SELECT semver, object_kind, object_id, version, actor, source, note, created_at "
+        "FROM sem_change_log ORDER BY created_at DESC LIMIT :limit"
+    )
+    try:
+        with dbsync.get_sync_engine().connect() as conn:
+            rows = conn.execute(text(sql), {"limit": max(1, min(100, limit))}).all()
+    except Exception:  # noqa: BLE001 - 版本记录读不出不影响快照本身(存量库可能还没这张表)
+        return []
+    return [dict(r._mapping) for r in rows]
 
 
 def _require_privileged(role: str, operator: str, what: str) -> None:

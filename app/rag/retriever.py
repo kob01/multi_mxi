@@ -74,12 +74,24 @@ class HybridRetriever:
         self.bodies = get_body_store()
 
     async def rebuild_bm25(self) -> None:
-        """Rebuild the ES BM25 index from child chunks stored in PostgreSQL.
+        """仅在 ES 索引为空时从 PostgreSQL 全量重建 BM25(首启/修复场景)。
 
-        PostgreSQL stays the source of truth for the corpus; 文本全在 PG
-        ``doc_chunks``, 不依赖 Mongo; 流式逐批索引(语料上量后不一次性加载)。
+        PostgreSQL 是语料的事实源; 已有内容时信任单文档增量写, 不再每轮启动
+        把全库重灌一遍(那在语料上量后会变成分钟级的启动/首次检索卡顿)。
         """
+        await self.bm25.ensure_corpus_or_rebuild(self.store.iter_chunk_corpus())
+
+    async def force_rebuild_bm25(self) -> None:
+        """无条件全量重建: 只给运维脚本/迁移后的收敛用。"""
         await self.bm25.rebuild(self.store.iter_chunk_corpus())
+
+    async def index_doc(self, doc_id: str, stale_chunk_ids: Sequence[str] = ()) -> int:
+        """单文档投影: 增量写现行子块 + 删发布阶段标陈旧的块(不碰其他文档)。"""
+        chunks = await self.store.list_doc_chunks(doc_id)
+        written = await self.bm25.index_doc_chunks(doc_id, chunks)
+        if stale_chunk_ids:
+            await self.bm25.delete_chunk_ids(list(stale_chunk_ids))
+        return written
 
     async def retrieve(
         self,

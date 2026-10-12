@@ -8,7 +8,7 @@
     uv run python -m scripts.dev_services down
 
 为什么需要这个脚本: 本项目的全部服务(含 assistant 网关)都在 compose 里
-(assistant / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru /
+(assistant / ingest-worker / postgres / elasticsearch / redis / neo4j / mongo / tei-rerank / mineru /
 hr-mcp / finance-mcp / analytics-mcp / procurement-mcp / askdata-mcp /
 hr-agent / finance-agent / analyst-agent / contract-agent / askdata-agent),
 宿主只跑 vite dev 与 Ollama。**验证代码改动只允许
@@ -46,6 +46,7 @@ COMPOSE_FILE = "docker/docker-compose.yml"
 # (容器唯一验证环境, 宿主禁止直跑网关), 改代码后用 up --build 重建镜像生效。
 DEV_SERVICES = [
     "assistant",
+    "ingest-worker",
     "postgres",
     "elasticsearch",
     "redis",

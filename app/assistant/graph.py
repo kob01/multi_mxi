@@ -77,6 +77,7 @@ from app.agents.common_tools import take_lookup_tool, with_lookup_tool
 from app.assistant.a2a_client import AGENT_PROFILES, get_a2a_pool, is_agent_domain
 from app.assistant.askdata_bridge import (
     artifacts_from_payload,
+    prior_of,
     slots_of,
     split_askdata_payload,
     to_metadata as askdata_view,
@@ -93,7 +94,7 @@ from app.assistant.prompts import (
 from app.assistant.stream import RunOverloaded, get_stream_hub, new_run_id
 from app.assistant.slot_store import get_slot_store
 from app.cache.prompt_cache import cached_llm_call
-from app.cache.retrieval_cache import cached_retrieve, invalidate_all
+from app.cache.retrieval_cache import bump_doc_gen, cached_retrieve, invalidate_all
 from app.cache.tool_cache import wrap_tools_for_cache
 from app.chat_store import get_chat_store
 from app.config import get_settings
@@ -559,8 +560,9 @@ class AssistantOrchestrator:
         # ES + rerank), 但下方的 assemble_parents / is_allowed 仍然照常执行
         # —— 缓存在权限裁剪之前, 不影响最终授权校验这道纵深防御。
         # 注: cached payload 是 retrieve() 的输出, 已在内部 attach_texts 补好子块正文,
-        # 故命中时不再走一次 chunk_id 主键回表; 文档重入库路径已调 invalidate_all(),
-        # 缓存里不会残留陈旧 chunk_id, 无需为本方案新增失效机制。
+        # 故命中时不再走一次 chunk_id 主键回表; 入库/改权限/删文档都在文档粒度
+        # bump docgen 版本号(cached payload 里存了本次命中文档的版本快照), 陈旧 chunk_id
+        # 会在读时校验上被判未命中并自删该 key, 所以无需为命中项再回表复核。
         children, score_mode, cache_hit = await cached_retrieve(
             query, self._settings.rag_top_k, self._settings.rerank_top_n,
             principal, _invoke_retrieve,
@@ -1059,7 +1061,14 @@ class AssistantOrchestrator:
             metadata["question"] = query
             prior = await get_slot_store().get(session_id)
             if prior:
-                metadata["slots"] = prior
+                # 存下来的是一整份"上一定稿"({slots,dsl,top_metric,question}); 旧形状(直接是
+                # 槽位 dict)还存在 Redis 里时得兼容, 不能因为升级就让存量会话的继承丢一片。
+                if isinstance(prior.get("slots"), dict) or "metric_terms" in prior:
+                    metadata["slots"] = prior.get("slots") or prior
+                if prior.get("dsl"):
+                    metadata["prior_dsl"] = prior["dsl"]
+                if prior.get("top_metric"):
+                    metadata["prior_top_metric"] = prior["top_metric"]
         # send_guarded 而不 send: 智能体侧的 ReAct 循环没有全局预算, 卡住时这一条委派
         # 会永远不返回并永久占住一个并发额度; 超时降级为可读文本比挂死好得多。
         answer = await get_a2a_pool().send_guarded(
@@ -1139,11 +1148,11 @@ class AssistantOrchestrator:
         session_id = state.get("session_id") or ""
         # append 的返回值是本轮新折叠出的会话摘要(没发生溢出压缩时为空串)。
         session_summary = await self._memory.append(session_id, masked_message, masked_answer)
-        # 问数轮: 把本轮确定的槽位存下来供下一轮省略继承。存的是 payload 里的槽位
-        # (说法与区间), 不是结果行 —— 于是继承是确定性的, 也不会把业务数字搬进记忆层。
+        # 问数轮: 把本轮定稿的上下文存下来供下一轮省略/指代继承。存的是槽位+DSL+最高分口径
+        # (都是结构化的口径选择), 不是结果行 —— 于是继承是确定性的, 也不会把业务数字搬进记忆层。
         askdata = state.get("askdata_payload") or {}
         if askdata.get("kind") in ("result", "clarify", "degraded") and askdata.get("slots"):
-            await get_slot_store().set(session_id, slots_of(askdata))
+            await get_slot_store().set(session_id, prior_of(askdata))
         await self._write_personal_memory(state, masked_message, masked_answer, session_summary)
         # 显式"记一下"指令是 knowledge 桶唯一的写入入口(自动提取与情节蒸馏已下线):
         # 关键词命中才进 LLM 提炼链路, 未命中零成本; 失败只记日志不阻断对话。
@@ -1667,34 +1676,38 @@ class AssistantOrchestrator:
                     self._retriever = retriever
         return self._retriever
 
-    async def refresh_knowledge(self) -> None:
-        """Rebuild the ES BM25 index after a document (re)ingest (drift repair).
+    async def refresh_knowledge(self, doc_keys: Sequence[str] | None = None) -> None:
+        """知识库变更后的检索侧收敛入口。
 
-        重建是"把全库子块从 PG 流式读出来再 bulk 进 ES", 分钟级; 它过去在入库请求
-        里同步等完 —— 一个管理员重入库一篇文档, 全厂人的检索都跟着变慢(而且同一个
-        事件循环里没人能抢过它)。现在: 缓存立刻失效(语义不变), 重建丢给后台单飞任务。
+        两个分支语义不同, 不要混用:
+        - 传 ``doc_keys``: 定向失效(只影响命中了这些文档的查询), O(文档数) 次 INCR;
+          入库/权限/删除热路径现在由 worker 直接调 ``bump_doc_gen``, 这里只是留一个
+          网关侧手工触发的入口。
+        - 不传: **运维/修复路径** —— 全清检索缓存 + 后台单飞全量重建 BM25。
 
-        单飞: 同时来了十篇入库也只跑一次全量重建(重建本身幂等且以全库为输入, 多次
-        重跑纯浪费); 后台任务失败只记日志 —— ES 是可从 PG 全量重建的派生索引。
+        旧写法是"每入库一篇就 ``invalidate_all()`` + 后台全量重建": 全清缓存会把全站
+        热查询一起打掉(缓存击空后全量回源 embedding + 两通道 + rerank), 而重建与
+        语料量成正比 —— 文档一多就是成本爆炸。现在两者都降级到运维手段。
         """
-        # 文档重新入库后旧 chunk_id 可能已被删除/重建, Retrieval Cache 必须同步失效,
-        # 否则会命中缓存里的脏 chunk_id(即使 TTL 未到)。这道不能推迟到后台。
+        if doc_keys:
+            await bump_doc_gen(list(doc_keys))
+            return
         await invalidate_all()
         if self._rebuild_running:
-            logger.info("BM25 全量重建已在后台进行中, 本次入库不重复发起")
+            logger.info("BM25 全量重建已在后台进行中, 本次不重复发起")
             return
         if self._retriever is None:
-            return  # 检索器还未首建(下一次 _get_retriever 会连带重建 BM25)
+            return  # 检索器还未首建(下一次 _get_retriever 会连带把空索引灌好)
         self._rebuild_running = True
         task = asyncio.create_task(self._rebuild_bm25_bg(), name="bm25-rebuild")
         self._rebuild_tasks.add(task)
         task.add_done_callback(self._rebuild_tasks.discard)
 
     async def _rebuild_bm25_bg(self) -> None:
-        """后台重建 BM25; 任何异常都不外溢(派生索引下次启动还会重补)。"""
+        """后台全量重建 BM25(仅运维路径); 任何异常都不外溢(派生索引下次启动还会重补)。"""
         try:
             if self._retriever is not None:
-                await self._retriever.rebuild_bm25()
+                await self._retriever.force_rebuild_bm25()
         except Exception as exc:  # noqa: BLE001 - ES 索引反正下次启动会重建
             logger.warning("后台 BM25 重建失败(下次入库/启动会重试): %s", exc)
         finally:

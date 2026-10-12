@@ -1,0 +1,18 @@
+# 智能问数语义层真值(由 scripts/export_semantic_defs.py 生成/维护)
+# 改这里 = 改口径: 必须走 scripts/sync_semantic_defs.py 同步进库并留版本记录。
+row_policies:
+- policy_id: rp_employee_own_reimbursements
+  role: employee
+  table_name: fin_reimbursements
+  predicate: '{alias}.emp_id = {user_id}'
+  priority: 50
+  enabled: false
+  note: 打开后员工问报销只能得到本人单据(RLS 仍是底线, 这一层是叠加的收紧)
+col_policies:
+- role: employee
+  table_name: hr_employees
+  denied_cols:
+  - annual_leave_total
+  - annual_leave_used
+  enabled: true
+  note: 员工角色不能问同事的年假额度(问得到就是越权读人); 在职人数/新入职人数这类聚合不受影响

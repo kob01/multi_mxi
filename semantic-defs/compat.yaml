@@ -1,0 +1,1107 @@
+# 智能问数语义层真值(由 scripts/export_semantic_defs.py 生成/维护)
+# 改这里 = 改口径: 必须走 scripts/sync_semantic_defs.py 同步进库并留版本记录。
+compat:
+- metric_id: m_expense_total
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_total
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_total
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_total
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_total
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_total
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_count
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_paid_total
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_pending_count
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_rejected_count
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_avg_amount
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_max_amount
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_reject_rate
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_travel_total
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_person_count
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_expense_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_expense_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_expense_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_reimb_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_expense_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_expense_per_capita
+  dim_id: d_expense_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_annual_total
+  dim_id: d_budget_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_annual_total
+  dim_id: d_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_used_total
+  dim_id: d_budget_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_used_total
+  dim_id: d_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_remaining
+  dim_id: d_budget_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_remaining
+  dim_id: d_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_used_pct
+  dim_id: d_budget_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_used_pct
+  dim_id: d_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_over_count
+  dim_id: d_budget_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_budget_over_count
+  dim_id: d_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_done_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_done_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_done_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_done_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_done_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_open_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_open_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_open_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_open_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_open_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_onboard_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_onboard_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_onboard_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_onboard_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_onboard_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_cert_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_cert_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_cert_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_cert_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_cert_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_person_count
+  dim_id: d_ticket_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_person_count
+  dim_id: d_ticket_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_person_count
+  dim_id: d_ticket_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_person_count
+  dim_id: d_ticket_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_ticket_person_count
+  dim_id: d_ticket_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_count
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_count
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_count
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_count
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_count
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_days_total
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_days_total
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_days_total
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_days_total
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_days_total
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_avg_days
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_avg_days
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_avg_days
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_avg_days
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_avg_days
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_annual_days
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_annual_days
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_annual_days
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_annual_days
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_annual_days
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_sick_days
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_sick_days
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_sick_days
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_sick_days
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_sick_days
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_approved_days
+  dim_id: d_leave_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_approved_days
+  dim_id: d_leave_type
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_approved_days
+  dim_id: d_leave_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_approved_days
+  dim_id: d_leave_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_leave_approved_days
+  dim_id: d_leave_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_headcount
+  dim_id: d_employee_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_headcount
+  dim_id: d_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_headcount
+  dim_id: d_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_headcount
+  dim_id: d_employee_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_onboard_count
+  dim_id: d_employee_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_onboard_count
+  dim_id: d_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_onboard_count
+  dim_id: d_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_onboard_count
+  dim_id: d_employee_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_left_count
+  dim_id: d_employee_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_left_count
+  dim_id: d_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_left_count
+  dim_id: d_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_left_count
+  dim_id: d_employee_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_leave_balance_total
+  dim_id: d_employee_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_leave_balance_total
+  dim_id: d_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_leave_balance_total
+  dim_id: d_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_leave_balance_total
+  dim_id: d_employee_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_avg_leave_used
+  dim_id: d_employee_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_avg_leave_used
+  dim_id: d_employee_position
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_avg_leave_used
+  dim_id: d_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_employee_avg_leave_used
+  dim_id: d_employee_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_total
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_count
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_pending_count
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_approved_total
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_avg_amount
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_quotes_short
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_department
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_supplier
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_node
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_budget_year
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_purchase_supplier_count
+  dim_id: d_order_employee_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_amount_total
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_high_risk_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_medium_risk_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_risk_flag_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_avg_amount
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_expiring_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_risk_level
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_party_b
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_reviewer
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_contract_party_count
+  dim_id: d_contract_currency
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_count
+  dim_id: d_supplier_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_count
+  dim_id: d_supplier_risk_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_count
+  dim_id: d_supplier_qualification
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_count
+  dim_id: d_supplier_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_blacklist_count
+  dim_id: d_supplier_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_blacklist_count
+  dim_id: d_supplier_risk_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_blacklist_count
+  dim_id: d_supplier_qualification
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_blacklist_count
+  dim_id: d_supplier_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_watch_count
+  dim_id: d_supplier_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_watch_count
+  dim_id: d_supplier_risk_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_watch_count
+  dim_id: d_supplier_qualification
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_watch_count
+  dim_id: d_supplier_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_general_taxpayer_count
+  dim_id: d_supplier_category
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_general_taxpayer_count
+  dim_id: d_supplier_risk_status
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_general_taxpayer_count
+  dim_id: d_supplier_qualification
+  compat: ok
+  note: 由内置集 compatible_dims 派生
+- metric_id: m_supplier_general_taxpayer_count
+  dim_id: d_supplier_name
+  compat: ok
+  note: 由内置集 compatible_dims 派生

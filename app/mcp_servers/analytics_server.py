@@ -268,14 +268,14 @@ def render_chart(
 ) -> dict[str, Any]:
     """把查询结果画成图并落盘, 返回可直接展示的 URL(SVG, 浏览器渲染中文无字体问题)。
 
-    chart_type: bar(类目对比) / line(时间趋势) / pie(构成占比)。
+    chart_type: bar(类目对比) / line(时间趋势) / pie(构成占比) / heatmap(两个维度交叉)。
     数据两种形态任选: categories=["研发部","市场部"] + values=[1200,800];
     或多系列 categories=[...] + series=[{"name":"金额","data":[...]},
-    {"name":"笔数","data":[...]}]。饼图只用第一个系列。
+    {"name":"笔数","data":[...]}]。饼图只用第一个系列; 热力图拿 categories 当列、series 名当行。
 
     Args:
         title: 图表标题, 同时用于生成文件名 slug。
-        chart_type: bar / line / pie。
+        chart_type: bar / line / pie / heatmap。
         categories: 类目标签列表(或 [标签, 数值] 成对列表)。
         series: 多系列数据, 每项 {name, data}。
         values: 单系列数值, 与 categories 对齐。

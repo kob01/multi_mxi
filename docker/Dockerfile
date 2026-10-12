@@ -28,6 +28,9 @@ RUN uv sync --frozen --no-install-project --no-dev
 COPY app ./app
 COPY web ./web
 COPY scripts ./scripts
+# 语义层真值(YAML): 容器里的灌入/同步也读这一份。不拷进去的话 `registry.defs_dir()`
+# 在容器内不存在, 会默默退到代码内置种子 —— 那等于"改了 YAML 不生效"的隐藏版本。
+COPY semantic-defs ./semantic-defs
 COPY data/knowledge ./data/knowledge
 
 EXPOSE 8000 8001 8002 8005 8006 8007 9001 9002 9005 9006 9007

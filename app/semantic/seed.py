@@ -178,6 +178,18 @@ TOP_DIMS: list[dict[str, Any]] = [
     _d("d_supplier_name", "供应商名称", "proc_suppliers", "name", enum_source="column:proc_suppliers.name"),
     _d("d_employee_position", "职位", "hr_employees", "position"),
     _d("d_employee_name", "员工", "hr_employees", "name"),
+    # 员工姓名/职位也会被报销/工单/请假类指标下钻使用, 但这三张事实表上没有 name/position 列:
+    # 它们必须按"事实表 + 需要 JOIN 员工主数据"各登记一份(与部门维度同一形状)。
+    # 拿 hr_employees 那两条直接用在报销指标上会生成 `e.name` 但没有任何 JOIN, PG 直接报
+    # "missing FROM-clause entry for table e"(实际被语义缓存+多维评测抖出来)。
+    _d("d_expense_employee_name", "员工", "fin_reimbursements", "name", join_emp=True),
+    _d("d_expense_employee_position", "职位", "fin_reimbursements", "position", join_emp=True),
+    _d("d_ticket_employee_name", "员工", "hr_tickets", "name", join_emp=True),
+    _d("d_ticket_employee_position", "职位", "hr_tickets", "position", join_emp=True),
+    _d("d_leave_employee_name", "员工", "hr_leave_records", "name", join_emp=True),
+    _d("d_leave_employee_position", "职位", "hr_leave_records", "position", join_emp=True),
+    _d("d_order_employee_name", "员工", "proc_orders", "name", join_emp=True),
+    _d("d_order_employee_position", "职位", "proc_orders", "position", join_emp=True),
     _d("d_employee_status", "在职状态", "hr_employees", "status", ["在职", "离职"]),
     _d("d_budget_year", "预算年度", "fin_department_budgets", "year"),
     _d("d_order_budget_year", "采购预算年度", "proc_orders", "budget_year"),
@@ -192,13 +204,14 @@ TOP_DIMS: list[dict[str, Any]] = [
 # 指标(Top 52)
 # ---------------------------------------------------------------------------
 _EXPENSE_DIMS = ["d_expense_department", "d_expense_category", "d_expense_status",
-                 "d_reimb_node", "d_employee_name", "d_employee_position"]
+                 "d_reimb_node", "d_expense_employee_name", "d_expense_employee_position"]
 _TICKET_DIMS = ["d_ticket_department", "d_ticket_category", "d_ticket_status",
-                "d_employee_name", "d_employee_position"]
+                "d_ticket_employee_name", "d_ticket_employee_position"]
 _LEAVE_DIMS = ["d_leave_department", "d_leave_type", "d_leave_status",
-               "d_employee_name", "d_employee_position"]
+               "d_leave_employee_name", "d_leave_employee_position"]
 _ORDER_DIMS = ["d_order_department", "d_order_category", "d_order_status", "d_order_supplier",
-               "d_order_node", "d_order_budget_year", "d_order_currency", "d_employee_name"]
+               "d_order_node", "d_order_budget_year", "d_order_currency",
+               "d_order_employee_name"]
 _CONTRACT_DIMS = ["d_contract_category", "d_contract_status", "d_contract_risk_level",
                   "d_contract_party_b", "d_contract_reviewer", "d_contract_currency"]
 _SUPPLIER_DIMS = ["d_supplier_category", "d_supplier_risk_status", "d_supplier_qualification",

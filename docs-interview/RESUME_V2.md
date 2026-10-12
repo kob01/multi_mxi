@@ -65,6 +65,28 @@
 > 「为解决纯向量对专名/条款编号召回差的问题，引入 ES BM25 稀疏通道并用 RRF(k=60) 融合，召回较单路向量提升 30%+」。
 > 标签版更适合面试前自我梳理，一眼能背出每条的「问题—方案—结果」。
 
+### C-0 项目介绍 · 整体版（三版共用，可作简历开头的「项目描述 + 个人职责」直接粘贴）
+
+> 与《马小i系统架构图》七大分支一一对应：① 入口层、② 调度核心、③ RAG 知识库座、⑦ 缓存层、⑧ 安全治理、⑩ 存储层、⑫ 可观测性；
+> 所有选型与数字在 C-1/C-2 与 `RESUME_PROJECTS.md` 中均有出处，面试被追问不会对不上。
+> 若投递口径拆成两个项目：③ RAG 知识库座单独拆为「智答」段（详见 C-1），其余归「马小i」。
+
+**马小i · 企业级多智能体 AI 助手（统一入口分层调度 + 企业 RAG 知识底座）** · 独立设计与实现 · 2025.05 - 至今
+`Python 3.11 / FastAPI / LangGraph / Vue3+Vite / PostgreSQL+pgvector / Elasticsearch / MongoDB / Redis Stack / Neo4j / Ollama(bge-m3) / TEI(bge-reranker-v2-m3) / MinerU / Langfuse / Docker Compose`
+
+**项目介绍**：马小i 是面向企业内部员工办公自动化的企业级 AI 助手，以统一对话入口承接知识问答、流程办理、业务查询与工具调用。系统按「入口网关、LangGraph 调度核心、RAG 知识库座、缓存层、安全治理、三层存储、可观测性」七层组织：FastAPI 网关按域对外提供 REST 与 SSE 流式契约，Vue3 SPA 承载对话、知识图谱与记忆自服务界面；调度核心以 LangGraph 完成「上下文构建 → 时间解析 → 查询改写 → 意图识别 → 四路分发 → 记忆写回」，支持条件边回环重检与 checkpoint 续跑；知识库座以稠密+稀疏混合检索与 cross-encoder 精排提供证据；全链路内置文档级 ACL、脱敏、审计与 Text2SQL 只读护栏；16 个服务以 Docker Compose 容器化一键私有化部署。
+
+**个人职责与架构设计**（按层）：
+- **入口层 Gateway**：FastAPI 网关按域注册路由——`/api/chat`·`/api/agents` 承接 assistant 流式对话、`/api/docs`·`/api/files` 文档/文件管理、`/api/memory`·`/api/kg` 记忆与知识图谱、`/api/dataops` 数据运维；Pydantic schema 定前后端契约，`route` 枚举驱动前端展示形态。
+- **调度核心 Assistant（LangGraph）**：编排节点流程 `build_context → resolve_time → rewrite_query → classify_intent → 四路分发（kb_retrieve / kb_requery / kb_generate、tool_execute / agent_delegate / chitchat） → persist_memory`，检索不足经条件边回环重检、会话中断可 checkpoint 续跑；意图识别三层漏斗——L1 规则快筛（正则/关键词，0ms）、L2 bge-m3 语义分类（Top-K 均值 ≥ 0.62 且 margin ≥ 0.05 防摇摆）、L3 deepseek LLM 兜底 + 终端关键词安全网 fallback，逐层可单独关停降级且命中层级落审计；多智能体并发委派由 `agent_targets` 显式点选触发，Semaphore 并发控制（默认并行度 2）+ 逐位超时（外层 150s / 内层 send_guarded 120s），合并为一节一智能体 Markdown 不过 LLM，`MULTI_AGENT_ENABLED=false` 可随时回退单意图链路。
+- **RAG 知识库座**：混合检索 = 稠密向量（bge-m3 + pgvector HNSW，cosine）∥ 稀疏倒排（Elasticsearch BM25 + jieba 分词），RRF 融合排序；重排序用 compose 内 TEI 容器跑 bge-reranker-v2-m3 真 cross-encoder，故障降级回 RRF 序；文档入库流水线 `upload → parse（MinerU OCR）→ 结构化切块 → embed（bge-m3）→ pgvector upsert + ES 增量 → 缓存失效通知`，重入库无检索空窗。
+- **缓存层 Cache（Redis）**：Prompt Cache（LLM 系统提示词/纯函数调用）、Retrieval Cache（RAG 检索结果，key 含 ACL 签名）、Tool Cache（MCP 工具结果，仅只读、A2A 委派整体不缓存）；全路径可降级，Redis 不可用时直接穿透，主链路不因缓存故障挂起。
+- **安全治理体系**：身份认证（Bearer Token + 角色白名单）与调用者上下文（`scope_id` 多租户隔离）；文档级 ACL、敏感信息脱敏（身份证/银行卡/手机号/金额）、配额控制、URL/SSRF 防护；全链路审计以 `trace_id` 串联各节点、append-only 落 `audit.jsonl`；数据面 SQL Guard（关键字黑名单 + `SET LOCAL statement_timeout`）与 AST Guard（Text2SQL AST 级白名单校验）双保险只读。
+- **存储层（三层分工）**：PostgreSQL+pgvector 统一持久化——documents/tags 文档元数据、knowledge_chunks 知识块向量（HNSW）、long_term_memories 长期/个人记忆、user_profiles 用户画像 JSONB、hr_*/finance_* 业务表；MongoDB 外置正文（raw_text / normalized_text / structure，父块 context 按 parent_id 批量取）；Elasticsearch 作 BM25 派生倒排（content_tokens 中文分词，可从 PG 全量 rebuild）；Redis Stack 承缓存+会话+Checkpointer；Neo4j 承文档图谱+个人图谱。
+- **可观测性 Observability**：自建 Langfuse 可观测栈（compose 内、数据不出内网），`trace_id` 全链路串联各节点并与审计双向对齐；`audit.jsonl` 结构化审计留痕；启动时打印能力开关摘要日志（on/off 清单），静默降级在启动即暴露。
+
+**量化结果**：混合检索召回较单路向量 **+30%+**，MS MARCO 评测 **recall@10 0.9625、MRR@10 0.7597、nDCG@10 0.8059**；结构感知切块 A/B **recall@10 +13.3%、nDCG@10 +17.1%、上下文长度 -29%、证据密度 +57%**；精排延迟从 **~28s 降至 0.59–1.30s**，精排后 Top-5 答案命中率 **+25%**；意图 L1 快筛 0ms 零网络调用命中高频指令，仅长难句下沉 LLM，成本与延迟显著下降。
+
 ### C-1 纯 AI 应用版（两项目讲透，前端一句带过）
 
 > 每条统一按「**痛点 → 选型/做法 → 收益**」写，体现技术不是堆名词而是解决了具体问题。

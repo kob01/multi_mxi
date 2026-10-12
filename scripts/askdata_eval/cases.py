@@ -32,9 +32,14 @@ def load_cases(*, limit: int | None = None, tag: str = "") -> list[dict[str, Any
             "case_id": str(row.get("case_id") or ""),
             "question": str(row.get("question") or ""),
             "dsl": dsl,
+            # 期望槽位可以没标(旧用例就是没标): slot-F1 的口径是"有标注的用例里算",
+            # 拿没标的当 0 分会把"没标"误报成"模型抽错了"。
+            "slots": _as_dict(row.get("slots_json")),
             "expected_sql": str(row.get("expected_sql") or ""),
             "expected": expected,
             "tags": str(row.get("tags") or ""),
+            "difficulty": str(row.get("difficulty") or "easy"),
+            "intent": str(row.get("intent") or ""),
             "note": str(row.get("note") or ""),
         })
     if limit:

@@ -20,10 +20,14 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# 三个集合: 整篇正文 / 超阈值溢出分片 / 父块全文。
+# 集合: 整篇正文 / 超阈值溢出分片 / 父块全文 / 解析产物 + 其 raw 溢出分片。
+# 解析产物(artifact)是"一次解析、预览与入库共用"的那一份: 只在入库生命周期里存在,
+# 不是检索层, 过期即回收。
 COLL_DOC_BODY = "doc_bodies"
 COLL_DOC_BODY_PARTS = "doc_body_parts"
 COLL_PARENT_TEXT = "parent_texts"
+COLL_PARSE_ARTIFACT = "parse_artifacts"
+COLL_PARSE_ARTIFACT_PARTS = "parse_artifact_parts"
 
 _client: AsyncIOMotorClient | None = None
 
@@ -71,7 +75,8 @@ async def init_body_schema() -> None:
     这里建的二级索引只服务两类非 _id 场景:
     - ``doc_bodies.updated_at``: 迁移排查(按时间扫描最近变更);
     - ``doc_body_parts (doc_key, part_no)`` 唯一复合: 溢出分片按 doc_key 升序拼;
-    - ``parent_texts.doc_id``: ``delete_many({doc_id})`` 的主路径(重入库/删除)。
+    - ``parent_texts.doc_id``: ``delete_many({doc_id})`` 的主路径(重入库/删除);
+    - ``parse_artifacts.created_at``: 过期产物回收按时间扫(唯一需要的范围查询)。
     """
     if not get_settings().mongo_enabled:
         logger.info("mongo_enabled=false, 跳过 body schema 初始化")
@@ -85,6 +90,11 @@ async def init_body_schema() -> None:
             [("doc_key", 1), ("part_no", 1)], unique=True, background=True
         )
         await db[COLL_PARENT_TEXT].create_index("doc_id", background=True)
+        await db[COLL_PARSE_ARTIFACT].create_index("created_at", background=True)
+        await db[COLL_PARSE_ARTIFACT].create_index("doc_key", background=True)
+        await db[COLL_PARSE_ARTIFACT_PARTS].create_index(
+            [("upload_id", 1), ("part_no", 1)], unique=True, background=True
+        )
     except OperationFailure as exc:
         # 索引已存在 / 并发创建竞态: 幂等吞掉。
         logger.warning("init_body_schema 索引创建告警(可忽略): %s", exc)

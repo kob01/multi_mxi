@@ -220,6 +220,7 @@ class ElasticBM25Retriever:
     async def rebuild(self, chunks_or_iter) -> None:
         """Drop + rebuild the whole index from a list or an async iterator of batches.
 
+        **运维/修复手段**, 不再在入库链路里跑(原因见 :meth:`index_doc_chunks`)。
         流式重建时批间不 refresh(最后一批才 refresh), 避免大语料重建的 refresh 抖动。
         语料源 = PG ``doc_chunks``(title + chunk_text), 与向量同一张表, 不依赖 Mongo。
 
@@ -245,6 +246,75 @@ class ElasticBM25Retriever:
             for c in chunks
         ]
         await async_bulk(self._bulk_client, actions, refresh=refresh)
+
+    async def index_doc_chunks(
+        self, doc_id: str, chunks: Sequence[KnowledgeChunk]
+    ) -> int:
+        """单文档增量写: 只 bulk 这一篇的子块(不碰其他文档)。
+
+        这是取代"每入库一篇就全库重建"的主路径: 全量重建是"从 PG 流式读出
+        全部子块 + 逐条 jieba 分词 + bulk 进 ES", 分钟级且与语料量成正比 —— 文档
+        一多, 入库一篇就把全库重写一遍, 成本会直接爆炸。重建仅作为运维/修复手段。
+        """
+        if not chunks:
+            return 0
+        await self.index_chunks(chunks, refresh=True)
+        return len(chunks)
+
+    async def delete_chunk_ids(self, chunk_ids: Sequence[str]) -> int:
+        """按 chunk_id 批量删 ES 文档(发布阶段标陈旧的那批块的稀疏侧投影)。
+
+        走低层 ``bulk`` 而不是 helper: helper 会因个别文档不存在(404)而抛
+        BulkIndexError, 而"陈旧块已经不在索引里"是完全正常的结果。
+        """
+        ids = [i for i in dict.fromkeys(chunk_ids) if i]
+        if not ids:
+            return 0
+        await self.ensure_index()
+        actions = [{"delete": {"_index": self.index, "_id": i}} for i in ids]
+        try:
+            await self._bulk_client.bulk(operations=actions, refresh=True)
+        except Exception as exc:  # noqa: BLE001 - 派生索引: 删不掉下次重建会收敛
+            logger.warning("ES bulk delete failed (%d ids): %s", len(ids), exc)
+            return 0
+        return len(ids)
+
+    async def delete_by_doc(self, doc_id: str) -> int:
+        """删除一篇文档的全部 ES 文档(文档删除投影)。"""
+        await self.ensure_index()
+        try:
+            res = await self._bulk_client.delete_by_query(
+                index=self.index,
+                query={"term": {"doc_id": doc_id}},
+                refresh=True,
+                conflicts="proceed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ES delete_by_doc failed doc_id=%s: %s", doc_id, exc)
+            return 0
+        return int(res.get("deleted") or 0)
+
+    async def count(self) -> int:
+        """索引文档数: ES 不可用或索引不存在都返回 0, 它是启动时"要不要全量重建"的判据。"""
+        try:
+            if not await self._client.indices.exists(index=self.index):
+                return 0
+            res = await self._client.count(index=self.index)
+            return int(res["count"])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ES count failed: %s", exc)
+            return 0
+
+    async def ensure_corpus_or_rebuild(self, corpus_batches) -> None:
+        """只在索引为空时全量重建(已有内容则信任增量写)。
+
+        ``corpus_batches`` 是个 async iterator of batches(PG 流式语料); 只有它真需要
+        被读时才读(避免每次首建检索都白扫全表)。
+        """
+        if await self.count() > 0:
+            self._index_exists = True
+            return
+        await self.rebuild(corpus_batches)
 
     async def search(
         self, query: str, top_k: int, principal: Principal | None = None

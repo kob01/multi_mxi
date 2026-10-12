@@ -169,8 +169,10 @@ RAG:  Query → Embedding
 
 - **权限存储**:每条知识块记录(`doc_chunks` 子块表与 `doc_parents` 父块表)冗余携带
   `visibility / owner_id / dept_id / allowed_roles` 四个标量列,同库的
-  `documents` 表为事实来源(`app/security/acl.py`);入库(`ingest`)与权限变更
-  (`PUT /api/docs/{doc}/acl`)时两张表同步刷新(`update_acl_by_doc` 两条 UPDATE 同事务)。
+  `documents` 表为事实来源(`app/security/acl.py`);入库与权限变更
+  (`PUT /api/docs/{doc}/acl`)都在**同一个 PG 事务**里改完元数据行 + 两张块表 +
+  `outbox_events`(`app/docs/service.py::update_document_acl`)。分两个事务写就会留下
+  「元数据已改 private、块表还是 public」的越权窗口, 而不是单纯的数据不一致。
   **ACL 永远以 PG/ES 标量列做前置裁剪, MongoDB 只按** **`_id`** **取文本, 不承载权限语义**;
   正文与 `extra`(JSONB) 只放展示字段, 权限字段禁止入 JSONB。
 - **可见性策略**:`public`(全员) / `dept`(指定部门) / `role`(指定角色)
@@ -187,21 +189,79 @@ RAG:  Query → Embedding
   拦截组装/脏数据可能引入的越权块,剔除项写审计(`acl_final_check_dropped`);越权与"知识库没有"
   用同一拒答文案,不泄漏文档存在性。
 
+### 文档入库流水线(异步任务 + 事件投影)
+
+文档入库是整系统里最重的一条写路径(OCR/解析/LLM tags/切块/embedding/发布/建索引/建图),
+因此它**不在 HTTP 请求里跑**。单一事实源: `app/docs/pipeline.py`(阶段实现) +
+`app/workers/ingest_worker.py`(进程入口) + `doc_uploads`/`ingest_tasks`/`outbox_events` 三张表。
+
+```
+POST /api/docs/upload   202  流式落盘 + 算 sha256 → doc_uploads 行 + outbox(parse.requested)
+        │                     同事务提交, 立即返回 upload_id
+        ├─► ingest-worker ──► 解析/OCR → Mongo parse_artifacts(偏移表 + raw 一份)
+        │                     + LLM tags → uploads.status=parsed
+GET  /api/docs/uploads/{id}   前端轮询: 预览 / 建议标签 / 告警   ← 预览与入库用同一份产物
+POST /api/docs/ingest   202  同步校参(ACL 非法即 400) + 建 ingest_tasks 行
+        │                     + 新文档置 ingesting + outbox(ingest.requested) 同事务
+        ├─► ingest-worker ──► parsing → embedding → publishing → indexing → ready
+        │       publishing = 单事务: documents 转 ready + tags + 父子块 upsert
+        │                    + 不再引用的行标 deprecated_at + outbox
+        │       indexing   = ES 单文档增量写 + 删被标陈旧的块 + bump docgen + 建图
+GET  /api/docs/tasks/{id}     前端轮询: stage / attempt / error / chunk_count / warnings
+```
+
+关键口径(改这条链路前必读):
+
+- **PG 是事实源, Redis Streams 只是低延迟 handoff**。`outbox_events` 与业务写同事务提交,
+  因此不会「错投/漏投」; worker 的 `db_poll` 循环会直接按任务表认领, 所以 Redis 挂了
+  入库照跑(时延从秒退化为轮询间隔), 事件恢复后多触发一次认领也会因租约已被持有而跳过。
+- **认领与并发靠租约**:`UPDATE ... WHERE lease 空或过期 RETURNING` 一条语句完成「判定 +
+  抢占」, 拿不到就跳过; `ingest_tasks` 上有一条部分唯一索引
+  `ux_ingest_tasks_active_doc`, 同一文档的第二个进行中任务插不进来。
+- **幂等有三重**:`task_id = sha1(doc_key|upload_id|content_sha256)`(连点两次得同一行)、
+  同字节同 `parser_version` 复用已解析产物(不重复 OCR)、阶段全部可重放
+  (upsert 幂等 / content_hash 差分 embed / ES 按 id 写删)。
+- **失败闭环**:`stage + attempt + lease_expires_at + heartbeat_at + error` 让「worker 崩在
+  半途」变成可回收状态: 调度器 `reap_stalled_tasks` 清租约让任务从**当前阶段**续跑,
+  超过 `ingest_task_max_attempts` 才判 `failed`(只把从没成功过的文档置 `failed`,
+  在架文档重入库失败不动它的 `ready`——否则一篇在用的文档会因为重试而整篇检不到)。
+- **发布不物删旧块**:主链路只 `UPDATE deprecated_at`, 物理删除由 `gc_deprecated_rows`
+  按 `ingest_stale_grace_minutes` 宽限期分批做(多副本靠 `pg_try_advisory_lock` 单飞)。
+  旧写法在单事务里先删子块再删父块, 大文档会长时间持锁并给并发查询留空窗。检索侧
+  每条读路径都带 `deprecated_at IS NULL`, 所以新旧交接在同一瞬间完成, 既无空窗也无重复。
+- **ES 常态是单文档增量写**(`index_doc_chunks` / `delete_chunk_ids`);全量重建只作为
+  运维/修复手段(`python -m scripts.rebuild_bm25`, 网关启动也只在索引为空时灌一次)。
+- **Retrieval Cache 按文档粒度失效**:`bump_doc_gen([doc_key])` 只 O(文档数) 次 INCR;
+  缓存 payload 里存了本次命中文档的版本快照, 读时一次 MGET 比对, 不符即当未命中并自删。
+  入库热路径不再 `invalidate_all()`(那会把全站热查询一起打空)。
+- **worker 不做 DDL**:建表唯一归属在网关 lifespan 的 `init_schema()`;worker 只轮询
+  三张表就绪。两个进程同时跑 `create_all` + ALTER 会出现「一个在补列、一个在读该列」。
+- **原件与产物落共享卷**:上传目录按**相对 `upload_dir` 的路径**存库(绝对路径是容器内
+  `/data/uploads/...`, 宿主脚本读到就指向不存在的位置);`ingest-worker` 与网关挂同一个
+  `../data:/data`。到期由 `cleanup_expired_uploads` 按 `upload_retention_hours` 回收,
+  孤儿正文/产物由 `prune_stale_bodies` 按 PG 现行引用回收。
+
+已知取舍(本次有意不做, 需要时再评估):对象存储/病毒扫描/分片上传协议(当前单实例 +
+共享卷, 多副本部署时才需要真对象存储)、`status/index_status/kg_status` 三态拆分(现在
+由 `ingest_tasks.stage` 统一表达进度, 文档表只留发布态)、`embedding_spec_hash` 复合指纹
+(仍按 `content_hash` 差分; 换 embedding 模型时靠 `EMBEDDING_DIM`/全量重入库覆盖)、
+上传文件魔数校验。
+
 ### 数据洞察智能体的六层数据访问治理
 
 Analyst_Agent 能跨 HR/财务/采购查全员数据, 也能受治理地改数据。"只靠提示词让模型小心"
 不成立, 因此这里是一层往一层下堆叠的硬约束(单一事实源: `app/db/rls.py` /
 `app/db/ast_guard.py` / `app/db/dataops.py`)。
 
-| 层         | 干什么                                                                                                                                                                                                                                           | 代码落点                                                                                                         |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| 层         | 干什么                                                                                                                                                                                                                                                                    | 代码落点                                                                                                         |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | 0 凭证     | agent 容器不再持有任何数据库凭据(已验证: `hr-agent`/`analyst-agent`/`finance-agent`/`contract-agent`/`askdata-agent` 取口令直接报错); "姓名->工号"解析从进程内直连库搬到 `hr-mcp` 的 `lookup_employee_by_name`; analytics/askdata 取数与写执行 `SET ROLE` 到 NOLOGIN 角色 | `docker-compose.yml` 五个 agent 服务、`app/mcp_servers/hr_server.py`、`app/db/sync.py::_attach_role_events`      |
-| 1 隔离     | 8 张业务表带 `tenant_id`/`dept_id`; `ENABLE + FORCE ROW LEVEL SECURITY`(属主也受约束); GUC 缺失 = 一行也看不见(默认拒)                                                                                                                           | `app/db/rls.py`、`app/db/scope.py`(回填 + 作用域解析), 由 `init_schema()` 尾部幂等执行                           |
-| 2 写形状   | 模型不写 SQL, 只交强类型 JSON DSL(`action`/`entity`/`filters`/`sets`/`reason`); 实体与字段逐个查白名单, 作用域谓词由服务端注入, 值全走绑参                                                                                                       | `app/db/datadsl.py`、`app/db/policy.py`、`app/db/dataops.py::compile_plan`                                       |
-| 3 静态校验 | sqlglot AST 校验(语句数/类型/表引用/域谓词形状/恒真 WHERE/函数黑名单/十六进制与 `CHR()` 拼接/注释), 并**由 AST 重生 SQL** 送库; 外加 EXPLAIN 预估扫描行数阈值                                                                                    | `app/db/ast_guard.py`(仅 analytics 域; 其余三域仍是 `app/db/sql_guard.py` 的正则黑名单)                          |
-| 4 误操作   | 预演 COUNT 后分四档: 0 行需复核 / 1~50 发起人二次确认 / 51~500 人工审批(审批人≠发起人) / >500 直接拒; DELETE 一律改写成软删; 变更前镜像支持回滚; 单事务 + 语句超时 + 专用小池; 高危表(员工/预算/供应商/审计)永无写权                             | `app/db/dataops.py`、`app/db/policy.py::FORBIDDEN_ENTITIES`、`app/dataops/router.py` + `DataOpsView.vue`(审批台) |
-| 5 注入分治 | A 类参数绑定根治; B 类靠权限+AST+审批; C 类间接提示注入: 读回来的数据带 `untrusted_data`+声明(spotlighting), 敏感列出口 DLP 打码, **本轮读过业务数据就不允许发起写计划**(信息流控制), 写意图词表核对计划偏移                                     | `app/security/spotlight.py`、`app/security/masking.py`、`app/agents/analyst_agent/executor.py`                   |
-| 6 审计     | 每条 SQL/写计划落 `sql_audit_records`(原文/最终 SQL/决策/审批人/行数/镜像/成本), 与 JSONL 双写; 角色无 UPDATE/DELETE + RULE 拦改; 异常模式实时告警(频繁写计划/拒绝激增/跨域谓词尝试)                                                             | `app/db/dataops.py::record_audit`/`detect_anomalies`、`app/db/rls.py::ensure_audit_immutability`                 |
+| 1 隔离     | 8 张业务表带 `tenant_id`/`dept_id`; `ENABLE + FORCE ROW LEVEL SECURITY`(属主也受约束); GUC 缺失 = 一行也看不见(默认拒)                                                                                                                                                    | `app/db/rls.py`、`app/db/scope.py`(回填 + 作用域解析), 由 `init_schema()` 尾部幂等执行                           |
+| 2 写形状   | 模型不写 SQL, 只交强类型 JSON DSL(`action`/`entity`/`filters`/`sets`/`reason`); 实体与字段逐个查白名单, 作用域谓词由服务端注入, 值全走绑参                                                                                                                                | `app/db/datadsl.py`、`app/db/policy.py`、`app/db/dataops.py::compile_plan`                                       |
+| 3 静态校验 | sqlglot AST 校验(语句数/类型/表引用/域谓词形状/恒真 WHERE/函数黑名单/十六进制与 `CHR()` 拼接/注释), 并**由 AST 重生 SQL** 送库; 外加 EXPLAIN 预估扫描行数阈值                                                                                                             | `app/db/ast_guard.py`(仅 analytics 域; 其余三域仍是 `app/db/sql_guard.py` 的正则黑名单)                          |
+| 4 误操作   | 预演 COUNT 后分四档: 0 行需复核 / 1~50 发起人二次确认 / 51~500 人工审批(审批人≠发起人) / >500 直接拒; DELETE 一律改写成软删; 变更前镜像支持回滚; 单事务 + 语句超时 + 专用小池; 高危表(员工/预算/供应商/审计)永无写权                                                      | `app/db/dataops.py`、`app/db/policy.py::FORBIDDEN_ENTITIES`、`app/dataops/router.py` + `DataOpsView.vue`(审批台) |
+| 5 注入分治 | A 类参数绑定根治; B 类靠权限+AST+审批; C 类间接提示注入: 读回来的数据带 `untrusted_data`+声明(spotlighting), 敏感列出口 DLP 打码, **本轮读过业务数据就不允许发起写计划**(信息流控制), 写意图词表核对计划偏移                                                              | `app/security/spotlight.py`、`app/security/masking.py`、`app/agents/analyst_agent/executor.py`                   |
+| 6 审计     | 每条 SQL/写计划落 `sql_audit_records`(原文/最终 SQL/决策/审批人/行数/镜像/成本), 与 JSONL 双写; 角色无 UPDATE/DELETE + RULE 拦改; 异常模式实时告警(频繁写计划/拒绝激增/跨域谓词尝试)                                                                                      | `app/db/dataops.py::record_audit`/`detect_anomalies`、`app/db/rls.py::ensure_audit_immutability`                 |
 
 三个容易误读的点:
 
@@ -230,36 +290,92 @@ ROUTE(指标API -> DSL编译器 -> 沙箱SQL) -> VERIFY(结果校验) -> [REPAIR
 RENDER(规则选型 + 叙述) -> FEEDBACK(留痕 + 归因路由)
 ```
 
-| 阶段 | 硬约束 | 代码落点 |
-| ---- | ------ | -------- |
-| 语义层 | 指标/维度/别名是**库里的治理对象**(52 指标 + 33 维度 + 83 别名内置集), 口径表达式是受控列级片段; 与周报重叠的口径共用 `reports.py` 常量 | `app/db/models.py`(sem_*)、`app/semantic/{catalog,seed,registry}.py` |
-| 链接 | 同义词精确 + pgvector 相似 + 枚举值反查三路融合打分, **不够就澄清不猜**; 枚举按调用者作用域反查(不泄露别人部门名) | `app/semantic/link.py` |
-| DSL | 模型只交强类型 JSON: 无标识符自由(列名出自登记表)、无值拼接自由(全走绑参)、无作用域自由、**无算术自由** | `app/semantic/dsl.py` |
-| 校验 | 独立模块不信模型自检: 语法→语义(兼容性/时间/枚举)→权限(角色白名单) 三级, 带错误码回炉重写一次 | `app/semantic/validate.py` |
-| 编译 | DSL→SQL 全模板: 裸列自动限定表别名、作用域谓词注入、产物再过 `ast_guard`, 同环比走双窗口 CTE 由 SQL 算 | `app/semantic/compiler.py` |
-| 取数 | 只读角色 + 事务作用域 + EXPLAIN 扫描量上限 + 行数上限; 出口 DLP 打码与 spotlighting | `app/mcp_servers/askdata_server.py` 复用 `app/db/{rls,sync,scope}.py` |
-| 呈现 | 图型由结果 shape 规则定(时序→line/占比→pie/对比→bar), LLM 只写叙述 | `app/agents/askdata_agent/{graph,prompts}.py` |
-| 闭环 | 全链路进 `askdata_query_log`(含被澄清与被拒的轮次), 看板算一次通过率/澄清率/降级率/P95/点踩率; 五类归因只产出**未生效的草案** | `app/askdata/{store,attribution,router}.py` + `/api/askdata/*` |
+| 阶段   | 硬约束                                                                                                                                  | 代码落点                                                               |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| 语义层 | 指标/维度/枚举值/别名/兼容规则/行列策略是**库里的治理对象**(52 指标 + 33 维度 + 83 别名 + 67 枚举值 + 276 条兼容规则), 真值是仓里 `semantic-defs/*.yaml`(可 review/可回滚), 口径表达式是受控列级片段; 与周报重叠的口径共用 `reports.py` 常量 | `semantic-defs/`、`app/db/models.py`(sem\_*)、`app/semantic/{defs,catalog,seed,registry}.py` |
+| 链接   | 同义词精确 + pgvector 相似 + 枚举值(含黑话别名与热度)反查三路融合打分, 槽位置信度作为先验乘进分数, **不够就澄清不猜**                       | `app/semantic/link.py`                                                 |
+| DSL    | 模型只交强类型 JSON: 无标识符自由(列名出自登记表)、无值拼接自由(全走绑参)、无作用域自由、**无算术自由**; 生成时带 golden 相似问法的 dynamic few-shot | `app/semantic/dsl.py` + `similar_cases` 工具                          |
+| 校验   | 独立模块不信模型自检: 语法→语义(兼容性/时间/枚举)→权限与成本(角色白名单、列级策略、行数与扫描量) 三级, 带错误码回炉重写 ≤2 轮           | `app/semantic/validate.py`                                             |
+| 编译   | DSL→SQL 全模板: 裸列自动限定表别名、作用域谓词 + **行策略**注入、产物再过 `ast_guard`, 同环比走**单扫描条件聚合**(解不出口径形状时退回双窗口 CTE) | `app/semantic/compiler.py`                                             |
+| 取数   | 只读角色 + 事务作用域 + EXPLAIN 扫描量上限 + 行数上限; 出口 DLP 打码与 spotlighting; 结果缓存 key = normalize(DSL)+身份+semver; 引擎连续错误熔断后短路下一级 | `app/mcp_servers/askdata_server.py`、`app/semantic/{resultcache,breaker}.py` |
+| 呈现   | 图型由结果 shape 规则定(时序→line/同环比→分组柱/低基数→pie/二维→按第二维分系列), LLM 只写叙述                                           | `app/agents/askdata_agent/{graph,prompts}.py`                          |
+| 闭环   | 全链路进 `askdata_query_log`(含 semver/token_cost/缓存命中/被澄清与被拒的轮次), 看板算一次通过率/澄清率/**误澄清率**/降级率/FALLBACK 率/P95/点踩率; 五类归因以 `edit_dsl` 的字段 diff 为直证, 只产出**未生效的草案**; 答不出来时开**人工工单** | `app/askdata/{store,attribution,router}.py` + `/api/askdata/*`         |
+| 可观测 | OTel span(每工具一条 + 整轮一条, 属性 conf/召回分/route/重试/tokens/semver) + Prometheus `/metrics` + 四条告警线; 与 Langfuse/audit.jsonl 并存 | `app/observability/{otel,metrics,alerts}.py`                           |
 
-三个设计取舍值得记在这:
+四个设计取舍值得记在这:
 
 - **状态机而不是 ReAct**: 主干每步输入输出形状固定, 可单测可回放可归因; 自由 ReAct 只留在
   结果校验失败后的有界自修复(默认 ≤2 轮, 工具集只有只读四件)。
 - **澄清用选项不用开放反问**: 开放式反问会得到另一句同样含糊的话; 选项带语义层 id,
-  前端拼一条带精确引用的确认消息回去(`问数确认：…`, 前缀保证路由回 askdata)。
-- **多轮继承走结构化槽位而不是会话摘要**: `app/assistant/slot_store.py` 存上一轮确定的
-  槽位(Redis + 进程内降级), 继承是一条 dict 合并, 只继承时间/指标不继承维度与过滤 ——
-  后者会把上一轮的筛选悄悄带进这一次的数, 是最难发现的错。
+  前端拼一条带精确引用的确认消息回去(`问数确认：…`, 前缀保证路由回 askdata)。点选了
+  最高分候选的那一轮会被记成 `clarify_pick` 事件 —— 它是**误澄清率**的分子, 否则只算得出"问了几个"。
+- **多轮继承存"上一轮定稿"而不是会话摘要**: `app/assistant/slot_store.py` 存上一轮的槽位 +
+  DSL + 最高分口径(Redis + 进程内降级), 继承是 dict 合并 + 指代消解喂 DSL 摘要, 只继承时间/指标
+  不继承维度与过滤 —— 后者会把上一轮的筛选悄悄带进这一次的数, 是最难发现的错。
+- **结果缓存的 key 必须带身份**: 方案给的三段式(`normalize(dsl)+role+semver`)在本仓不够 —— 同为
+  manager 的两个人可见行集不同, 按它做键就是一次跨部门泄露且看板上看不出来, 所以工号与作用域也在 key 里。
+
+语义层真值与版本(YAML → PG 单向):
+
+```bash
+python -m scripts.export_semantic_defs --from-seed     # 第一次把内置集落成 YAML(可 --from-db 回写人工修订)
+python -m scripts.sync_semantic_defs --check           # CI: 真值与库不一致就退码 1, 不写库
+python -m scripts.sync_semantic_defs --actor <谁>       # 同步: 内容有变才 version+1 并写 sem_change_log
+python -m scripts.seed_semantic_layer                   # 别名/指标向量回填
+```
+
+Trace 与留痕里都带 `semver`(定义集内容指纹), 所以"一个月前的 badcase 当时用的是哪版口径"
+可以反查(`sem_change_log`)并回放。临时直接在库里改口径是可以的, 但**必须回写 YAML**,
+否则下一次同步会按 YAML 覆盖它 —— 口径的最终形态只允许有一个来源。
+
+语义缓存与两层缓存的区别(别弄混它们的责任):
+
+| 层 | 键 | 复用什么 | 不能省下什么 |
+| --- | --- | --- | --- |
+| 语义缓存(V3) | 问法向量相似度 ≥0.95 **且 semver 同版 且已人工批准(`cacheable`)** | 查询意图(DSL) | 校验、编译、RLS、审计、结果缓存 |
+| 结果缓存 | normalize(DSL)+route+工号+角色+作用域+semver | 结果行 | 口径与权限判定(它们都在键里) |
+
+两者都不省校验: 语义缓存命中时状态机仍然跑 link/validate/route/verify, 所以指标被停用、
+口径改了版、权限不够这些情况仍旧会被拦下而不是"静默复用了一个旧答案"。
+
+**为什么合成 golden 默认不可复用**(`askdata_golden.cacheable` 默认 false): 一是批量生成的
+问法没经过人逐条核对, 不该直接服务真实用户; 二是 agent 模式的评测题就来自 golden,
+全部可缓存等于让模型拄标准答案 —— 本轮实踩过一次: 留痕里 165/277 轮带"相似度 1.000 复用"
+注记, 于是 EX 从 87.5% 直接刷到 100%, 而 NL→DSL 能力一点没变。要打开只能逐条批准:
+`POST /api/askdata/golden/{case_id}/cacheable?cacheable=true`(只给治理角色)。
+
+样本回流与语义层修订(都是"机器提议 + 人批准"):
+
+```bash
+python -m scripts.embed_askdata_golden            # golden 问法向量回填(语义缓存基底)
+python -m scripts.askdata_semantic_advisor --days 30            # badcase 簇 -> YAML 修订建议(只出文件)
+python -m scripts.askdata_semantic_advisor --days 30 --apply    # 只追加 add_term/add_dim_value, 且 status=draft
+GET  /api/askdata/samples                                       # 看 SFT/DPO 队列与两道门禁统计
+POST /api/askdata/samples/{id}?status=approved                   # 人工批准
+python -m scripts.export_askdata_samples --dry-run              # 只导 approved 且过双门禁的
+```
+
+为什么样本要过两道门: 错的样本比不训更危险。`chosen` 必须**真能过校验器并编成 SQL**,
+并且这一轮得用户点过赞或亲自改写过 —— 否则它就是模型自己给自己的考卷打分。
 
 自检与评测:
 
 - 离线纯函数(不碰库不碰 LLM): `python -m scripts.test_askdata_offline`
-  (DSL/三级校验错误码/编译产物形状/口径一致性/澄清门/载荷剥离/注册一致性);
-- 语义层灌入与向量回填: `python -m scripts.seed_semantic_layer`(启动后跑一次, 新增指标后重跑);
-- golden 评测集: `python -m scripts.seed_askdata_golden`(公开基准噪声大, 只认自建集);
+  (DSL/三级校验错误码/编译产物形状/口径一致性/澄清门/载荷剥离/真值往返/semver 稳定性/
+  行列策略下推/熔断与缓存 key/图表形状/DSL-EM 与 slot-F1 判据/告警线/注册一致性);
+- 在线全链路(打容器网关): `python -m scripts.test_askdata`;
+- golden 评测集: `python -m scripts.seed_askdata_golden --refresh`(按 intent × 难度分层展开,
+  公开基准噪声大, 只认自建集);跑完接着跑 `embed_askdata_golden` 回填问法向量;
 - 回归: `python -m scripts.askdata_eval`(DSL 编译回归, 无 LLM) 与
-  `python -m scripts.askdata_eval --mode agent`(端到端), 报告进 `reports/askdata_eval_*`,
-  结论进 `askdata_eval_run` 供看板取 EX。
+  `python -m scripts.askdata_eval --mode agent`(端到端), 加 `--gate` 就是 CI 门禁
+  (EX 比上一条同模式 run 掉超 `ASKDATA_EVAL_GATE_MAX_DROP` 个点则退码 3);
+  报告进 `reports/askdata_eval_*`, 结论(EX/DSL-EM/slot-F1/误澄清率/门禁)进 `askdata_eval_run`。
+
+可观测栈是**可选**的(默认不启): `docker compose --profile observe up -d otel-lgtm` 起
+OTel Collector + Prometheus + Loki + Grafana 四合一(宿主 18300/18686), 再把 `docker/.env` 的
+`ASKDATA_OTEL_ENABLED=true` 与 `OTEL_ENDPOINT=http://otel-lgtm:4318/v1/traces` 置上;
+指标端点 `GET /metrics` 始终由网关提供(`METRICS_ENABLED`, 配 `docker/secrets/metrics_token.txt`
+后可加口令)。
 
 ### 三层缓存与降级口径
 
@@ -269,7 +385,7 @@ RENDER(规则选型 + 叙述) -> FEEDBACK(留痕 + 归因路由)
 | 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                       |
 | ------------------------------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)          |
-| Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名;文档重入库时 `refresh_knowledge()` 调 `invalidate_all()`(SCAN 而非 KEYS)     |
+| Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名; 失效按**文档粒度**做: payload 存命中文档的 docgen 版本快照, 读时一次 MGET 比对, 不符即未命中并自删(`bump_doc_gen`); `invalidate_all()`(SCAN 而非 KEYS)只留运维路径 |
 | Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入 |
 
 两个刻意保留的"不优化":流式闲聊不读 Prompt Cache(命中的重放没有思考过程, 收益小于
@@ -362,9 +478,15 @@ mxi/
 │   ├── bodies/                   # ★ 正文外置存储(MongoDB)
 │   │   ├── client.py             #   连接与集合索引(doc_bodies/doc_body_parts/parent_texts)
 │   │   └── store.py              #   正文门面: 整篇 raw/normalized/structure + 父块全文
-│   ├── docs/                     # ★ 文档解析与元数据
+│   ├── docs/                     # ★ 文档解析与入库流水线
 │   │   ├── normalize.py          #   normalize_text/offset_slice/content_hash(offset 基准)
-│   │   └── service.py            #   上传/入库(发布态门禁)/ACL/删除/列表
+│   │   ├── parsers.py            #   各模态解析(txt/md/pdf/docx/pptx/xlsx/字幕/图片 OCR)
+│   │   ├── artifacts.py          #   解析产物门面(一次解析, 预览与入库共用同一份)
+│   │   ├── pipeline.py           #   入库四阶段实现 + outbox + 回收/GC/过期清理
+│   │   ├── service.py            #   提交(202)/状态查询/ACL/删除(同事务+事件)/列表
+│   │   └── router.py             #   /api/docs 路由(upload/ingest 异步 + uploads/tasks 轮询)
+│   ├── workers/                  # ★ 后台 worker 进程(与网关同镜像, 不同 command)
+│   │   └── ingest_worker.py      #   Streams 消费 + PG 认领自愈 + outbox relay + 调度器
 │   ├── mcp_servers/              # ★ MCP 工具层(业务系统封装)
 │   │   ├── hr_server.py          #   HR 工单系统(:8001/mcp)
 │   │   ├── finance_server.py     #   财务报销系统(:8002/mcp)
@@ -372,7 +494,7 @@ mxi/
 │   │   ├── procurement_server.py #   采购与合同初审(:8006/mcp)
 │   │   └── askdata_server.py     #   智能问数(:8007/mcp, 语义层/指标API/DSL编译/沙箱取数)
 │   ├── analytics/                # ★ 数据洞察支撑(不引 matplotlib/cairosvg)
-│   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie) + Pillow PNG(供 office 嵌图)
+│   │   ├── charts.py             #   纯 Python SVG 图表(bar/line/pie/heatmap) + Pillow PNG(供 office 嵌图)
 │   │   ├── reports.py            #   固定口径指标 SQL + Markdown 报告组装
 │   │   └── store.py              #   产物落 data/reports + 台账 + 相对 URL 寻址
 │   ├── docgen/                   # ★ 文档生成(文字+图片 -> 可下载 office/PDF/MD 文件)
@@ -514,16 +636,16 @@ docker compose -f docker/docker-compose.yml exec assistant python -m scripts.see
 
 > **宿主发布端口对照(当前实测)**:
 >
-> | 服务                                                                                       | 宿主端口                                                               | 容器内监听      | 说明                                          |
-> | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- | --------------- | --------------------------------------------- |
-> | assistant                                                                                  | `18000`                                                                | `8000`          | Web 聊天 / API / 文档管理                     |
-> | hr-mcp / finance-mcp                                                                       | `18001` / `18002`                                                      | `8001` / `8002` | MCP 服务                                      |
-> | analytics-mcp / procurement-mcp                                                            | `18005` / `18006`                                                      | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
-> | askdata-mcp                                                                                | `18007`                                                                | `8007`          | 智能问数 MCP(语义层/编译/取数)              |
-> | neo4j HTTP                                                                                 | `17474`                                                                | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
-> | neo4j Bolt                                                                                 | `17687`                                                                | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
-> | tei-rerank                                                                                 | `8080`                                                                 | `8080`          | 重排服务 `/rerank`与`/health`                 |
-> | redis                                                                                      | `16379`                                                                | `6379`          | redis-stack-server, 记忆层/缓存层共用         |
+> | 服务                                                                                                       | 宿主端口                                                                        | 容器内监听      | 说明                                          |
+> | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------- | --------------------------------------------- |
+> | assistant                                                                                                  | `18000`                                                                         | `8000`          | Web 聊天 / API / 文档管理                     |
+> | hr-mcp / finance-mcp                                                                                       | `18001` / `18002`                                                               | `8001` / `8002` | MCP 服务                                      |
+> | analytics-mcp / procurement-mcp                                                                            | `18005` / `18006`                                                               | `8005` / `8006` | 数据洞察 / 采购合同 MCP                       |
+> | askdata-mcp                                                                                                | `18007`                                                                         | `8007`          | 智能问数 MCP(语义层/编译/取数)                |
+> | neo4j HTTP                                                                                                 | `17474`                                                                         | `7474`          | Neo4j Browser 网页控制台(人工看图谱时才需要)  |
+> | neo4j Bolt                                                                                                 | `17687`                                                                         | `7687`          | 驱动 RPC, 图记忆/文档知识图谱走这个(功能必需) |
+> | tei-rerank                                                                                                 | `8080`                                                                          | `8080`          | 重排服务 `/rerank`与`/health`                 |
+> | redis                                                                                                      | `16379`                                                                         | `6379`          | redis-stack-server, 记忆层/缓存层共用         |
 > | postgres / ES / Mongo / mineru / hr-agent / finance-agent / analyst-agent / contract-agent / askdata-agent | `5432` / `9200` / `27017` / `8888` / `9001` / `9002` / `9005` / `9006` / `9007` | 同左            | 未抬, 保持原值                                |
 >
 > 抬端口只动**宿主发布端口**, 容器内监听端口与 compose 网络内的服务名地址(`bolt://neo4j:7687` 等)
@@ -583,10 +705,11 @@ uv run python -m scripts.dev_services down         # 只停 docker 服务(只停
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d --build \
-  assistant postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp askdata-mcp hr-agent finance-agent analyst-agent contract-agent askdata-agent
+  assistant ingest-worker postgres elasticsearch redis neo4j mongo tei-rerank mineru hr-mcp finance-mcp analytics-mcp procurement-mcp askdata-mcp hr-agent finance-agent analyst-agent contract-agent askdata-agent
 uv run python -m scripts.dev_services check --gateway    # 对接结果 + 容器网关健康
 cd web-ui && pnpm install && pnpm dev                    # 前端 dev, /api 代理到 assistant 容器发布端口(18000)
 docker logs -f assistant                                 # 网关日志(不再落宿主文件)
+docker logs -f ingest-worker                             # 入库 worker 日志(阶段推进/回收/GC)
 ```
 
 要点:

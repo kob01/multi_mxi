@@ -769,6 +769,99 @@ services:
       - "host.docker.internal:host-gateway"
     networks: [mxi]
 
+  # ingest-worker: 入库流水线后台 worker(解析/OCR/embedding/发布/ES 投影 + 回收调度)。
+  # 与网关同镜像、不同 command: 把分钟级重活从 HTTP 同步链路里拆出来, 并且不再与
+  # 对话抢同一个进程/事件循环。编排口径: PG 任务表是事实源(认领/恢复都看它),
+  # Redis Streams 只做低延迟 handoff —— Redis 挂了入库照跑, 只是时延退化为轮询间隔。
+  # 不做 DDL: 建表唯一归属在网关 lifespan 的 init_schema(), 本容器只轮询等表就绪。
+  ingest-worker:
+    build: *build
+    command: python -m app.workers.ingest_worker
+    env_file: [.env]
+    # 本块红线键一律字面量(禁止插值, 见文件头约定与 env-check 专项)。
+    environment:
+      PG_HOST: postgres
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-mxi}
+      PG_DATABASE: ${PG_DATABASE:-mxi}
+      PG_SSLMODE: disable
+      # 连接预算: worker 是新增进程, 不吃满网关那一档池。PG max_connections=200 这笔
+      # 账里每加一个进程都要减一侧(口径见 app/config.py::pg_pool_size 注释)。
+      PG_POOL_SIZE: "5"
+      PG_MAX_OVERFLOW: "5"
+      ES_URL: http://elasticsearch:9200
+      ES_INDEX: ${ES_INDEX:-kb_chunks}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DATABASE: ${MONGO_DATABASE:-mxi}
+      MONGO_ENABLED: ${MONGO_ENABLED:-true}
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      EMBEDDING_MODEL: bge-m3
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      DEEPSEEK_BASE_URL: https://api.deepseek.com
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      # 合规红线: trace 会把入库内容上传到 LangSmith, 容器侧永远置 false。
+      LANGSMITH_TRACING: "false"
+      # 原件与解析产物都必须落在共享卷: 网关写入、worker 读取, 两个容器同一个 ../data。
+      # 相对路径存库, 绝对路径只在本卷布局一致时才能跨环境解释(见 docs/service.py)。
+      UPLOAD_DIR: /data/uploads
+      KNOWLEDGE_DIR: /data/knowledge
+      AUDIT_LOG_PATH: /data/logs/audit.jsonl
+      MINERU_BASE_URL: ${MINERU_BASE_URL:-http://mineru:8888}
+      MINERU_BACKEND: ${MINERU_BACKEND:-pipeline}
+      MINERU_TIMEOUT: ${MINERU_TIMEOUT:-300}
+      NORMALIZER_VERSION: ${NORMALIZER_VERSION:-n1}
+      PARSER_VERSION: ${PARSER_VERSION:-p1}
+      DOC_KG_ENABLED: ${DOC_KG_ENABLED:-true}
+      KG_MAX_RELATIONS_PER_DOC: ${KG_MAX_RELATIONS_PER_DOC:-40}
+      KG_RELATION_VOCAB_ENABLED: ${KG_RELATION_VOCAB_ENABLED:-true}
+      # 入库异步总闸: false = 网关在请求内跑完四阶段(只用于排障/未部 worker 的环内启动)。
+      INGEST_ASYNC_ENABLED: ${INGEST_ASYNC_ENABLED:-true}
+      INGEST_WORKER_CONCURRENCY: ${INGEST_WORKER_CONCURRENCY:-2}
+    secrets:
+      - pg_password
+      - deepseek_api_key
+      - zhipu_api_key
+    volumes:
+      - ../data:/data
+      - ../logs:/data/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      elasticsearch:
+        condition: service_started
+      mongo:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [mxi]
+
+  # 可选可观测栈(profile=observe): OTel Collector + Prometheus + Loki + Grafana 四合一。
+  # 为什么不进默认栈: 拉不到 grafana/otel-lgtm 不应该影响主链路起停(与 langfuse 栈同一姿态)。
+  # 开它三步:
+  #   1) docker compose --profile observe up -d otel-lgtm
+  #   2) docker/.env 置 ASKDATA_OTEL_ENABLED=true 与 OTEL_ENDPOINT=http://otel-lgtm:4318/v1/traces
+  #      (容器内地址必须用服务名, 不能写 localhost)
+  #   3) 重建/重启 assistant 与 askdata-agent 容器
+  # 问数侧只手工埋状态机 8 个阶段 + 每工具一条 span(属性: conf/召回分/route/重试/tokens/semver),
+  # 没开就是空操作; Langfuse/audit.jsonl 与本栈**并存**不互替(trace 看单次, 指标看趋势, 审计看合规)。
+  otel-lgtm:
+    image: ${OTEL_LGTM_IMAGE:-docker.m.daocloud.io/grafana/otel-lgtm:latest}
+    container_name: mxi-otel-lgtm
+    profiles: [observe]
+    ports:
+      - "${LGTM_GRAFANA_HOST_PORT:-18300}:3000"   # Grafana 面板(Explore 里选 Loki/Prometheus)
+      - "${LGTM_OTLP_HOST_PORT:-18686}:4318"       # OTLP HTTP(从本机外上报给 collector)
+    volumes:
+      # 把上面的抓取配置接给镜像自带的 Prometheus(镜像内路径由上游约定)
+      - ./otel/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - lgtm_data:/data
+    restart: unless-stopped
+    networks: [mxi]
+
 volumes:
   mineru_models:
   es_data:
@@ -782,6 +875,8 @@ volumes:
   langfuse_clickhouse_logs:
   langfuse_redis_data:
   langfuse_minio_data:
+  # 可观测栈专用(profile=observe): trace/metric/log 都存在这里, 删栈不伤业务数据。
+  lgtm_data:
 
 networks:
   mxi:

@@ -5,7 +5,8 @@
 .DESCRIPTION
     拓扑约定(2026-09 起, 详见 .qoder/rules/container-first-verification.md 与
     CONFIG_RULES.md 第 9 条):
-      - **容器是唯一的验证环境**: assistant 网关与全部依赖(postgres / elasticsearch /
+      - **容器是唯一的验证环境**: assistant 网关、ingest-worker(入库后台进程)与全部依赖
+        (postgres / elasticsearch /
         redis / neo4j / mongo / tei-rerank / mineru / hr-mcp / finance-mcp /
         analytics-mcp / procurement-mcp / askdata-mcp / hr-agent / finance-agent /
         analyst-agent / contract-agent / askdata-agent)都跑在 docker compose 里。

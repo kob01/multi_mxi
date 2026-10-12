@@ -71,6 +71,8 @@ class AskDataAgent:
         trace_id: str = "",
         session_id: str = "",
         prior_slots: dict[str, Any] | None = None,
+        prior_dsl: dict[str, Any] | None = None,
+        prior_top_metric: str = "",
     ) -> tuple[str, dict[str, Any]]:
         """跑一轮问数, 返回 ``(给人看的正文, 结构化载荷)``。"""
         settings = get_settings()
@@ -79,6 +81,9 @@ class AskDataAgent:
         state: AskDataState = {
             "question": user_text,
             "prior_slots": prior_slots or {},
+            # 上一轮的 DSL 与最高分口径: 前者给指代消解用, 后者只用来判误澄清。
+            "prior_dsl": prior_dsl or {},
+            "prior_top_metric": prior_top_metric or "",
             "user_id": user_id or "",
             "role": role.value,
             "trace_id": trace_id or "",
@@ -87,6 +92,8 @@ class AskDataAgent:
             "notes": [],
             "attempts": [],
             "rewrite_count": 0,
+            "token_cost": 0,
+            "llm_calls": 0,
         }
         result = await self._pipeline.run(state)
         payload = result.get("payload") or {}
@@ -115,6 +122,8 @@ class AskDataAgentExecutor(AgentExecutor):
         except ValueError:
             role = Role.EMPLOYEE
         prior_slots = metadata.get("slots") if isinstance(metadata.get("slots"), dict) else {}
+        prior_dsl = metadata.get("prior_dsl") if isinstance(metadata.get("prior_dsl"), dict) else {}
+        prior_top = str(metadata.get("prior_top_metric") or "")
         session_id = str(metadata.get("session_id") or "")
         # 问题以网关单独下发的 metadata["question"] 为准(不带"对话背景/当前时间"前缀);
         # 缺失时退回消息原文, 行为与没这个字段时一致。
@@ -135,6 +144,7 @@ class AskDataAgentExecutor(AgentExecutor):
             answer, payload = await self._agent.invoke(
                 question, user_id=user_id, role=role, trace_id=trace_id,
                 session_id=session_id, prior_slots=prior_slots,
+                prior_dsl=prior_dsl, prior_top_metric=prior_top,
             )
         except Exception as exc:  # noqa: BLE001 - 状态机抛出来的一切只能兑成一句可读降级
             logger.exception("[askdata] 问数状态机异常")

@@ -41,31 +41,200 @@ EVAL_ROLE = "admin"
 
 
 def golden_cases(catalog: MetricCatalog) -> list[dict[str, Any]]:
-    """评测用例集: 每个已登记指标一条单值问法 + 一批多维/同环比/澄清型问法。
+    """评测用例集: 每个已登记指标沿 intent × 难度 分层展开多条问法。
 
-    用例数量随语义层增长(52 个指标 → 至少 52 条), 目标 500 条靠后续把真实业务问法
-    (点踩/改写草案)补进来, 而不是凭空编更多同义句 —— 后者只会把分数刷高。
+    为什么是"按形状笛卡尔展开"而不是"多编几个同义句": 同义句只能刷文本多样性,
+    分数会虚高; 而"单值/下钻/环比/同比/topN/趋势/过滤/多指标"这些**结构差异**才是
+    准确率真正会掉的地方, 并且它们的 DSL 形状能由同一个源(语义层登记表)推出来 ——
+    不需要人拍脑袋标, 也不会标出"库里根本算不出来"的假标准答案(跑不通就跳过)。
+
+    每条都带 ``slots``(期望槽位说法)与 ``intent``/``difficulty``: slot-F1 需要前者,
+    报告的分层视图需要后者。
     """
     cases: list[dict[str, Any]] = []
     for metric in catalog.active_metrics:
-        dims = list(metric.compatible_dims or [])
-        cases.append({
-            "question": f"{_today_word()}的{metric.label}是多少",
-            "dsl": {"metrics": [{"id": metric.metric_id}], "time": {"range": "this_year"}},
-            "tags": "单指标",
-        })
-        if dims:
-            dim_label = _dim_label(catalog, dims[0]) or "相关维度"
-            cases.append({
-                # 问法用维度自己的名字(不写死"各部门"): 合同类指标首个可下钻维度是
-                # "合同类别", 问成"各部门"就是一条自相矛盾的用例。
-                "question": f"按{dim_label}看今年的{metric.label}",
-                "dsl": {"metrics": [{"id": metric.metric_id}], "dims": [dims[0]],
-                        "time": {"range": "this_year"}},
-                "tags": "下钻",
-            })
-    cases.extend(_EXTRA_CASES)
+        cases.extend(_metric_cases(catalog, metric))
+    cases.extend(_pair_cases(catalog))
+    cases.extend(_with_labels(_EXTRA_CASES))
     return cases
+
+
+# 手工补录的几条反向/边角用例: intent 与难度从 tags 推(避免两处手写不一致)。
+_TAG_TO_INTENT = (("环比", "compare"), ("同比", "compare"), ("topN", "topn"),
+                 ("趋势", "trend"), ("多指标", "composition"))
+
+
+def _with_labels(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for case in cases:
+        tags = str(case.get("tags") or "")
+        intent = case.get("intent") or next(
+            (value for keyword, value in _TAG_TO_INTENT if keyword in tags), "fetch"
+        )
+        difficulty = case.get("difficulty") or ("hard" if "应被拒" in tags
+                                               or "多指标" in tags or "粒度" in tags else "medium")
+        out.append({**case, "intent": intent, "difficulty": difficulty})
+    return out
+
+
+def _metric_cases(catalog: MetricCatalog, metric: Any) -> list[dict[str, Any]]:
+    """一个指标能展开的所有问法(不适用的形状直接不出现在结果里, 不写成失败用例)。"""
+    mid = metric.metric_id
+    label = metric.label
+    dims = [d for d in (metric.compatible_dims or []) if catalog.get_dim(d)]
+    out: list[dict[str, Any]] = []
+
+    def _slot(metric_label: str, *, time_word: str = "", dim_labels: list[str] | None = None,
+              filter_words: list[str] | None = None, compare: str = "") -> dict[str, Any]:
+        """期望槽位: 只写"会出现在问法原文里"的说法(状态机会剔除不在原话里的词)。"""
+        slots: dict[str, Any] = {"metric_terms": [metric_label]}
+        if dim_labels:
+            slots["dim_terms"] = list(dim_labels)
+        if filter_words:
+            slots["filter_terms"] = [{"phrase": w} for w in filter_words]
+        if time_word:
+            slots["time"] = {"phrase": time_word}
+        if compare:
+            slots["compare"] = {"type": compare}
+        return slots
+
+    # --- easy: 单值 + 时间词形(今年/本月)两种 ---
+    for word, token in (("今年", "this_year"), ("本月", "this_month")):
+        out.append({
+            "question": f"{word}的{label}是多少",
+            "dsl": {"metrics": [{"id": mid}], "time": {"range": token}},
+            "slots": _slot(label, time_word=word),
+            "tags": "单指标", "intent": "fetch", "difficulty": "easy",
+        })
+    if not metric.has_time:
+        # 快照型指标(年度预算/在职人数)额外给一条不带时间的: 它本来就不该被追问时间。
+        out.append({
+            "question": f"{label}是多少",
+            "dsl": {"metrics": [{"id": mid}]},
+            "slots": _slot(label),
+            "tags": "单指标,快照", "intent": "fetch", "difficulty": "easy",
+        })
+    # --- medium: 下钻(前两个可下钻维度各一条) ---
+    for dim_id in dims[:2]:
+        dim_label = _dim_label(catalog, dim_id)
+        out.append({
+            "question": f"按{dim_label}看本年的{label}",
+            "dsl": {"metrics": [{"id": mid}], "dims": [dim_id], "time": {"range": "this_year"}},
+            "slots": _slot(label, time_word="本年", dim_labels=[dim_label]),
+            "tags": "下钻", "intent": "fetch", "difficulty": "medium",
+        })
+    if metric.has_time:
+        out.append({
+            "question": f"本年{label}同比去年怎么样",
+            "dsl": {"metrics": [{"id": mid}], "time": {"range": "this_year"},
+                   "compare": {"type": "yoy"}},
+            "slots": _slot(label, time_word="本年", compare="yoy"),
+            "tags": "同比", "intent": "compare", "difficulty": "medium",
+        })
+        out.append({
+            "question": f"本月{label}环比上月变化",
+            "dsl": {"metrics": [{"id": mid}], "time": {"range": "this_month"},
+                   "compare": {"type": "mom"}},
+            "slots": _slot(label, time_word="本月", compare="mom"),
+            "tags": "环比", "intent": "compare", "difficulty": "medium",
+        })
+        out.append({
+            "question": f"本年逐月看{label}趋势",
+            "dsl": {"metrics": [{"id": mid}], "time": {"range": "this_year", "granularity": "month"}},
+            "slots": _slot(label, time_word="本年"),
+            "tags": "趋势,粒度", "intent": "trend", "difficulty": "medium",
+        })
+    # --- hard: topN / 枚举过滤 ---
+    if dims and metric.has_time:
+        dim_id = dims[0]
+        dim_label = _dim_label(catalog, dim_id)
+        out_name = metric.output_alias
+        out.append({
+            "question": f"本年{label}最高的 5 个{dim_label}",
+            "dsl": {"metrics": [{"id": mid}], "dims": [dim_id], "time": {"range": "this_year"},
+                   "order_by": f"{out_name} desc", "limit": 5},
+            "slots": _slot(label, time_word="本年", dim_labels=[dim_label]),
+            "tags": "topN,排序", "intent": "topn", "difficulty": "hard",
+        })
+    enum_dim_id, enum_value = _first_enum_dim(catalog, dims)
+    if enum_value:
+        out.append({
+            # 枚举值当**过滤条件**而不是下钻维度: 问法"本年研发部的X"要的是标量, 编成
+            # dims 就得出一张表 —— 这正好是 DSL 生成最容易错的一类形状。
+            "question": f"本年{enum_value}的{label}是多少",
+            "dsl": {"metrics": [{"id": mid}],
+                   "filters": [{"dim": enum_dim_id, "op": "eq", "value": enum_value}],
+                   "time": {"range": "this_year"}},
+            "slots": _slot(label, time_word="本年", filter_words=[enum_value]),
+            "tags": "枚举反查,过滤", "intent": "fetch", "difficulty": "hard",
+        })
+    if metric.has_time:
+        # 两个结构差异叠在一起才是真难题(单一形状几乎不会错):
+        # 环比 + 下钻(对比期要按同一个维度对齐), 与 过滤 + 下钻(枚举值与分组共存)。
+        if dims:
+            dim_id = dims[0]
+            dim_label = _dim_label(catalog, dim_id)
+            out.append({
+                "question": f"按{dim_label}看本月{label}环比变化",
+                "dsl": {"metrics": [{"id": mid}], "dims": [dim_id],
+                       "time": {"range": "this_month"}, "compare": {"type": "mom"}},
+                "slots": _slot(label, time_word="本月", dim_labels=[dim_label], compare="mom"),
+                "tags": "环比,下钻", "intent": "compare", "difficulty": "hard",
+            })
+            if len(dims) > 1:
+                second = dims[1]
+                out.append({
+                    "question": f"本年逐月按{_dim_label(catalog, second)}看{label}趋势",
+                    "dsl": {"metrics": [{"id": mid}], "dims": [second],
+                           "time": {"range": "this_year", "granularity": "month"}},
+                    "slots": _slot(label, time_word="本年", dim_labels=[_dim_label(catalog, second)]),
+                    "tags": "趋势,粒度,下钻", "intent": "trend", "difficulty": "hard",
+                })
+        if enum_value:
+            out.append({
+                "question": f"按{_dim_label(catalog, dims[0])}看本年{enum_value}的{label}",
+                "dsl": {"metrics": [{"id": mid}], "dims": [dims[0]],
+                       "filters": [{"dim": enum_dim_id, "op": "eq", "value": enum_value}],
+                       "time": {"range": "this_year"}},
+                "slots": _slot(label, time_word="本年", dim_labels=[_dim_label(catalog, dims[0])],
+                               filter_words=[enum_value]),
+                "tags": "过滤,下钻", "intent": "fetch", "difficulty": "hard",
+            })
+    return out
+
+
+def _first_enum_dim(catalog: MetricCatalog, dims: list[str]) -> tuple[str, str]:
+    """第一个有静态枚举取值的可下钻维度与其首个取值(没有就返空, 不造假过滤)。"""
+    for dim_id in dims:
+        dim = catalog.get_dim(dim_id)
+        values = list(dim.enum_values or []) if dim else []
+        if values:
+            return dim_id, str(values[0])
+    return "", ""
+
+
+def _pair_cases(catalog: MetricCatalog) -> list[dict[str, Any]]:
+    """同一事实表上两个无各自行集限定的指标(占比/多指标同屏形状)。"""
+    out: list[dict[str, Any]] = []
+    by_table: dict[str, list[Any]] = {}
+    for metric in catalog.active_metrics:
+        if metric.caliber_where or not metric.compatible_dims:
+            continue  # 带自己行集口径的两个指标会被 E_CALIBER_CONFLICT 拦下(那是反向用例)
+        by_table.setdefault(metric.source_table, []).append(metric)
+    for metrics in by_table.values():
+        for first, second in zip(metrics, metrics[1:]):
+            out.append({
+                "question": f"本年{first.label}和{second.label}按{ _dim_label(catalog, first.compatible_dims[0])}看",
+                "dsl": {"metrics": [{"id": first.metric_id}, {"id": second.metric_id}],
+                       "dims": [first.compatible_dims[0]], "time": {"range": "this_year"}},
+                "slots": {"metric_terms": [first.label, second.label], "time": {"phrase": "本年"},
+                          "dim_terms": [_dim_label(catalog, first.compatible_dims[0])]},
+                "tags": "多指标", "intent": "composition", "difficulty": "hard",
+            })
+            if len(out) >= 60:
+                return out
+            break  # 每张表只取一对: 同形状的十条不会多告诉我们什么
+    return out
 
 
 # 多维/同环比/过滤/粒度/澄清型问法: 这些才是准确率真正会掉的地方
@@ -116,15 +285,11 @@ _EXTRA_CASES: list[dict[str, Any]] = [
 
 def _dim_label(catalog: MetricCatalog, dim_id: str) -> str:
     dim = catalog.get_dim(dim_id)
-    return dim.label if dim else ""
+    return dim.label if dim else dim_id
 
 
 def _case_id(question: str) -> str:
     return hashlib.sha256(question.encode("utf-8")).hexdigest()[:24]
-
-
-def _today_word() -> str:
-    return "今年"
 
 
 def _scope() -> DataScope:
@@ -239,6 +404,10 @@ def build_rows(*, refresh: bool, dry_run: bool) -> int:
         out = store.upsert_golden(
             question=question, dsl=dsl, expected_sql=compiled.sql,
             expected_result=expected, tags=case.get("tags", ""),
+            slots=case.get("slots") or {}, difficulty=case.get("difficulty") or "easy",
+            intent=case.get("intent") or "",
+            # 记下标准答案是按哪一版口径算的: 语义缓存只复用同版的用例
+            semver=compiled.semver,
             note=f"route={compiled.route}; 作用域=全员(比 EX 时须同作用域); "
                  f"caliber={' | '.join(compiled.caliber_notes)[:300]}",
             created_by="seed_askdata_golden", enabled=True, case_id=_case_id(question),
@@ -250,7 +419,13 @@ def build_rows(*, refresh: bool, dry_run: bool) -> int:
             written += 1
     print(f"\n合计: 写入/更新 {written}, 跳过 {skipped}, 失败 {failed}; "
           f"启用中用例 {store.golden_count()} 条")
+    minimum = int(_settings().askdata_golden_min_cases or 0)
+    have = store.golden_count()
+    if minimum and have < minimum:
+        print(f"警告: 用例 {have} 条低于下限 {minimum} 条 —— 分层结论不可信, "
+              "继续靠 badcase 回流与真实问法补录(而不是堆同义句刷分)。")
     print("提示: 公开基准噪声大, 回归只认这套自建 golden 的 EX; 人工抽查过 note 里的口径再用于放行。")
+    print("下一步: 跑 python -m scripts.embed_askdata_golden 回填问法向量(语义缓存与 few-shot 都靠它)。")
     return 1 if failed else 0
 
 

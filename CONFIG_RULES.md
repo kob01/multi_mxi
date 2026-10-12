@@ -11,7 +11,7 @@
 | 1    | `OLLAMA_BASE_URL` 禁改（`host.docker.internal`）          | `config-env-tracks.md` §2         |
 | 2    | 容器内 `PG_HOST=postgres`                                 | `config-env-tracks.md` §2         |
 | 3    | 容器内 `MONGO_URL=mongodb://mongo:27017`                  | `config-env-tracks.md` §2、§3     |
-| 4    | `NORMALIZER_VERSION` 与 `normalize_text()` 同升降         | `doc-normalizer-version.md`       |
+| 4    | `NORMALIZER_VERSION` 与 `PARSER_VERSION` 随行为同升降 | `doc-normalizer-version.md`       |
 | 5    | 配置双轨：`env_file` 只读宿主轨，禁止加回 `docker/.env`   | `config-env-tracks.md` §1         |
 | 6    | 宿主端口走 `*_HOST_PORT`（18000/18001/18002/17474/17687） | `config-env-tracks.md` §4         |
 | 7    | A2A 卡片通告地址不作路由依据                              | `a2a-endpoint.md`                 |
@@ -30,7 +30,7 @@
 
 ## 已作废的判断（防止再被误改回来）
 
-- **「Mongo 已下线」是错的。** 「统一存储 PostgreSQL」只覆盖元数据与向量层（取代原 MySQL + Milvus），正文外置仍在 Mongo。现行是三层分工，见 `config-env-tracks.md` §3；不要因为看到 `MONGO_URL` 就当作遗留配置清掉。
+- **「Mongo 已下线」是错的。** 「统一存储 PostgreSQL」只覆盖元数据与向量层，正文外置仍在 Mongo。现行是三层分工，见 `config-env-tracks.md` §3；不要因为看到 `MONGO_URL` 就当作遗留配置清掉。
 - **「`env_file` 顺序要调对」已过时。** 历史写法 `(".env", "docker/.env")` 已删除，约束现在是「不得再加回去」。
 - 2026-09 之前本文件是唯一事实源；此后任何只写进本文件的"规则"都不会被模型看到。
 

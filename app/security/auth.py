@@ -131,7 +131,9 @@ def analytics_whitelist(role: Role) -> set[str]:
     return tools
 
 # ---------------------------------------------------------------------------
-# 智能问数域(askdata): 全部是只读工具(语义层查询/链接/校验/编译取数/沙箱取数/成图/留痕)。
+# 智能问数域(askdata): 全部是只读工具(语义层查询/链接/校验/编译取数/沙箱取数/成图/留痕)
+# + 三个"过不去了才能用"的面: similar_cases(元数据 few-shot) / metric_baseline(自己
+# 问过的量级) / create_ticket(人工工单, 只写治理表不碰业务数据)。
 # 没有写通道: 改数据仍然是 Analyst_Agent 受治理写通道的职责, 两者不开双重入口。
 # 普通员工对本域默认拒(与 analytics 同一口径: 能拿到全员数字的能力不默认开放)。
 # ---------------------------------------------------------------------------
@@ -144,6 +146,10 @@ ASKDATA_TOOLS: frozenset[str] = frozenset({
     "exec_sql_sandbox",
     "render_chart",
     "log_query",
+    "similar_cases",
+    "similar_intent",
+    "metric_baseline",
+    "create_ticket",
 })
 
 
