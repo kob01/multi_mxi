@@ -11,7 +11,7 @@
 | 1    | `OLLAMA_BASE_URL` 禁改（`host.docker.internal`）          | `config-env-tracks.md` §2         |
 | 2    | 容器内 `PG_HOST=postgres`                                 | `config-env-tracks.md` §2         |
 | 3    | 容器内 `MONGO_URL=mongodb://mongo:27017`                  | `config-env-tracks.md` §2、§3     |
-| 4    | `NORMALIZER_VERSION` 与 `PARSER_VERSION` 随行为同升降 | `doc-normalizer-version.md`       |
+| 4    | `NORMALIZER_VERSION` 与 `PARSER_VERSION` 随行为同升降     | `doc-normalizer-version.md`       |
 | 5    | 配置双轨：`env_file` 只读宿主轨，禁止加回 `docker/.env`   | `config-env-tracks.md` §1         |
 | 6    | 宿主端口走 `*_HOST_PORT`（18000/18001/18002/17474/17687） | `config-env-tracks.md` §4         |
 | 7    | A2A 卡片通告地址不作路由依据                              | `a2a-endpoint.md`                 |

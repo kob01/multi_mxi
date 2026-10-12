@@ -853,8 +853,8 @@ services:
     container_name: mxi-otel-lgtm
     profiles: [observe]
     ports:
-      - "${LGTM_GRAFANA_HOST_PORT:-18300}:3000"   # Grafana 面板(Explore 里选 Loki/Prometheus)
-      - "${LGTM_OTLP_HOST_PORT:-18686}:4318"       # OTLP HTTP(从本机外上报给 collector)
+      - "${LGTM_GRAFANA_HOST_PORT:-18300}:3000" # Grafana 面板(Explore 里选 Loki/Prometheus)
+      - "${LGTM_OTLP_HOST_PORT:-18686}:4318" # OTLP HTTP(从本机外上报给 collector)
     volumes:
       # 把上面的抓取配置接给镜像自带的 Prometheus(镜像内路径由上游约定)
       - ./otel/prometheus.yaml:/etc/prometheus/prometheus.yml:ro

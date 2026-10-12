@@ -290,17 +290,17 @@ ROUTE(指标API -> DSL编译器 -> 沙箱SQL) -> VERIFY(结果校验) -> [REPAIR
 RENDER(规则选型 + 叙述) -> FEEDBACK(留痕 + 归因路由)
 ```
 
-| 阶段   | 硬约束                                                                                                                                  | 代码落点                                                               |
-| ------ | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| 语义层 | 指标/维度/枚举值/别名/兼容规则/行列策略是**库里的治理对象**(52 指标 + 33 维度 + 83 别名 + 67 枚举值 + 276 条兼容规则), 真值是仓里 `semantic-defs/*.yaml`(可 review/可回滚), 口径表达式是受控列级片段; 与周报重叠的口径共用 `reports.py` 常量 | `semantic-defs/`、`app/db/models.py`(sem\_*)、`app/semantic/{defs,catalog,seed,registry}.py` |
-| 链接   | 同义词精确 + pgvector 相似 + 枚举值(含黑话别名与热度)反查三路融合打分, 槽位置信度作为先验乘进分数, **不够就澄清不猜**                       | `app/semantic/link.py`                                                 |
-| DSL    | 模型只交强类型 JSON: 无标识符自由(列名出自登记表)、无值拼接自由(全走绑参)、无作用域自由、**无算术自由**; 生成时带 golden 相似问法的 dynamic few-shot | `app/semantic/dsl.py` + `similar_cases` 工具                          |
-| 校验   | 独立模块不信模型自检: 语法→语义(兼容性/时间/枚举)→权限与成本(角色白名单、列级策略、行数与扫描量) 三级, 带错误码回炉重写 ≤2 轮           | `app/semantic/validate.py`                                             |
-| 编译   | DSL→SQL 全模板: 裸列自动限定表别名、作用域谓词 + **行策略**注入、产物再过 `ast_guard`, 同环比走**单扫描条件聚合**(解不出口径形状时退回双窗口 CTE) | `app/semantic/compiler.py`                                             |
-| 取数   | 只读角色 + 事务作用域 + EXPLAIN 扫描量上限 + 行数上限; 出口 DLP 打码与 spotlighting; 结果缓存 key = normalize(DSL)+身份+semver; 引擎连续错误熔断后短路下一级 | `app/mcp_servers/askdata_server.py`、`app/semantic/{resultcache,breaker}.py` |
-| 呈现   | 图型由结果 shape 规则定(时序→line/同环比→分组柱/低基数→pie/二维→按第二维分系列), LLM 只写叙述                                           | `app/agents/askdata_agent/{graph,prompts}.py`                          |
-| 闭环   | 全链路进 `askdata_query_log`(含 semver/token_cost/缓存命中/被澄清与被拒的轮次), 看板算一次通过率/澄清率/**误澄清率**/降级率/FALLBACK 率/P95/点踩率; 五类归因以 `edit_dsl` 的字段 diff 为直证, 只产出**未生效的草案**; 答不出来时开**人工工单** | `app/askdata/{store,attribution,router}.py` + `/api/askdata/*`         |
-| 可观测 | OTel span(每工具一条 + 整轮一条, 属性 conf/召回分/route/重试/tokens/semver) + Prometheus `/metrics` + 四条告警线; 与 Langfuse/audit.jsonl 并存 | `app/observability/{otel,metrics,alerts}.py`                           |
+| 阶段   | 硬约束                                                                                                                                                                                                                                         | 代码落点                                                                                      |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| 语义层 | 指标/维度/枚举值/别名/兼容规则/行列策略是**库里的治理对象**(52 指标 + 33 维度 + 83 别名 + 67 枚举值 + 276 条兼容规则), 真值是仓里 `semantic-defs/*.yaml`(可 review/可回滚), 口径表达式是受控列级片段; 与周报重叠的口径共用 `reports.py` 常量   | `semantic-defs/`、`app/db/models.py`(sem\_\*)、`app/semantic/{defs,catalog,seed,registry}.py` |
+| 链接   | 同义词精确 + pgvector 相似 + 枚举值(含黑话别名与热度)反查三路融合打分, 槽位置信度作为先验乘进分数, **不够就澄清不猜**                                                                                                                          | `app/semantic/link.py`                                                                        |
+| DSL    | 模型只交强类型 JSON: 无标识符自由(列名出自登记表)、无值拼接自由(全走绑参)、无作用域自由、**无算术自由**; 生成时带 golden 相似问法的 dynamic few-shot                                                                                           | `app/semantic/dsl.py` + `similar_cases` 工具                                                  |
+| 校验   | 独立模块不信模型自检: 语法→语义(兼容性/时间/枚举)→权限与成本(角色白名单、列级策略、行数与扫描量) 三级, 带错误码回炉重写 ≤2 轮                                                                                                                  | `app/semantic/validate.py`                                                                    |
+| 编译   | DSL→SQL 全模板: 裸列自动限定表别名、作用域谓词 + **行策略**注入、产物再过 `ast_guard`, 同环比走**单扫描条件聚合**(解不出口径形状时退回双窗口 CTE)                                                                                              | `app/semantic/compiler.py`                                                                    |
+| 取数   | 只读角色 + 事务作用域 + EXPLAIN 扫描量上限 + 行数上限; 出口 DLP 打码与 spotlighting; 结果缓存 key = normalize(DSL)+身份+semver; 引擎连续错误熔断后短路下一级                                                                                   | `app/mcp_servers/askdata_server.py`、`app/semantic/{resultcache,breaker}.py`                  |
+| 呈现   | 图型由结果 shape 规则定(时序→line/同环比→分组柱/低基数→pie/二维→按第二维分系列), LLM 只写叙述                                                                                                                                                  | `app/agents/askdata_agent/{graph,prompts}.py`                                                 |
+| 闭环   | 全链路进 `askdata_query_log`(含 semver/token_cost/缓存命中/被澄清与被拒的轮次), 看板算一次通过率/澄清率/**误澄清率**/降级率/FALLBACK 率/P95/点踩率; 五类归因以 `edit_dsl` 的字段 diff 为直证, 只产出**未生效的草案**; 答不出来时开**人工工单** | `app/askdata/{store,attribution,router}.py` + `/api/askdata/*`                                |
+| 可观测 | OTel span(每工具一条 + 整轮一条, 属性 conf/召回分/route/重试/tokens/semver) + Prometheus `/metrics` + 四条告警线; 与 Langfuse/audit.jsonl 并存                                                                                                 | `app/observability/{otel,metrics,alerts}.py`                                                  |
 
 四个设计取舍值得记在这:
 
@@ -330,10 +330,10 @@ Trace 与留痕里都带 `semver`(定义集内容指纹), 所以"一个月前的
 
 语义缓存与两层缓存的区别(别弄混它们的责任):
 
-| 层 | 键 | 复用什么 | 不能省下什么 |
-| --- | --- | --- | --- |
+| 层           | 键                                                                | 复用什么      | 不能省下什么                    |
+| ------------ | ----------------------------------------------------------------- | ------------- | ------------------------------- |
 | 语义缓存(V3) | 问法向量相似度 ≥0.95 **且 semver 同版 且已人工批准(`cacheable`)** | 查询意图(DSL) | 校验、编译、RLS、审计、结果缓存 |
-| 结果缓存 | normalize(DSL)+route+工号+角色+作用域+semver | 结果行 | 口径与权限判定(它们都在键里) |
+| 结果缓存     | normalize(DSL)+route+工号+角色+作用域+semver                      | 结果行        | 口径与权限判定(它们都在键里)    |
 
 两者都不省校验: 语义缓存命中时状态机仍然跑 link/validate/route/verify, 所以指标被停用、
 口径改了版、权限不够这些情况仍旧会被拦下而不是"静默复用了一个旧答案"。
@@ -382,11 +382,11 @@ OTel Collector + Prometheus + Loki + Grafana 四合一(宿主 18300/18686), 再�
 三类缓存统一落 Redis(`app/cache/`), 全部按"能降级就降级"设计: Redis 关闭/连不上
 (`get_redis()` 返回 None)就退回直连真实调用, 行为等同于本功能上线前, 不报错不阻断。
 
-| 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                       |
-| ------------------------------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)          |
+| 缓存                                  | key 组成                                         | 默认 TTL         | 接入门槛(默认拒)                                                                                                                                                                                                              |
+| ------------------------------------- | ------------------------------------------------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt Cache(`prompt_cache.py`)       | `model\|temperature\|sha256(prompt)`             | 300s             | 只给"同 prompt → 同结果"的纯函数式调用: 改写/意图 LLM 兜底/闲聊直答;**严禁用于知识库生成**(输出携带文档级 ACL 与实时检索结果)                                                                                                 |
 | Retrieval Cache(`retrieval_cache.py`) | `query\|top_k\|top_n\|ACL签名(user\|dept\|role)` | 300s             | 命中即跳过整条检索(含前置权限裁剪), 故 key 必须带身份签名; 失效按**文档粒度**做: payload 存命中文档的 docgen 版本快照, 读时一次 MGET 比对, 不符即未命中并自删(`bump_doc_gen`); `invalidate_all()`(SCAN 而非 KEYS)只留运维路径 |
-| Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入 |
+| Tool Cache(`tool_cache.py`)           | `server\|tool\|args(sort_keys)\|role`            | 30s(web 域 300s) | 工具名需命中只读前缀白名单 `query_/list_/get_/check_/lookup_/search_`;`generate_*`/`create_*`/`submit_*` 天然不命中;A2A 委派整体不接入                                                                                        |
 
 两个刻意保留的"不优化":流式闲聊不读 Prompt Cache(命中的重放没有思考过程, 收益小于
 体验损失);多智能体分节合并不再过一次 LLM(各节已是智能体产出的事实, 再过一次只会
