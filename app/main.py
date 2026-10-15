@@ -106,6 +106,7 @@ _CAPABILITY_FLAGS: tuple[tuple[str, str], ...] = (
     ("multi_agent_enabled", "多智能体并发委派"),
     ("askdata_enabled", "智能问数(AskData_Agent)"),
     ("checkpoint_enabled", "LangGraph Checkpointer"),
+    ("audit_otel_enabled", "审计 OTel 主写(Logs API)"),
 )
 
 

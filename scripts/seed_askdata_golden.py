@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+from datetime import date
 from typing import Any
 
 from app.db import sync as dbsync
@@ -268,8 +269,8 @@ _EXTRA_CASES: list[dict[str, Any]] = [
      "tags": "全部历史"},
     {"question": "按到期日看未来三十天内要续签的合同数",
      "dsl": {"metrics": [{"id": "m_contract_expiring_count"}],
-             "time": {"start": "2026-10-01", "end": "2026-11-30"}},
-     "tags": "显式区间"},
+             "time": {"range": "next_30d"}},
+     "tags": "前向窗口"},
     {"question": "本季度按部门看未结工单数",
      "dsl": {"metrics": [{"id": "m_ticket_open_count"}], "dims": ["d_ticket_department"],
              "time": {"range": "this_quarter"}},
@@ -290,6 +291,28 @@ def _dim_label(catalog: MetricCatalog, dim_id: str) -> str:
 
 def _case_id(question: str) -> str:
     return hashlib.sha256(question.encode("utf-8")).hexdigest()[:24]
+
+
+def _absolute_date_warn(case: dict[str, Any]) -> str:
+    """用例里写了**绝对日期**就告警: 标准答案会随日历过期待。
+
+    为什么不能留: 把"未来三十天"标成固定日期区间后, 灌入那天它是对的, 第二天起
+    模型给出任何一个"真正的未来 30 天"都会被判错(本轮实测过: 用例里 start 已是过去的
+    2026-10-01)。相对时间必须用区间词写, 由 timesem 按当天重算。
+    真需要硬日期的用例(测"显式区间"解析本身)可以留, 但要看得到这条提醒。
+    """
+    time_block = ((case.get("dsl") or {}).get("time") or {}) if isinstance(case.get("dsl"), dict) else {}
+    start, end = str(time_block.get("start") or ""), str(time_block.get("end") or "")
+    if not (start or end):
+        return ""
+    try:
+        tail = date.fromisoformat(end or start)
+    except ValueError:
+        return f"{case.get('question')}: 日期不是 ISO 形式({start}~{end})"
+    if tail < date.today():
+        return (f"{case.get('question')}: 期望区间已于 {tail.isoformat()} 过期 —— "
+                "相对时间请用区间词而不是硬日期")
+    return f"{case.get('question')}: 用了硬日期({start}~{end}), 到期后会变成假失败"
 
 
 def _scope() -> DataScope:
@@ -370,6 +393,10 @@ def build_rows(*, refresh: bool, dry_run: bool) -> int:
     for case in golden_cases(catalog):
         question = case["question"]
         dsl = case.get("dsl")
+        warning = _absolute_date_warn(case)
+        if warning:
+            # 不阻断灌入(真需要硬日期的用例是合法的), 但把"明天就会变成假失败"当顶提示说出来。
+            print(f"  [警告] {warning}")
         if not refresh and question in existing:
             skipped += 1
             continue

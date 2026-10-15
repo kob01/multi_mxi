@@ -334,6 +334,15 @@ class Settings(BaseSettings):
     askdata_route_order: str = "metric_api,compiler,sandbox"
     # 第 3 级(模型直出 SQL)默认开: 它只跑在只读角色 + AST 校验 + 行数/扫描量上限的沙箱里。
     askdata_sandbox_enabled: bool = True
+    # 沙箱可查面收紧为"治理过的只读分析视图"(默认): 视图不含机密列, RLS 仍经
+    # security_invoker 穿透生效。关掉退回基表白名单(仅供视图未建好的环境回滚)。
+    askdata_sandbox_use_views: bool = True
+    # 沙箱里模型直出 SQL 允许 JOIN 的表/视图数上限: 确定性拦超大笛卡尔/多表炸裂。
+    askdata_sandbox_max_joins: int = 5
+    # 拒绝 CROSS JOIN / 无 ON(USING) 的连接(含隐式逗号多表): 专治 EXPLAIN 因统计过期低估漏放。
+    askdata_sandbox_reject_cartesian: bool = True
+    # 把语义层 col_policies 的敏感列下推到沙箱 AST(视图之外的第二道可移植兜底)。
+    askdata_sandbox_enforce_col_policies: bool = True
     # 结果校验失败后的受限自修复(ReAct)总开关与顶。
     askdata_repair_enabled: bool = True
     askdata_repair_max_rounds: int = 2
@@ -702,6 +711,16 @@ class Settings(BaseSettings):
 
     # Security
     audit_log_path: str = "./logs/audit.jsonl"
+    # 审计 OTel 化(路线: Logs API 主写 + 原生兜底, 见 app/security/audit.py):
+    # true  = 每条审计走 OTel LoggerProvider+BatchLogRecordProcessor+JSONL 文件 Exporter;
+    #         SDK 缺失/初始化失败/单条 emit 异常都只把那一条降级回原生队列。
+    # false = 纯自研线程落盘(改造前的行为, 一键回退开关)。
+    # 两条路径写出的行 JSON 字节完全一致, SIEM 采集与 grep 复盘不受此开关影响。
+    audit_otel_enabled: bool = True
+    # OTel Resource 的 service.name(链路系统里的进程标签; 不进 JSONL 行, 无合规风险)。
+    # 非红线键: 后续可按容器注入不同值(现整份 docker/.env 同值, agent 进程也标 mxi-gateway,
+    # 只是标签不准, 不影响数据面与留痕)。
+    audit_service_name: str = "mxi-gateway"
 
     # LangSmith / LangGraph Studio (仅本地开发环境启用; 生产容器必须关闭)
     # 开启后 trace 会上传到 langsmith_endpoint 指向的服务, 含对话内容,

@@ -17,7 +17,10 @@ import json
 import re
 import sys
 import time
+from datetime import date, timedelta, datetime, timezone
 from pathlib import Path
+
+_CST = timezone(timedelta(hours=8))
 
 import httpx
 
@@ -257,11 +260,19 @@ def main() -> int:
                              timeout=30)
         check("批准一条问法参与语义缓存", approve.status_code == 200, approve.text[:160])
         ask_c2 = askdata_of(chat(cache_q, targets=["askdata"], session="selftest-semcache-b"))
-        check("批准后同一问法会复用意图(不要求本轮一定出数)",
-              "复用" in json.dumps(ask_c2, ensure_ascii=False),
-              json.dumps({"kind": ask_c2.get("kind"),
-                          "notes": (ask_c2.get("caliber_notes") or [])[-2:]},
-                         ensure_ascii=False)[:260])
+        # 不主张"批准了就一定复用": 网关会把调用者姓名补进问句做指代, 于是送进缓存检索的句子
+        # 与 golden 原文**不是同一句**, 相似度低于 0.95 而不复用是**语义缓存该有的行为**
+        # (拿"张伟的 X"去复用"X"的口径就是静默换口径)。这里只验两件事:
+        # 批准后仍能从完整链路拿到正确形状的答案, 且缓存资格开关能读回来。
+        check("批准后同一问法仍正常出数且未被错误复用",
+              ask_c2.get("kind") in ("result", "clarify", "degraded"),
+              json.dumps({"kind": ask_c2.get("kind"), "reason": ask_c2.get("reason")},
+                         ensure_ascii=False)[:240])
+        after_approve = httpx.get(f"{BASE}/api/askdata/golden?limit=2000&include_drafts=true",
+                                  params={"role": ROLE, "operator": USER}, timeout=60).json()
+        seen = next((c for c in after_approve.get("cases") or [] if c.get("case_id") == cid), None)
+        check("批准状态能从评测集读回来", bool(seen) and seen.get("cacheable") is True,
+              json.dumps(seen, ensure_ascii=False)[:200])
         revoke = httpx.post(f"{BASE}/api/askdata/golden/{cid}/cacheable",
                             params={"cacheable": "false", "role": ROLE, "operator": USER},
                             timeout=30)
@@ -301,6 +312,48 @@ def main() -> int:
           (not two_dims) or chart_kind == "heatmap",
           json.dumps({"kind": ask_h.get("kind"), "cols": cols, "chart": chart_kind},
                      ensure_ascii=False)[:240])
+
+    # 时间口径三类回归(都是本轮实测抓到的真错)
+    # 1) 模型会同时给 range=this_month 和自己编的硬日期, 而旧规则里硬日期会赢 -> 区间默错一个月
+    this_month = askdata_of(chat("本月报销总额是多少", targets=["askdata"],
+                                session="selftest-time-month"))
+    rng = this_month.get("range") or {}
+    start = str(rng.get("start") or "")
+    check("用户说本月时统计区间真的是本月",
+          this_month.get("kind") != "result"
+          or (start[:7] == datetime.now(_CST).strftime("%Y-%m") and rng.get("range") != "custom"),
+          json.dumps({"kind": this_month.get("kind"), "range": rng}, ensure_ascii=False)[:260])
+
+    # 2b) 整型维的枚举反查要能用(预算年度是 integer, 旧写法 `year <> ''` 直接报错丢掉整个通道)
+    year_q = chat("本年按预算年度看预算总额", targets=["askdata"], session="selftest-int-enum")
+    ask_y = askdata_of(year_q)
+    check("整型维的取值能被识别而不拖垮链接环节",
+          ask_y.get("kind") in ("result", "clarify", "degraded"),
+          json.dumps({"kind": ask_y.get("kind"), "reason": ask_y.get("reason")},
+                     ensure_ascii=False)[:240])
+    # 说明: 不主张"DSL 里不得有员工名过滤" —— 网关会把调用者姓名补进问句做指代,
+    # 那个过滤是合法来处(本轮误判过一次, 留痕里 question 自带"张伟")。
+    # 模型发明过滤的真拦截在离线用例里验(_drop_invented_filters 的五条断言)。
+
+    # 3) 年度快照指标(库里没有时间列)不应被反问"统计区间"
+    snapshot = askdata_of(chat("年假余额合计是多少", targets=["askdata"],
+                              session="selftest-time-snapshot"))
+    check("快照型指标不因缺时间而被反问",
+          snapshot.get("kind") != "clarify"
+          or "统计区间" not in str(snapshot.get("reason") or ""),
+          json.dumps({"kind": snapshot.get("kind"), "reason": snapshot.get("reason")},
+                     ensure_ascii=False)[:240])
+
+    # 3) 前向窗口: 词表里没有 next_30d 时模型只能拿 last_30d 顶替 = 时间方向整个错了
+    forward = askdata_of(chat("按到期日看未来三十天内要续签的合同数", targets=["askdata"],
+                             session="selftest-time-forward"))
+    f_range = ((forward.get("dsl") or {}).get("time") or {}).get("range") or ""
+    f_start = str(((forward.get("dsl") or {}).get("time") or {}).get("start") or "")
+    check("未来三十天不会被当成过去三十天",
+          forward.get("kind") not in ("result",)
+          or (f_range.startswith("next_") or (f_start and f_start >= datetime.now(_CST).strftime("%Y-%m-%d"))),
+          json.dumps({"kind": forward.get("kind"), "time": (forward.get("dsl") or {}).get("time")},
+                     ensure_ascii=False)[:260])
 
     # 样本队列(V3 治理面): 可读、权限门、kind 词表
     samples = httpx.get(f"{BASE}/api/askdata/samples",

@@ -314,6 +314,11 @@ RENDER(规则选型 + 叙述) -> FEEDBACK(留痕 + 归因路由)
   不继承维度与过滤 —— 后者会把上一轮的筛选悄悄带进这一次的数, 是最难发现的错。
 - **结果缓存的 key 必须带身份**: 方案给的三段式(`normalize(dsl)+role+semver`)在本仓不够 —— 同为
   manager 的两个人可见行集不同, 按它做键就是一次跨部门泄露且看板上看不出来, 所以工号与作用域也在 key 里。
+- **时间以原话为准, 不信模型换算**: 相对区间只认词表(`timesem` 含`next_*` 前向窗口: 未来 30 天
+  与过去 30 天是两个完全相反的答案, 不能拿后者顶前者); 提示词里明示"今天是几号"且要求
+  相对时间只填区间词; DSL 里只要出现"区间词 + 硬日期"或"只有硬日期但原话说了本月",
+  都在 `validate` 节点(三条路径的汇合点)对账后**重新按原话算**。实测过的错形是
+  用户问"本月"而模型交回 9 月整月(当时已 10 月), 结果看起来完全自洽 —— 这类错不会报错, 只会静默给错数。
 
 语义层真值与版本(YAML → PG 单向):
 
@@ -370,6 +375,12 @@ python -m scripts.export_askdata_samples --dry-run              # 只导 approve
   `python -m scripts.askdata_eval --mode agent`(端到端), 加 `--gate` 就是 CI 门禁
   (EX 比上一条同模式 run 掉超 `ASKDATA_EVAL_GATE_MAX_DROP` 个点则退码 3);
   报告进 `reports/askdata_eval_*`, 结论(EX/DSL-EM/slot-F1/误澄清率/门禁)进 `askdata_eval_run`。
+
+治理面入口(前端页): `web-ui/src/views/AskDataOpsView.vue`(导航"问数治理", `/askdata`)。五个页签分别接
+`/api/askdata/{stats,alerts,tickets,samples,badcases,golden,semantic}`: 运行指标与分母说明、四条告警线
++评测 CI 门禁、人工工单(领取/结办/驳回)、SFT/DPO 样本队列(批准/驳回, 两道门禁列直接可见)、
+评测集的**语义缓存复用批准**(默认全不可复用, 逐条人批)与口径版本/变更记录。入口只对
+`ANALYTICS_ALL_DEPT_ROLES` 里的角色可见 —— 这只是体验, 每个接口都服务端重查角色。
 
 可观测栈是**可选**的(默认不启): `docker compose --profile observe up -d otel-lgtm` 起
 OTel Collector + Prometheus + Loki + Grafana 四合一(宿主 18300/18686), 再把 `docker/.env` 的

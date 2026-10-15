@@ -301,6 +301,18 @@ terms:
   weight: 1.0
   source: seed
   status: active
+- term: 比价不足三单
+  term_type: metric
+  target_id: m_purchase_quotes_short
+  weight: 1.0
+  source: seed
+  status: active
+- term: 比价不足
+  term_type: metric
+  target_id: m_purchase_quotes_short
+  weight: 0.95
+  source: seed
+  status: active
 - term: 三家比价
   term_type: metric
   target_id: m_purchase_quotes_short

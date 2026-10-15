@@ -135,6 +135,41 @@ proc_suppliers 供应商主数据:
 
 
 # ---------------------------------------------------------------------------
+# 智能问数沙箱 (AskData_Agent 降级链第 3 级): 只允许引用治理视图
+# ---------------------------------------------------------------------------
+# 与 ANALYTICS_SCHEMA_DDL 的区别不是"写得简略一点", 而是**可查面不同**:
+# 那一份给自由 Text2SQL 看基表, 这一份给问数沙箱看视图。视图投影由
+# app/db/analytics_views.py 单一事实源定义, 这里的字段说明也从它派生 —— 手写两份
+# 必然漂移, 漂移的代价是模型写出"基表有但视图没有"的列而在数据库侧报错。
+_SANDBOX_RULES = """\
+
+沙箱硬性规则(违反会被服务端 AST 校验直接拒): 
+- 只能 FROM/JOIN 上面列出的 v_analytics_* 视图; 写基表名(hr_/fin_/proc_)会被拒。
+- 视图里没有 tenant_id/dept_id/is_deleted: 能读到哪些行、是否含已删行都由服务端
+  行级安全与视图定义决定, 不要(也不许)自己写这三个条件。
+- 需要部门/姓名就 JOIN v_analytics_employees ON <事实视图>.emp_id = v_analytics_employees.emp_id。
+- 必须有表间关联条件(ON/USING): CROSS JOIN 与不写 ON 的多表连接会被直接拒。
+- 最多 JOIN 五张视图; 点名列, 不要 SELECT *(敏感角色下星号投影会被拒)。"""
+
+
+def _render_sandbox_view_ddl() -> str:
+    """由视图规格渲染字段说明(与真实投影同源, 不可能漂移)。"""
+    from app.db.analytics_views import SANDBOX_VIEW_SPECS
+
+    lines = ["-- 问数沙箱可查视图 (只读, 均为已过滤软删的治理投影)"]
+    for spec in SANDBOX_VIEW_SPECS:
+        cols = ", ".join(f"{name} {type_}" for name, type_ in spec.columns)
+        lines.append(f"{spec.name} {spec.label}:")
+        lines.append(f"  {cols}")
+        if spec.note:
+            lines.append(f"  -- {spec.note}")
+    return "\n".join(lines) + SQL_DIALECT_NOTES + _SANDBOX_RULES
+
+
+ANALYTICS_SANDBOX_VIEW_DDL = _render_sandbox_view_ddl()
+
+
+# ---------------------------------------------------------------------------
 # 采购与合同 (Contract_Agent)
 # ---------------------------------------------------------------------------
 PROCUREMENT_SCHEMA_DDL = """\

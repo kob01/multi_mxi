@@ -48,6 +48,7 @@ const showDataOps = computed(() => APPROVER_ROLES.includes(current.role))
       <el-menu-item index="graph" :route="{ name: 'graph' }">知识图谱</el-menu-item>
       <el-menu-item index="memory" :route="{ name: 'memory' }">我的记忆</el-menu-item>
       <el-menu-item v-if="showDataOps" index="dataops" :route="{ name: 'dataops' }">变更审批</el-menu-item>
+      <el-menu-item v-if="showDataOps" index="askdata-ops" :route="{ name: 'askdata-ops' }">问数治理</el-menu-item>
     </el-menu>
   </div>
 </template>
@@ -97,8 +98,9 @@ const showDataOps = computed(() => APPROVER_ROLES.includes(current.role))
     width: 160px !important;
   }
 
-  /* 窄屏下先舍掉最后的"我的记忆", 靠 URL 直达 */
-  .nav :deep(.el-menu-item[index='memory']) {
+  /* 窄屏下先舍掉最后两项治理页, 靠 URL 直达(治理看板不是高频入口, 宁可舍它也不舍审批) */
+  .nav :deep(.el-menu-item[index='memory']),
+  .nav :deep(.el-menu-item[index='askdata-ops']) {
     display: none;
   }
 }

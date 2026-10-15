@@ -18,6 +18,12 @@ langchain-deepseek>=1.0.0
 # docker-compose.yml 的 profile=langfuse 栈(同大版本)。
 langfuse>=3.4,<5
 
+# 审计留痕 OTel 主写(app/security/audit.py, 与 LangSmith/Langfuse 并存的可选观测面):
+# OTel Logs API + BatchLogRecordProcessor 落 JSONL 文件 Exporter; SDK 缺失时降级为
+# 纯标准库落盘(import 期不依赖, 数据面字节不变)。
+opentelemetry-api>=1.27,<2
+opentelemetry-sdk>=1.27,<2
+
 # MCP (Model Context Protocol) - pin 1.x: FastMCP high-level API (renamed in mcp 2.x)
 mcp>=1.10.0,<2
 langchain-mcp-adapters>=0.1.0

@@ -1150,6 +1150,78 @@ def test_v3_second_round() -> None:
           not _has_time(_recover_time_phrase({"time": {}}, "各部门报销总额")), "")
 
 
+def test_sandbox_governance() -> None:
+    """沙箱加固的确定性不变量: 可查面=治理视图, 机密列不在面内, 提示词与视图同源。"""
+    import inspect
+
+    from app.agents.askdata_agent import graph as askdata_graph
+    from app.db.analytics_views import (
+        SANDBOX_VIEW_SPECS, sandbox_view_names, sensitive_columns, source_tables, view_selects,
+    )
+    from app.db.schema_docs import ANALYTICS_SANDBOX_VIEW_DDL, ANALYTICS_SCHEMA_DDL
+    from app.db.scope import SCOPED_TABLES
+
+    print("\n17) 沙箱可查面(治理视图)与列/资源护栏接线")
+    names = sandbox_view_names()
+    check("视图名统一 v_analytics_ 前缀",
+          names and all(n.startswith("v_analytics_") for n in names), str(sorted(names)))
+    check("视图个数与作用域表名单对齐", len(names) == len(SCOPED_TABLES),
+          f"{len(names)} vs {len(SCOPED_TABLES)}")
+    # 基表必须全部受 RLS 管辖: 否则"视图只挑列"反而开了一个没有行级安全的后门。
+    stray = sorted(table for table in source_tables() if table not in SCOPED_TABLES)
+    check("视图基表全部受行级安全管辖", not stray, str(stray))
+
+    # 这些列出现在自由 SQL 面里就是越权读人/渗出素材: 结构上就不能存在。
+    hidden = {
+        "annual_leave_total", "annual_leave_used", "bank_account", "content", "review_json",
+        "findings", "opinion", "precheck_result", "flags", "doc_key",
+        "tenant_id", "dept_id", "is_deleted", "deleted_at", "deleted_by",
+    }
+    for spec in SANDBOX_VIEW_SPECS:
+        leaked = sorted(set(spec.column_names()) & hidden)
+        check(f"{spec.name} 不暴露机密/服务端列", not leaked, str(leaked))
+
+    soft_views = {
+        "v_analytics_tickets", "v_analytics_leave_records", "v_analytics_reimbursements",
+        "v_analytics_purchase_orders", "v_analytics_contracts",
+    }
+    declared_soft = {s.name for s in SANDBOX_VIEW_SPECS if s.soft_delete}
+    check("软删表逐一对上了过滤标记", declared_soft == soft_views,
+          f"{sorted(declared_soft ^ soft_views)}")
+    unchecked = [n for n, sql in view_selects().items() if n in soft_views and "is_deleted = false" not in sql]
+    check("软删过滤真的写进视图 SELECT", not unchecked, str(unchecked))
+
+    # 提示词与真实投影同源: 任何一个列没写进说明, 模型就无从正确点名。
+    missing = [f"{spec.name}.{col}" for spec in SANDBOX_VIEW_SPECS for col, _ in spec.columns
+               if col not in ANALYTICS_SANDBOX_VIEW_DDL]
+    check("视图字段说明与真实投影列全覆盖", not missing, str(missing[:6]))
+    hidden_names = {col for cols in sensitive_columns().values() for col in cols}
+    # 机密列名一旦出现在发给模型的文本里, 就是在告诉注入者"这里值得挖": 视图面要连名字都不给。
+    shown = sorted(name for name in hidden_names if name in ANALYTICS_SANDBOX_VIEW_DDL)
+    check("发给模型的说明不点名机密列", not shown, str(shown))
+    check("沙箱面与基表面不是同一份文本", ANALYTICS_SANDBOX_VIEW_DDL != ANALYTICS_SCHEMA_DDL, "")
+    check("机密列剔除清单与视图面一致", set(sensitive_columns()) == names, "")
+
+    # 沙箱节点必须引用视图说明而不是基表说明: 给基表清单等于让模型写出必被拒的表名。
+    source = inspect.getsource(askdata_graph.AskDataPipeline._sandbox)
+    check("沙箱 prompt 用视图 DDL", "ANALYTICS_SANDBOX_VIEW_DDL" in source, source[:120])
+    check("沙箱 prompt 不再出现基表清单", "ANALYTICS_SCHEMA_DDL" not in source, "")
+    check("沙箱 prompt 要求 JOIN 带关联条件", "ON" in source and "v_analytics_employees" in source, "")
+
+    # MCP 侧接线: 默认给视图集合, 配置退回时才给基表集合(回滚通道必须真的接得上)。
+    from app.mcp_servers import askdata_server
+
+    settings = get_settings()
+    check("沙箱可查面默认=视图集合", askdata_server._sandbox_allowed_tables() == names, "")
+    saved = settings.askdata_sandbox_use_views
+    try:
+        settings.askdata_sandbox_use_views = False
+        check("use_views=false 时退回基表白名单",
+              askdata_server._sandbox_allowed_tables() == askdata_server._allowed_tables(), "")
+    finally:
+        settings.askdata_sandbox_use_views = saved
+
+
 def _raises(fn) -> bool:
     try:
         fn()
@@ -1165,6 +1237,206 @@ def catalog_with(base_catalog, extra_dims):
         dimensions[dim.dim_id] = dim
     return MetricCatalog(metrics=base_catalog.metrics, dimensions=dimensions,
                          terms=base_catalog.terms)
+
+
+def test_forward_windows_and_aliases() -> None:
+    """前向时间窗口与词典覆盖: 两条真实失败的确切根因。"""
+    print("\n16) 前向窗口与别名覆盖")
+    from datetime import date, timedelta
+
+    from app.semantic.link import link as run_link
+    from scripts.askdata_eval import judge
+    from scripts.seed_askdata_golden import _absolute_date_warn
+
+    today = date(2026, 10, 15)
+    for token, days in (("next_7d", 7), ("next_30d", 30), ("next_90d", 90)):
+        got = timesem.resolve({"range": token}, today=today)
+        check(f"{token} 从今天起算 N 天",
+              got.start == today and got.end == today + timedelta(days=days) and got.days == days,
+              f"{got.start} ~ {got.end}")
+        check(f"{token} 标签说清方向", f"未来 {days} 天" in got.label, got.label)
+
+    # 汉字与数字两种写法都要认得(用户写"未来三十天", 不是 "未来30天")
+    for phrase, token in (("未来三十天", "next_30d"), ("未来30天", "next_30d"),
+                          ("未来一个月", "next_30d"), ("未来一周", "next_7d"),
+                          ("接下来三个月", "next_90d"), ("未来一年", "next_365d")):
+        check(f"说法「{phrase}」归一到 {token}", timesem.normalize_range(phrase) == token, phrase)
+    check("原话能识别出前向说法",
+          timesem.detect_phrase("按到期日看未来三十天内要续签的合同数") == "未来三十天内",
+          timesem.detect_phrase("按到期日看未来三十天内要续签的合同数"))
+
+    # 前向窗口做环比: 对比期必须是**它前面**那段等长区间, 不能往前拿一个不存在的周期
+    fwd = timesem.resolve({"range": "next_30d"}, compare="mom", today=today)
+    check("前向窗口的环比是上一个等长区间",
+          fwd.prev_start == today - timedelta(days=30) and fwd.prev_end == today,
+          f"{fwd.prev_start} ~ {fwd.prev_end} · {fwd.note}")
+    yoy = timesem.resolve({"range": "next_30d"}, compare="yoy", today=today)
+    check("前向窗口的同比仍旧平移一年",
+          yoy.prev_start == today.replace(year=today.year - 1)
+          and yoy.prev_end == (today + timedelta(days=30)).replace(year=today.year - 1),
+          f"{yoy.prev_start} ~ {yoy.prev_end}")
+
+    # 新别名要真能把口径定住(这两条曾经分别导致"误澄清"与"拿 last_30d 顶替")
+    ids = [c.target_id for c in run_link("今年比价不足三单的采购有几个",
+                                        catalog=CATALOG, scope=None).metric_candidates]
+    check("比价不足三单能直达该口径", "m_purchase_quotes_short" in ids, str(ids))
+    check("不会顺便把'采购单数'也拉进来当竞争者",
+          ids.count("m_purchase_count") == 0 or ids[0] == "m_purchase_quotes_short", str(ids))
+
+    # 硬日期用例要被顶提示说出来(它会每天临近一步, 然后开始假失败)
+    stale = _absolute_date_warn({"question": "q", "dsl": {"time": {"start": "2020-01-01",
+                                                                   "end": "2020-02-01"}}})
+    check("已过期的硬日期用例会被告警", "过期" in stale, stale)
+    fresh = _absolute_date_warn({"question": "q", "dsl": {"time": {"range": "next_30d"}}})
+    check("用区间词时无需告警", fresh == "", fresh)
+    future = _absolute_date_warn({"question": "q", "dsl": {"time": {"start": "2099-01-01",
+                                                                    "end": "2099-02-01"}}})
+    check("未过期但硬写日期也给提醒", "硬日期" in future, future)
+    
+    # ⑩ DSL-EM 尺子: 只落到一个桶的粒度与"不展开"等价, 真的拆开了则算不同
+    same_year = judge._effective_granularity({"range": "next_7d", "granularity": "year"})
+    check("一个桶的粒度归一为空", same_year == "", same_year)
+    split_by_day = judge._effective_granularity({"range": "last_30d", "granularity": "day"})
+    check("真拆成多行的粒度仍然保留", split_by_day == "day", split_by_day)
+    ok, _note = judge.dsl_exact_match(
+        {"metrics": [{"id": "m_expense_total"}], "time": {"range": "this_year"}},
+        {"metrics": [{"id": "m_expense_total"}],
+         "time": {"range": "this_year", "granularity": "year"}},
+    )
+    check("今年+year 与今年不展开算同一意图", ok, _note)
+    bad, _note2 = judge.dsl_exact_match(
+        {"metrics": [{"id": "m_expense_total"}], "time": {"range": "this_year"}},
+        {"metrics": [{"id": "m_expense_total"}],
+         "time": {"range": "this_year", "granularity": "day"}},
+    )
+    check("今年按天展开仍算不同意图", not bad, _note2)
+
+    # ⑪ 时间要求按"会被选中的口径"判, 不按全部候选取"与"
+    # (本轮 6 条误澄清的真因: 快照指标与时间型指标混在候选里时, 全体取与就变成"缺区间")
+    from app.agents.askdata_agent.graph import _time_required
+    from app.agents.askdata_agent.prompts import today_anchor as prompts_today
+
+    mixed = [{"id": "m_a", "time_aware": False, "score": 1.0},
+             {"id": "m_b", "time_aware": True, "score": 0.9}]
+    check("top1 是快照指标时不追问时间", _time_required(mixed) is False, str(mixed))
+    check("top1 需要时间时仍要追问",
+          _time_required([{"id": "m_b", "time_aware": True}]) is True, "")
+    check("拿不到 time_aware 时保守当作需要时间",
+          _time_required([{"id": "m_x"}]) is True and _time_required([]) is True, "")
+    check("全是快照指标时仍不追问",
+          _time_required([{"id": "m_a", "time_aware": False},
+                          {"id": "m_c", "time_aware": False}]) is False, "")
+
+    # ⑫ 相对区间词与模型编的硬日期同时出现时, 以用户原话为准
+    # (本轮实测: 用户说"本月", 模型交 start/end=2026-09, resolve 默认拿它算出了上个月的空结果)
+    from app.agents.askdata_agent.graph import _reconcile_time
+
+    # 时间对账的分支覆盖。**判"用户说了什么"只能看原话**, 所以每条用例都必须传 question;
+    # 不传 question 的旧用例等于在测"拿槽位自证槽位" —— 那个优先级已被推翻并删除。
+    # 区间词先拿 normalize_range 验它真在词表里再拼问句复用: 这个文件里手敲的中文关键字
+    # 一旦被写坏, 用例会"静默走另一条分支"报出看不出原因的假失败(本轮踩过)。
+    rel_word = "本月"
+    assert timesem.normalize_range(rel_word) == "this_month", "区间词字面量已损坏"
+    rel_q = f"{rel_word}报销总额是多少"
+    date_q = "查 2026-09-01 到 2026-09-30 的报销总额"
+    plain_q = "员工报销总额是多少"
+
+    invented = {"metrics": [{"id": "m_expense_total"}],
+                "time": {"range": "this_month", "start": "2026-09-01", "end": "2026-09-30"}}
+    fixed, note = _reconcile_time(invented, {"time": {"phrase": rel_word}}, rel_q)
+    check("用户说相对区间时丢掉模型编的日期",
+          fixed["time"]["start"] == "" and fixed["time"]["end"] == ""
+          and fixed["time"]["range"] == "this_month" and rel_word in note, str(fixed) + repr(note))
+    # 解析后的区间必须是"本月"而不是上个月
+    bounds = timesem.resolve(fixed["time"])
+    check("修完后的区间真的从本月起算",
+          bounds.token == "this_month" and bounds.start.month == timesem.today_cst().month,
+          bounds.label)
+    said_dates, note2 = _reconcile_time(invented, {"time": {"phrase": "2026-09-01 到 2026-09-30"}}, date_q)
+    check("原话写着日期时去掉碰巧并存的区间词",
+          said_dates["time"]["range"] == "" and said_dates["time"]["start"] == "2026-09-01"
+          and "具体日期" in note2, str(said_dates) + "|note=" + repr(note2))
+    only_one, note3 = _reconcile_time({"time": {"range": "this_year"}}, {"time": {"phrase": "今年"}})
+    check("只给了一种时不动也不说明", only_one["time"] == {"range": "this_year"} and note3 == "", str(only_one))
+    # 最阴的一种: 模型只给硬日期不给区间词(无 token 可对比) —— 对账逻辑一开始漏了这条分支
+    dates_only = {"metrics": [{"id": "m_expense_total"}],
+                  "time": {"start": "2026-09-01", "end": "2026-10-01", "granularity": "month"}}
+    fixed2, note4 = _reconcile_time(dates_only, {"time": {"phrase": ""}}, rel_q)
+    check("只给硬日期时也会改回相对区间",
+          fixed2["time"].get("range") == "this_month" and fixed2["time"]["start"] == ""
+          and fixed2["time"]["end"] == "" and note4, str(fixed2) + "|note=" + repr(note4))
+    real_dates, note5 = _reconcile_time(dates_only, {"time": {"phrase": ""}}, date_q)
+    check("用户真只说日期时不推翻", real_dates["time"]["start"] == "2026-09-01" and note5 == "",
+          str(real_dates) + "|note=" + repr(note5))
+    # 拿槽位里的 phrase 当依据会被模型自己错的日期自证(本轮实测到的真因)
+    both = {"metrics": [{"id": "m_expense_total"}],
+            "time": {"range": "this_month", "start": "2026-09-01", "end": "2026-09-30"}}
+    polluted, note6 = _reconcile_time(both, {"time": {"phrase": "2026-09-01~2026-09-30"}}, rel_q)
+    check("槽位 phrase 被模型填成日期时仍以原话为准",
+          polluted["time"]["range"] == "this_month" and polluted["time"]["start"] == ""
+          and bool(note6), str(polluted) + "|note=" + repr(note6))
+    said_in_q, note7 = _reconcile_time(both, {"time": {"phrase": rel_word}}, date_q)
+    check("原话真说了日期时保留日期、去掉区间词",
+          said_in_q["time"]["range"] == "" and said_in_q["time"]["start"] == "2026-09-01"
+          and bool(note7), str(said_in_q) + "|note=" + repr(note7))
+    # 三条判据都拿不到证据时必须返原样而不是 None(返 None 会让调用方解包直接报 TypeError)
+    no_evidence, note8 = _reconcile_time(both, {"time": {"phrase": ""}}, plain_q)
+    check("无证据时不动且返回形状正确",
+          note8 == "" and no_evidence["time"]["range"] == "this_month"
+          and no_evidence["time"]["start"] == "2026-09-01",
+          str(no_evidence) + "|note=" + repr(note8))
+
+    # ⑭ 展示区间由定稿 DSL 现算(实测过: DSL 对而展示块错, 两者分叉就是"数与区间不同事")
+    from app.agents.askdata_agent.graph import _display_range
+
+    shown = _display_range({"time": {"range": "this_month"}, "compare": {"type": "mom"}},
+                           {"range": "custom", "start": "2026-09-01", "end": "2026-10-01"})
+    check("展示区间跟着定稿 DSL 而不是旧回执",
+          shown.get("range") == "this_month" and "custom" not in str(shown.get("range")), str(shown))
+    check("展示区间的环比对比期也算的是本月",
+          str(shown.get("compare") or "mom") != "" and shown.get("prev_start"), str(shown))
+    backoff = _display_range({"time": {}}, {"range": "this_year"})
+    check("拿不到 DSL 时间时退回回执不阻断", backoff == {"range": "this_year"}, str(backoff))
+    # 今天信息必须每次调用现算(写成模块常量会在 import 时定住日期, 长进程里每天错一天)
+    anchor_a = prompts_today()
+    check("今天提示含当前日期且不是一次性常量",
+          timesem.today_cst().isoformat() in anchor_a and anchor_a.startswith("今天"), anchor_a[:60])
+
+    # ⑬ 模型私自加的过滤条件会被拦(本轮实测: 问"本月报销总额", DSL 里多了员工=张伟)
+    from app.agents.askdata_agent.graph import _drop_invented_filters
+
+    hijacked = {"metrics": [{"id": "m_expense_total"}],
+                "time": {"range": "this_month"},
+                "filters": [{"dim": "d_expense_employee_name", "op": "eq", "value": "张伟"}]}
+    cleaned, dropped = _drop_invented_filters(hijacked, "本月报销总额是多少", [])
+    check("用户没说的过滤被丢弃", dropped == ["d_expense_employee_name=张伟"]
+          and cleaned.get("filters") == [], str(dropped) + str(cleaned))
+    kept, dropped2 = _drop_invented_filters(
+        {"metrics": [{"id": "m_expense_total"}],
+         "filters": [{"dim": "d_expense_status", "op": "eq", "value": "PAID"}]},
+        "本月已打款的报销总额",
+        [{"kind": "enum", "id": "d_expense_status", "value": "PAID", "matched": "已打款"}],
+    )
+    check("枚举反查过的码值过滤不会被误删", not dropped2 and kept["filters"], str(dropped2) + str(kept))
+    said, dropped3 = _drop_invented_filters(
+        {"metrics": [{"id": "m_expense_total"}],
+         "filters": [{"dim": "d_expense_department", "op": "eq", "value": "研发部"}]},
+        "本月研发部的报销总额", [],
+    )
+    check("用户真说了的范围保留", not dropped3 and said["filters"], str(dropped3))
+    multi, dropped4 = _drop_invented_filters(
+        {"metrics": [{"id": "m_expense_total"}],
+         "filters": [{"dim": "d_expense_category", "op": "in",
+                      "value": ["差旅费", "保密费"]}]},
+        "本月差旅费的报销总额", [],
+    )
+    check("in 列表里有来处就整条保留", not dropped4 and multi["filters"], str(dropped4))
+    nulls, dropped5 = _drop_invented_filters(
+        {"metrics": [{"id": "m_expense_total"}],
+         "filters": [{"dim": "d_supplier_name", "op": "is_null", "value": None}]},
+        "本月报销总额", [],
+    )
+    check("is_null 不参与来处判定", not dropped5 and nulls["filters"], str(dropped5))
 
 
 def main() -> int:
@@ -1183,7 +1455,9 @@ def main() -> int:
     test_semantic_layer_extensions()
     test_orchestration_extensions()
     test_rival_gap()
+    test_sandbox_governance()
     test_v3_second_round()
+    test_forward_windows_and_aliases()
     print(f"\n合计: PASS={PASS} FAIL={FAIL}")
     return 1 if FAIL else 0
 

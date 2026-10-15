@@ -32,6 +32,11 @@ ALLOWED = {
     "proc_suppliers",
 }
 
+# 沙箱可查面与生产同源(不手抄一份名单: 视图改名后这里不跟着改就会"测过但跑不通")。
+from app.db.analytics_views import sandbox_view_names  # noqa: E402
+
+VIEWS = sandbox_view_names()
+
 _results: list[tuple[bool, str, str]] = []
 
 
@@ -53,6 +58,26 @@ def denied(name: str, sql: str, mode: str = READ_MODE) -> None:
 def allowed(name: str, sql: str, mode: str = READ_MODE) -> str:
     try:
         out = validate_sql(sql, allowed_tables=ALLOWED, mode=mode)
+    except ASTGuardError as exc:
+        check(name, False, f"被误杀: {exc}")
+        return ""
+    check(name, True)
+    return out
+
+
+def sandbox_denied(name: str, sql: str, **kwargs) -> None:
+    """沙箱专项护栏的"必须拒"断言(可查面 = 治理视图)。"""
+    try:
+        out = validate_sql(sql, allowed_tables=VIEWS, mode=READ_MODE, **kwargs)
+    except ASTGuardError:
+        check(name, True)
+        return
+    check(name, False, f"竟被放行 -> {out[:120]}")
+
+
+def sandbox_allowed(name: str, sql: str, **kwargs) -> str:
+    try:
+        out = validate_sql(sql, allowed_tables=VIEWS, mode=READ_MODE, **kwargs)
     except ASTGuardError as exc:
         check(name, False, f"被误杀: {exc}")
         return ""
@@ -173,6 +198,96 @@ def main() -> int:
         "写模式根类型判定不放过未知通道",
         _unknown_channel_denied(),
     )
+
+    # ---- 11. 沙箱专项护栏(越权 + 资源)----
+    # 这一组只服务于"模型直出自由 SQL"那一级: 默认全关, 下面最后两条兼容性断言把
+    # "没传新参就与改造前逐字一致"钉住 —— 编译器产物与 analytics 路径不应该被误杀。
+    sandbox_denied("基表不在沙箱可查面(只能碰视图)", "SELECT emp_id FROM hr_employees")
+    sandbox_allowed(
+        "带 ON 的两视图 JOIN",
+        "SELECT r.amount, e.name FROM v_analytics_reimbursements r "
+        "JOIN v_analytics_employees e ON r.emp_id = e.emp_id",
+        reject_cartesian=True, max_joins=5,
+    )
+    sandbox_denied(
+        "笛卡尔: CROSS JOIN",
+        "SELECT r.amount FROM v_analytics_reimbursements r CROSS JOIN v_analytics_employees e",
+        reject_cartesian=True,
+    )
+    sandbox_denied(
+        "笛卡尔: 隐式逗号多表",
+        "SELECT r.amount FROM v_analytics_reimbursements r, v_analytics_employees e",
+        reject_cartesian=True,
+    )
+    sandbox_denied(
+        "笛卡尔: JOIN 不写 ON",
+        "SELECT r.amount FROM v_analytics_reimbursements r JOIN v_analytics_employees e",
+        reject_cartesian=True,
+    )
+    sandbox_denied(
+        "笛卡尔: ON 1=1(有子句但永真)",
+        "SELECT r.amount FROM v_analytics_reimbursements r "
+        "JOIN v_analytics_employees e ON 1 = 1",
+        reject_cartesian=True,
+    )
+    sandbox_allowed(
+        "USING 也算关联条件",
+        "SELECT emp_id FROM v_analytics_reimbursements r "
+        "JOIN v_analytics_tickets t USING (emp_id)",
+        reject_cartesian=True, max_joins=5,
+    )
+    sandbox_denied(
+        "JOIN 数超上限(6 张视图)", _SIX_VIEW_JOIN, reject_cartesian=True, max_joins=5,
+    )
+    sandbox_allowed(
+        "JOIN 数在上限内(5 张视图)", _FIVE_VIEW_JOIN, reject_cartesian=True, max_joins=5,
+    )
+    # 上限只数真实关系: 把 CTE 别名也算进去会让"两个视图 + 几个中间步骤"的写法全被误杀。
+    sandbox_allowed(
+        "CTE 别名不计入 JOIN 数",
+        "WITH s1 AS (SELECT emp_id FROM v_analytics_employees), "
+        "s2 AS (SELECT emp_id FROM v_analytics_tickets) "
+        "SELECT COUNT(*) FROM s1 JOIN s2 ON s1.emp_id = s2.emp_id",
+        reject_cartesian=True, max_joins=2,
+    )
+    sandbox_denied(
+        "敏感列: 点名引用",
+        "SELECT annual_leave_used FROM v_analytics_employees",
+        denied_columns={"annual_leave_used"},
+    )
+    sandbox_denied(
+        "敏感列: 出现在 WHERE 也要拒",
+        "SELECT emp_id FROM v_analytics_employees WHERE annual_leave_used > 5",
+        denied_columns={"annual_leave_used"},
+    )
+    sandbox_allowed(
+        "同一视图不含敏感列仍放行",
+        "SELECT department FROM v_analytics_employees",
+        denied_columns={"annual_leave_used"},
+    )
+    sandbox_denied(
+        "敏感列生效时拒星号投影",
+        "SELECT * FROM v_analytics_employees",
+        denied_columns={"annual_leave_used"}, deny_star_projection=True,
+    )
+    sandbox_allowed(
+        "COUNT(*) 的星号不是投影",
+        "SELECT COUNT(*) FROM v_analytics_employees",
+        denied_columns={"annual_leave_used"}, deny_star_projection=True,
+    )
+    sandbox_allowed(
+        "视图面默认不拒 SELECT *(仅退回基表时才拒)",
+        "SELECT * FROM v_analytics_employees",
+        denied_columns={"annual_leave_used"},
+    )
+    check("系统表即使误加进白名单也拒", _pg_relation_in_whitelist_denied())
+
+    # 兼容性: 新护栏必须"不传就等于没有"(旧路径逐字不变)。
+    allowed("兼容: 未开护栏时逗号连接仍按旧行为放行",
+            "SELECT r.amount FROM fin_reimbursements r, hr_employees e")
+    allowed("兼容: 未开护栏时敏感列与星号都不拦",
+            "SELECT * FROM hr_employees")
+
     passed = sum(1 for ok, _, _ in _results if ok)
     print(f"\n{passed}/{len(_results)} 通过")
     return 0 if passed == len(_results) else 1
@@ -185,6 +300,27 @@ def _unknown_channel_denied() -> bool:
     except ASTGuardError:
         return True
     return False
+
+
+def _pg_relation_in_whitelist_denied() -> bool:
+    """``pg_`` 前缀必须无条件拒: 不能把安全性交给"没人误把系统表加进白名单"这个假设。"""
+    try:
+        validate_sql("SELECT usename FROM pg_user", allowed_tables={"pg_user"})
+    except ASTGuardError:
+        return True
+    return False
+
+
+_SIX_VIEW_JOIN = (
+    "SELECT x0.emp_id FROM v_analytics_employees x0 "
+    "JOIN v_analytics_tickets x1 ON x1.emp_id = x0.emp_id "
+    "JOIN v_analytics_leave_records x2 ON x2.emp_id = x0.emp_id "
+    "JOIN v_analytics_reimbursements x3 ON x3.emp_id = x0.emp_id "
+    "JOIN v_analytics_purchase_orders x4 ON x4.emp_id = x0.emp_id "
+    "JOIN v_analytics_contracts x5 ON x5.status = x0.status"
+)
+
+_FIVE_VIEW_JOIN = _SIX_VIEW_JOIN.split("JOIN v_analytics_contracts")[0].rstrip()
 
 
 if __name__ == "__main__":

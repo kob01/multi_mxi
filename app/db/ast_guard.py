@@ -11,7 +11,13 @@
 2. 语句类型: 只读通道只许 SELECT/WITH...SELECT; 写通道只许 UPDATE/DELETE/INSERT,
    DDL(DROP/TRUNCATE/ALTER/CREATE)与命令(COPY/VACUUM/CALL/DO/GRANT...)一律拒;
 3. 表白名单: 遍历所有表引用(含 JOIN、子查询、CTE 引用), 不在授权名单即拒;
-   schema 限定名只允许 public(挡住 information_schema / pg_catalog);
+   schema 限定名只允许 public(挡住 information_schema / pg_catalog), ``pg_`` 开头的
+   关系名额外无条件拒(双保险: 防哪天有人把系统表误加进白名单);
+3b. 敏感列黑名单(沙箱专用): 引用到调用角色被禁的列即拒; 带此约束时还拒 ``SELECT *``
+    投影(不点名列就无从判定, 而 ``COUNT(*)`` 里的星号不是投影, 不受影响);
+3c. 笛卡尔连接与 JOIN 数上限(沙箱专用): CROSS / 无 ON(USING) / 隐式逗号多表都按
+    笛卡尔积拒, 引用关系数超上限拒 —— 这两条**不依赖统计信息**,
+    补的是 EXPLAIN 预估在统计过期时会低估的那一类资源风险;
 4. 域谓词强制(写通道): WHERE 里必须存在 ``tenant_id = :scope_tenant`` 与
    ``dept_id = ANY(string_to_array(:scope_depts, ','))``, 且右侧必须是那个绑参占位符 ——
    字面量伪造一律拒;
@@ -25,6 +31,8 @@
 
 边界: 本模块**不是**权限防线。真正兜底的是层 1 的 RLS 与最小权限角色 —— 这里放过一条
 语句, 数据库仍然只会返回作用域内的行; 反过来这里拒一条语句, 也只是"不让它跑"。
+3b/3c 两组新校验默认全关(不传参与改造前逐字一致), 只由智能问数的沙箱那一级按需开启:
+编译器产物与 analytics 自由 SQL 不应该被"问数的列治理"与"JOIN 预算"反向误杀。
 """
 
 from __future__ import annotations
@@ -225,12 +233,80 @@ def _collect_tables(root: exp.Expression, allowed_tables: set[str]) -> set[str]:
             continue
         if schema not in _ALLOWED_SCHEMAS:
             raise ASTGuardError(f"不允许访问 schema {schema!r} 下的表 {name}")
+        # pg_ 前缀无条件拒: schema 白名单已经能挡住 pg_catalog, 但裸写的 pg_user 这类
+        # 只靠"不在白名单里"拒 —— 那等于把安全性交给"没人误加白名单"这个假设。
+        if name.startswith("pg_"):
+            raise ASTGuardError(f"不允许访问系统目录关系 {name}")
         if name not in allowed_tables:
             raise ASTGuardError(
                 f"仅允许查询业务白名单表 {sorted(allowed_tables)}, 非法表: {name}"
             )
         tables.add(name)
     return tables
+
+
+def _has_star_projection(root: exp.Expression) -> bool:
+    """是否存在**投影位置**上的 ``*`` / ``t.*``(包括 CTE 与子查询里的那一层)。
+
+    为什么要单独判形状而不是见到 exp.Star 就拒: ``COUNT(*)`` 是全仓最高频的合法写法,
+    它的星号是聚合的参数而不是投影。不点名列就没法判"这一列是不是敏感的",
+    所以带敏感列约束时必须让它点名(比放过一个 * 更便宜)。
+    """
+    selects = [node for node in [root, *root.find_all(exp.Select)] if isinstance(node, exp.Select)]
+    for select in selects:
+        for item in select.expressions:
+            if isinstance(item, exp.Star):
+                return True
+            if isinstance(item, exp.Column) and isinstance(item.this, exp.Star):
+                return True
+    return False
+
+
+def _check_denied_columns(
+    root: exp.Expression, denied_columns: set[str], *, deny_star_projection: bool,
+) -> None:
+    """3b: 引用到被禁列即拒(沙箱专用; 值只来自语义层 col_policies, 不看模型自报)。"""
+    needles = {str(c or "").strip().lower() for c in denied_columns if str(c or "").strip()}
+    if not needles:
+        return
+    if deny_star_projection and _has_star_projection(root):
+        hit = ", ".join(sorted(needles))
+        raise ASTGuardError(
+            f"本角色不能读敏感列({hit}), 因此不允许 SELECT * 投影; 请点名需要的列"
+        )
+    bad = sorted({
+        str(node.name or "").lower()
+        for node in root.find_all(exp.Column)
+        if str(node.name or "").lower() in needles
+    })
+    if bad:
+        raise ASTGuardError(f"列 {', '.join(bad)} 对当前角色不开放")
+
+
+def _find_cartesian(root: exp.Expression) -> str:
+    """3c: 找出第一处笛卡尔形状(没找到返空串)。
+
+    为什么不能只靠 EXPLAIN 的预估扫描行数: 它读的是统计信息, 统计缺失或过期时会把
+    笛卡尔积低估成"很便宜"。结构判定不依赖任何统计, 是这类风险里确定性最高的那一刀。
+
+    sqlglot 把 ``FROM a, b``(隐式逗号连接)与 ``JOIN b``(不写 ON)归成同一个形状:
+    既无 ``on`` 也无 ``using``; ``CROSS JOIN`` 则带 kind=CROSS。三种一并拒。
+    ``ON 1=1`` 这种"有 ON 但永真"也算笛卡尔: 只看"有没有 on 这个子句"会漏掉它,
+    而它恰恰是模型被注入后最便宜的绕过形状。
+    """
+    for join in root.find_all(exp.Join):
+        kind = str(join.args.get("kind") or "").lower()
+        target = join.this.sql(dialect="postgres")[:60] if join.this is not None else "?"
+        if kind == "cross":
+            return f"CROSS JOIN {target}(笛卡尔积)"
+        on = join.args.get("on")
+        # 注意取的是 on 本体而不是 on.this: sqlglot 把 Join 的 ON 直接存成条件表达式
+        # (EQ/And), 不像 WHERE 那样包 exp.Where —— 拿错一层就是"看了个常量字面量"。
+        if on is not None and _has_tautological_term(on):
+            return f"JOIN {target} 的 ON 是恒真条件(等价笛卡尔积)"
+        if on is None and not join.args.get("using"):
+            return f"JOIN {target} 缺少 ON/USING(等价笛卡尔积)"
+    return ""
 
 
 def validate_sql(
@@ -240,6 +316,10 @@ def validate_sql(
     mode: str = READ_MODE,
     max_rows: int | None = None,
     normalize: bool = True,
+    denied_columns: set[str] | None = None,
+    deny_star_projection: bool = False,
+    max_joins: int | None = None,
+    reject_cartesian: bool = False,
 ) -> str:
     """校验一条 SQL; 默认返回**重新生成**的可执行文本(已按通道施加行数上限)。
 
@@ -248,6 +328,9 @@ def validate_sql(
     ``normalize=False`` 只用于写模板自校验: sqlglot 的 postgres 方言会把 ``:name``
     占位符重写成 ``%(name)s``, 而 SQLAlchemy 的 ``text()`` 只认 ``:name`` —— 那种场合
     执行服务端自己写的模板文本, 不要让重写过的文本进绑参通道。
+
+    后四个参数是沙箱(模型直出自由 SQL)专用的附加护栏, 默认全关以保证已有的
+    编译器自校验与 analytics 路径行为逐字不变。
     """
     raw = (sql or "").strip().rstrip(";").strip()
     if not raw:
@@ -283,8 +366,26 @@ def validate_sql(
     else:  # 未知通道: 默认拒(不是默认放行)
         raise ASTGuardError(f"未知校验通道: {mode}")
 
-    # 3. 表白名单(含 JOIN/子查询/CTE 引用)。
-    _collect_tables(root, allowed_tables)
+    # 3. 表白名单(含 JOIN/子查询/CTE 引用); 返回的引用集合同时用作 3c 的 JOIN 计数。
+    referenced = _collect_tables(root, allowed_tables)
+
+    # 3b. 敏感列黑名单(只读通道且调用方传了才生效)。
+    if mode == READ_MODE and denied_columns:
+        _check_denied_columns(
+            root, set(denied_columns), deny_star_projection=bool(deny_star_projection),
+        )
+
+    # 3c. 资源形状护栏: 笛卡尔连接与 JOIN 数上限(同样不依赖统计信息)。
+    if mode == READ_MODE:
+        if reject_cartesian:
+            cartesian = _find_cartesian(root)
+            if cartesian:
+                raise ASTGuardError(f"已拒 {cartesian}; 请给出表与表之间的关联条件")
+        if max_joins is not None and int(max_joins) > 0 and len(referenced) > int(max_joins):
+            raise ASTGuardError(
+                f"本次查询引用 {len(referenced)} 张表/视图, 超过上限 {int(max_joins)}: "
+                "多表交叉的风险远大于收益, 请缩小到口径明确的那几张"
+            )
 
     # 6. 函数黑名单 + 7. 十六进制/CHR 拼接字面量。
     functions = _iter_function_names(root)

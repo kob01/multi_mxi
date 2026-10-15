@@ -14,7 +14,28 @@ from __future__ import annotations
 
 from app.security.spotlight import NOTICE_TEXT
 
+def today_anchor() -> str:
+    """一句"今天是几号"(每次调用现算, 不能写在模块常量里)。
+
+    为什么要给: 不告诉模型今天, 它一旦去填 `start/end` 就只能猜一个对自己合理的月份
+    (本轮实测拿到过 `range=this_month` + `2026-09-01~09-30`, 而当时已是 10 月)。
+    给了这一句后它至少能算对; 真算错了也不要紧 —— 相对区间以词表为准,
+    模型编的日期会被 :func:`app.agents.askdata_agent.graph._reconcile_time` 丢掉。
+    写成函数而不是 f-string 常量: 常量会在 import 时定住日期, 长进程里每天错一天
+    (表现为"月初那几天时间全错")。
+    """
+    from app.semantic import timesem
+
+    day = timesem.today_cst()
+    weekday = "一二三四五六日"[day.weekday()]
+    return (f"今天(服务端日历): {day.isoformat()} 星期{weekday}。"
+            "相对时间一律用区间词填(本月/今年/近30天...), 不要自己换算成日期;"
+            "只有用户明说了具体日期时才填 start/end。")
+
+
 SLOT_PROMPT = """你在为"智能问数"抽取查询槽位。用户看到的是企业内部的报销/预算/工单/请假/采购/合同数据。
+
+{today}
 
 本轮用户原话:
 {question}
@@ -62,6 +83,8 @@ def dsl_prompt(*, question: str, slots: str, candidates: str, schema_hint: str,
     tail = f"\n\n上一次尝试被拒, 拒因: {error_hint}\n请只修正被拒的部分, 不要改动用户已经明确的口径。" if error_hint else ""
     return f"""把下面这份"问数槽位"编成受约束的查询 DSL(JSON), 只输出 JSON。
 
+{today_anchor()}
+
 用户原话:
 {question}
 
@@ -93,6 +116,8 @@ def dsl_prompt(*, question: str, slots: str, candidates: str, schema_hint: str,
 5. order_hint "前 10 名/从高到低" 这类说法翻成 order_by 与 limit; 没有就别写。
 6. time.granularity 只在用户明说"趋势/按月/按天/各月/逐周"这类意思时才填; 问"是多少"
    就是**一个聚合值**, 把 granularity 留空(画蛇添足地按年拆开会让用户拿到一张表而不是一个数)。
+   **按部门/类别/状态下钻不等于要按时间展开**: 那是 dims 的事, 与 granularity 无关;
+   两者同时给会把一个数变成"粒度×分组"的多行。
 7. "归因/预测"类问题本期不支持自动算: 把它按"取数"编出用户真正要的那个数, 不要虚构预测值。
 8. 上面相似例子只是口径参考: 它们用的指标 id 如果没出现在本轮候选里, 就不能用。
 9. **指标名里已经含的限定不要重复写成 filters**: 比如"一般纳税人供应商数"这个口径本身已包含

@@ -23,6 +23,13 @@ const routes = [
     name: "dataops",
     component: () => import("./views/DataOpsView.vue"),
   },
+  {
+    // 问数治理看板(运行指标/告警线/工单/样本队列/评测集与语义缓存复用批准)。
+    // 入口对谁可见只是体验层: 每个接口都服务端重查角色(能跨全员看数 = 能看全员问数记录)。
+    path: "/askdata",
+    name: "askdata-ops",
+    component: () => import("./views/AskDataOpsView.vue"),
+  },
 ];
 
 export default createRouter({

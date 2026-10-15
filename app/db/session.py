@@ -310,6 +310,7 @@ async def init_schema() -> None:
 
     # 作用域回填与策略/角色建立(内部各自幂等; rls_enabled=false 时只回填不碰策略)。
     from app.db.rls import (
+        ensure_analytics_views,
         ensure_audit_immutability,
         ensure_db_principals,
         ensure_rls_policies,
@@ -320,6 +321,9 @@ async def init_schema() -> None:
     if get_settings().rls_enabled:
         await ensure_db_principals()
         await ensure_rls_policies()
+    # 沙箱治理视图不跟着 rls_enabled 一起关: 它是"列可达面"这一层的载体, 与行隔离开关无关;
+    # 但必须排在策略之后(视图靠 security_invoker 继承基表的行级安全)。
+    await ensure_analytics_views()
     # 审计不可变性不跟着 RLS 一起关: 它是层 6 的地基, 与隔离开关无关。
     await ensure_audit_immutability()
 

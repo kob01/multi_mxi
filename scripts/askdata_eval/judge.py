@@ -147,6 +147,51 @@ def _parse(text: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _effective_granularity(time_block: dict[str, Any]) -> str:
+    """时间粒度: 只保留**真的会把区间拆开**的粒度。
+
+    为什么不算"写法差异": 用户说"今年同比去年怎么样", 模型写成 granularity=year 与留空
+    得的是同一个数(一个年度一个桶), EX 也两边都过; 拿它判"DSL 不同"只会把尺子噪声
+    当能力差距(本轮实测: 17 条 DSL-EM 差异全部是这一个原因, 且 17 条 EX 均通过)。
+    判"会不会拆开"靠 timesem 自己算边界(与取数同一口径), 而不是在这重算一套日历;
+    解不出来(时间槽不合法/无区间)时**保守保留原粒度** —— 宁可多判一条不等。
+    """
+    raw = str(time_block.get("granularity") or "")
+    if raw in ("", "none"):
+        return ""
+    try:
+        from app.semantic import timesem
+
+        resolved = timesem.resolve({
+            "range": str(time_block.get("range") or ""),
+            "granularity": raw,
+            "start": str(time_block.get("start") or ""),
+            "end": str(time_block.get("end") or ""),
+        })
+        if resolved.whole or resolved.start is None or resolved.end is None:
+            return raw
+        span = max(1, (resolved.end - resolved.start).days)
+        if raw == "day":
+            buckets = span
+        elif raw == "week":
+            buckets = max(1, (span + 6) // 7)
+        elif raw == "month":
+            buckets = max(1, (resolved.end.year - resolved.start.year) * 12
+                          + (resolved.end.month - resolved.start.month) + 1)
+        elif raw == "quarter":
+            buckets = max(1, (resolved.end.year - resolved.start.year) * 4
+                          + ((resolved.end.month - 1) // 3) - ((resolved.start.month - 1) // 3) + 1)
+        elif raw == "year":
+            buckets = max(1, resolved.end.year - resolved.start.year + 1)
+        else:
+            return raw
+    except Exception as exc:  # noqa: BLE001 - 判不了就当不同(保守), 不能拖碎整个评测
+        logger.debug("[askdata-eval] 粒度等价判定跳过: %s", str(exc)[:120])
+        return raw
+    # 一个桶 = 与"不按时序展开"完全等价; 两个桶以上就是真的把结果拆开了, 必须算不同。
+    return "" if buckets <= 1 else raw
+
+
 def _canonical_dsl(dsl: dict[str, Any]) -> dict[str, Any]:
     """DSL 的语义核(指标 id/维度/时间/过滤/对比), 用于 DSL-EM。
 
@@ -154,7 +199,9 @@ def _canonical_dsl(dsl: dict[str, Any]) -> dict[str, Any]:
     - ``limit``/``order_by``: 不影响"哪个口径按什么维度算", golden 是人工标的;
     - 聚合覆盖 ``agg``: 不写就用语义层默认聚合, 写错会直接反映在结果集上(EX 抓住),
       拿它参与严格匹配只会带来"期望不写 agg 而模型写了默认值"这种噪声;
-    - ``granularity`` 的 "none" 与 "": 同一个意思("没指定粒度"), 必须归一。
+    - ``granularity`` 的 "none" 与 "": 同一个意思("没指定粒度"), 必须归一;
+      进一步, **只落到一个桶的粒度**与"不展开"等价(:func:`_effective_granularity`),
+      否则会把 17 条语义等价的写法差异当成能力差距报。
 
     集合类字段全部排序: 否则"同一份意图不同写法"会被算不同。
     """
@@ -165,7 +212,6 @@ def _canonical_dsl(dsl: dict[str, Any]) -> dict[str, Any]:
         for item in (dsl.get("metrics") or []) if isinstance(item, dict) and item.get("id")
     )
     time_block = dsl.get("time") or {}
-    granularity = str(time_block.get("granularity") or "")
     filters = sorted(
         f"{item.get('dim')}|{item.get('op') or 'eq'}|{json.dumps(item.get('value'), ensure_ascii=False, default=str)}"
         for item in (dsl.get("filters") or []) if isinstance(item, dict) and item.get("dim")
@@ -177,7 +223,7 @@ def _canonical_dsl(dsl: dict[str, Any]) -> dict[str, Any]:
         "dims": sorted(str(d) for d in (dsl.get("dims") or [])),
         "time": {
             "range": str(time_block.get("range") or ""),
-            "granularity": "" if granularity in ("", "none") else granularity,
+            "granularity": _effective_granularity(time_block),
             "start": str(time_block.get("start") or ""),
             "end": str(time_block.get("end") or ""),
         },

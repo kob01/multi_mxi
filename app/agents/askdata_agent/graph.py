@@ -32,6 +32,7 @@ from app.config import get_settings
 from app.llm import get_chat_model
 from app.observability import otel
 from app.security.caller import caller_tool_args
+from app.semantic import timesem
 from app.semantic.dsl import DslError, parse_dsl
 from app.semantic.dsl import render_schema_hint
 from app.semantic.resultcache import SEMANTIC_CACHE_MARKER
@@ -164,6 +165,156 @@ _TOPN_RE = re.compile(
     # 时间窗口的"前 3 个月/前 30 天"不是 topN: 这个否定预查必须**紧接在数字后面**
     # (拿 `\s*` 先吃掉空格再预查会被正则回溯绕过, 实测就是这样误把"前 3 个月"当成取前 3 行)。
 )
+
+
+_EXPLICIT_DATE_RE = re.compile(r"\d{4}\s*[-/年]\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}\s*日")
+
+
+def _reconcile_time(dsl: dict[str, Any], slots: dict[str, Any],
+                    question: str = "") -> tuple[dict[str, Any], str]:
+    """相对区间词与显式日期同时出现时, 按**用户实际说了哪种**留一个。
+
+    为什么不沿用"显式日期优先"的默认行为: 本轮实测到模型会交回
+    `{"range": "this_month", "start": "2026-09-01", "end": "2026-09-30"}` —— 用户说的是
+    "本月", 而当时已是 10 月: 提示词里写了可以用 start/end, 但没告诉模型今天是几号,
+    它就只能自己编一个看着合理的月份(golden 里其实一条硬日期都没有, 不是抄示例)。
+    默认行为下这变成一份"口径看着对、区间默错一个月"的空结果, 然后叙述会把错区间再说一遍。
+    拿不定时(原话既没相对词也没日期)保留原有优先级, 交给校验与澄清门。
+
+    返回 ``(新 DSL, 说明)``; 没改动时说明为空串。
+    """
+    time_block = dsl.get("time")
+    if not isinstance(time_block, dict):
+        return dsl, ""
+    token = str(time_block.get("range") or "").strip()
+    start, end = str(time_block.get("start") or ""), str(time_block.get("end") or "")
+    if not (start or end) and token:
+        return dsl, ""      # 只有区间词: 本来就是想要的形状
+    if not (start or end):
+        return dsl, ""
+    phrase = str(((slots or {}).get("time") or {}).get("phrase") or "").strip()
+    # 判"用户说了什么"只能看**原话**: 槽位里的 phrase 也是模型写的, 它会把它算出的日期
+    # 当成"用户说的说法"填回来(本轮实测: 用户说"本月"而 slots.time.phrase="2026-09-01~2026-09-30"),
+    # 拿它当依据就等于是拿模型的错自证模型的错。
+    detected = timesem.detect_phrase(question or "")
+    haystack = detected or phrase
+    out = dict(dsl)
+    new_time = dict(time_block)
+
+    if not token:
+        # 原话里就写着日期: 这是用户自己给的区间, 不动也不说明。
+        # (先判这条再去猜区间词: 否则"2026-09-01 到 2026-10-01"这种句子里碰巧出现了
+        # 词表子串时, 会把用户明写的日期换成一个相对区间 —— 那是另一个方向的错)
+        if _EXPLICIT_DATE_RE.search(question or ""):
+            return dsl, ""
+        # 只有硬日期而用户说的其实是相对区间: 用区间词替掉自己算的日期
+        # (这才是最阴的一种: 没有区间词可供对比, 对账逻辑一开始漏了这条分支,
+        # 导致"本月"被静默算成上个月整月, 而且结果看上去完全自洽)
+        for guess in (detected, phrase):
+            if not guess:
+                continue
+            try:
+                wanted = timesem.normalize_range(guess)
+            except timesem.TimeError:
+                wanted = ""
+            if wanted and wanted != "custom":
+                new_time["range"] = wanted
+                new_time["start"] = ""
+                new_time["end"] = ""
+                out["time"] = new_time
+                return out, (
+                    f"你说的是「{guess}」, 本次按相对区间 {wanted} 算"
+                    f"(模型自己换算的 {start or '?'}~{end or '?'} 已不再使用)"
+                )
+        return dsl, ""
+
+    # 三条判据的**固定优先级**(原话 > 槽位 > 模型自算的日期):
+    # 1. 原话里写着日期 -> 日期赢(去掉碰巧从日期串里猜到的区间词);
+    # 2. 原话里有区间词 -> 区间词赢(删掉模型自己换算的日期);
+    # 3. 两样都没证据 -> 不猜, 交给校验与澄清门。
+    if _EXPLICIT_DATE_RE.search(question or ""):
+        # 用户说的是日期: 删掉模型顺手补的区间词
+        new_time["range"] = ""
+        out["time"] = new_time
+        return out, f"你说了具体日期({start}~{end}), 本次按该区间算(已去掉同时给出的区间词 {token})"
+    if detected:
+        # 用户说的是相对区间("本月/今年/近 30 天"): 删掉跟着的硬日期
+        new_time["start"] = ""
+        new_time["end"] = ""
+        out["time"] = new_time
+        return out, (
+            f"你说的是「{detected}」, 本次按相对区间算; "
+            f"模型同时给出的具体日期 {start or '?'}~{end or '?'} 已丢弃(它们不来自你的原话)"
+        )
+    if phrase and not _EXPLICIT_DATE_RE.search(phrase):
+        # 原话里拿不到证据但槽位给了一个非日期的说法: 拿它试一次, 猜不出就不动
+        try:
+            timesem.normalize_range(phrase)
+        except timesem.TimeError:
+            return dsl, ""
+        new_time["start"] = ""
+        new_time["end"] = ""
+        out["time"] = new_time
+        return out, f"按你说的「{phrase}」算, 模型自己补的日期已丢弃"
+    # 三条判据都没证据: 必须显式返回原样。漏掉这条时函数会隐式返回 None,
+    # 而调用方按 `(dsl, note)` 解包 -> TypeError 把整轮问数直接抬死(测试抓到的真错)。
+    return dsl, ""
+
+
+def _drop_invented_filters(dsl: dict[str, Any], question: str,
+                          candidates: list[dict[str, Any]],
+                          enum_filters: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
+    """丢掉用户根本没说的过滤条件(只允许三种来处: 原话 / 枚举反查 / 语义层命中的取值)。
+
+    为什么必需: 本轮实测到问"本月报销总额是多少"时, DSL 里多了
+    `filters: [d_expense_employee_name = 张伟]` —— 模型把"当前这个人的名字"当成"用户想看的范围"
+    静静加进了查询。结果仍然自洽、仍然能执行, 但**口径已经被换了**: finance 角色本来能看全员,
+    却收到一个只算一个人的总数。这类错不会触发任何校验器(它是合法维度+合法取值),
+    只能靠"取值必须能在输入里找到来处"这道确定判据拦住。
+
+    不误杀合法映射的关键: 枚举型候选(link 己经把"已打款"→PAID 这类映射算好了)与
+    枚举反查结果都进允许集, 所以按码值写的过滤不会被误删。
+
+    返回 ``(新 DSL, 被丢的过滤描述列表)``。
+    """
+    filters = dsl.get("filters")
+    if not isinstance(filters, list) or not filters:
+        return dsl, []
+    haystack = _norm_text(question)
+    allowed: set[str] = set()
+    for item in candidates or []:
+        if isinstance(item, dict) and str(item.get("kind") or "") == "enum":
+            for token in (str(item.get("value") or ""), str(item.get("matched") or "")):
+                if token:
+                    allowed.add(_norm_text(token))
+    for item in (enum_filters or {}).values() if isinstance(enum_filters, dict) else []:
+        for token in ([str(item)] if isinstance(item, (str, int, float)) else
+                      [str(getattr(entry, "value", entry)) for entry in (item or [])]):
+            if token:
+                allowed.add(_norm_text(token))
+
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for filt in filters:
+        if not isinstance(filt, dict):
+            kept.append(filt)
+            continue
+        op = str(filt.get("op") or "eq")
+        if op in ("is_null", "not_null"):
+            kept.append(filt)
+            continue
+        raw_value = filt.get("value")
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        probes = [_norm_text(str(v)) for v in values if str(v or "").strip()]
+        if not probes or any(p in haystack or p in allowed for p in probes):
+            kept.append(filt)
+        else:
+            dropped.append(f"{filt.get('dim')}={raw_value}")
+    if not dropped:
+        return dsl, []
+    out = dict(dsl)
+    out["filters"] = kept
+    return out, dropped
 
 
 def _apply_topn(dsl: dict[str, Any], slots: dict[str, Any], question: str = "") -> dict[str, Any]:
@@ -331,6 +482,7 @@ class AskDataPipeline:
         prior = state.get("prior_slots") or {}
         prior_dsl = state.get("prior_dsl") or {}
         prompt = prompts.SLOT_PROMPT.format(
+            today=prompts.today_anchor(),
             question=state.get("question", ""),
             prior_slots=json.dumps(prior, ensure_ascii=False) if prior else "(无)",
             # 上一轮的 DSL 比裸槽位信息量高: 它带的是最终选定的指标 id 与已确定的过滤条件,
@@ -473,7 +625,7 @@ class AskDataPipeline:
                 reasons.append(f"指标匹配置信 {best:.2f} 低于阈值 {threshold:.2f}")
             if rival is not None and best - rival < gap:
                 reasons.append(f"前两个口径太接近({best:.2f} vs {rival:.2f}), 需要你确认要哪一个")
-        if not _has_time(slots) and not _candidates_are_snapshots(metrics):
+        if not _has_time(slots) and _time_required(metrics):
             reasons.append("没有给出统计区间")
 
         if not reasons:
@@ -496,8 +648,18 @@ class AskDataPipeline:
             # (复用的是口径形状, 用户今年说 3 个部门就不能拿昔年的 5 个答复他)。
             filled = _apply_topn(cached, state.get("prior_slots") or {}, state.get("question", ""))
             filled.pop("_topn_fixed", None)
+            filled, time_note = _reconcile_time(filled, state.get("prior_slots") or {},
+                                                 state.get("question", ""))
+            filled, dropped_filters = _drop_invented_filters(
+                filled, state.get("question", ""), state.get("candidates") or [],
+                state.get("enum_filters"),
+            )
+            reused_notes = [n for n in (time_note,)
+                             if n] + (["复用的意图里带了用户没说的过滤条件, 本轮已丢弃"]
+                                       if dropped_filters else [])
             _track(state, f"DSL 复用缓存({time_ms(started)}ms)")
-            return {"dsl": filled, "error_hint": ""}
+            return {"dsl": filled, "error_hint": "",
+                    "notes": list(state.get("notes") or []) + reused_notes}
         breach = _budget_breach(state)
         if breach:
             return {"budget_reason": breach, "verdict": "", "error_hint": ""}
@@ -529,15 +691,25 @@ class AskDataPipeline:
                     "llm_calls": int(state.get("llm_calls") or 0) + 1,
                     "notes": list(state.get("notes") or [])}
         _track(state, f"DSL 生成完成({time_ms(started)}ms)")
-        filled = _apply_topn(spec.to_payload(), slots, state.get("question", ""))
+        question = state.get("question", "")
+        filled = _apply_topn(spec.to_payload(), slots, question)
         filled.pop("_topn_fixed", None)  # 内部标记不能混进 DSL(校验器只认登记过的字段)
+        filled, time_note = _reconcile_time(filled, slots, question)
+        filled, dropped_filters = _drop_invented_filters(
+            filled, question, candidates, state.get("enum_filters"),
+        )
+        extra_notes = ([time_note] if time_note else []) + (
+            ["本轮丢弃了用户没说的过滤条件: " + ", ".join(dropped_filters)
+             + "(只按你说了的范围算)"] if dropped_filters else []
+        ) + (
+            ["topN 的 N 以用户原话为准(本轮已按原话对齐 order_by 与 limit)"]
+            if filled != spec.to_payload() else []
+        )
         return {
             "dsl": filled, "error_hint": "", "examples": examples,
             "token_cost": int(state.get("token_cost") or 0) + tokens,
             "llm_calls": int(state.get("llm_calls") or 0) + 1,
-            "notes": list(state.get("notes") or [])
-            + (["topN 的 N 以用户原话为准(本轮已按原话对齐 order_by 与 limit)"]
-               if filled != spec.to_payload() else []),
+            "notes": list(state.get("notes") or []) + extra_notes,
         }
 
     async def _few_shot(self, state: AskDataState) -> list[dict[str, Any]]:
@@ -560,14 +732,22 @@ class AskDataPipeline:
             return {"validate_result": {"ok": False, "errors": [
                 {"code": "E_SCHEMA", "message": state.get("error_hint") or "DSL 未生成", "field": ""}
             ], "notices": []}}
+        # 时间对账放在这里而不是只放在 plan 里: 本节点是**三条路径的汇合点**
+        # (DSL 生成 / 语义缓存复用 / 回炉重写都得经过它), 只在 plan 里补一次的话,
+        # 重写环节重新交出的 DSL 会绕过对账(本轮实测: 修完仍拿到"本月=9月整月")。
+        # 对账本身幂等: 已经只剩区间词时进去就是空操作。
+        reconciled, time_note = _reconcile_time(dsl, state.get("slots") or {},
+                                               state.get("question", ""))
+        notes = list(state.get("notes") or [])
+        if time_note:
+            notes = notes + [time_note]
         out = await self._call(
-            "validate_dsl", dsl_json=dsl, trace_id=state.get("trace_id", ""),
+            "validate_dsl", dsl_json=reconciled, trace_id=state.get("trace_id", ""),
         )
         notices = out.get("notices") or []
-        notes = list(state.get("notes", []))
         for notice in notices:
             notes.append(f"[{notice.get('code')}] {notice.get('message')}")
-        return {"validate_result": out, "notes": notes,
+        return {"validate_result": out, "notes": notes, "dsl": reconciled,
                 "semver": out.get("semver") or state.get("semver") or ""}
 
     async def route(self, state: AskDataState) -> dict[str, Any]:
@@ -613,18 +793,23 @@ class AskDataPipeline:
                 "answer": _route_failed_text(attempts, state)}
 
     async def _sandbox(self, state: AskDataState) -> dict[str, Any]:
-        """最后一级: 模型直出 SQL, 只在只读沙箱里跑(白名单表 + 行数 + 扫描量 + RLS)。"""
-        from app.db.schema_docs import ANALYTICS_SCHEMA_DDL
+        """最后一级: 模型直出 SQL, 只在只读沙箱里跑(治理视图 + 行数 + 扫描量 + JOIN/笛卡尔护栏 + RLS)。
+
+        发给模型的是**视图清单而不是基表清单**: 可查面与提示词必须是同一件事。
+        给基表清单会让模型按基表列名写 SQL, 然后在 AST 表白名单那一轮被拒 —— 那种
+        "提示词说可以, 防线说不可以"的矛盾会表现成这一级永远答不出来。
+        """
+        from app.db.schema_docs import ANALYTICS_SANDBOX_VIEW_DDL
 
         question = state.get("question", "")
         dsl = json.dumps(state.get("dsl") or {}, ensure_ascii=False)
         prompt = (
             "只写一条 PostgreSQL 只读 SELECT(或 WITH...SELECT), 只输出 SQL 本身, 不要解释。\n"
             f"要回答的问题: {question}\n已确定的查询意图: {dsl}\n"
-            f"可用表与字段:\n{ANALYTICS_SCHEMA_DDL}\n"
-            "规则: 只查上面列出的表; 不要自己写 tenant_id/dept_id 条件(能读到哪些行由"
-            "服务端行级安全决定); 时间用 created_at 左闭右开; 需要部门就 JOIN hr_employees; "
-            "不要注释、不要分号、不要写第二条语句。"
+            f"可查视图与字段:\n{ANALYTICS_SANDBOX_VIEW_DDL}\n"
+            "规则: 只查上面列出的视图; 不要自己写 tenant_id/dept_id 条件(能读到哪些行由"
+            "服务端行级安全决定); 时间用 created_at 左闭右开; 需要部门就 JOIN v_analytics_employees "
+            "并带上 ON 关联条件; 不要注释、不要分号、不要写第二条语句。"
         )
         try:
             resp = await self._llm.ainvoke(prompt)
@@ -866,7 +1051,13 @@ class AskDataPipeline:
             "route": state.get("route", ""),
             "slots": state.get("slots") or {},
             "dsl": state.get("dsl") or {},
-            "range": (state.get("validate_result") or {}).get("resolved_range") or {},
+            # 展示用的区间**由定稿 DSL 现算**, 不转抄 validate 的回执:
+            # 本轮实测到一个难查的错: 留痕里的 DSL 时间是对的(this_month),
+            # 而给用户看的 range 块却是 custom 2026-09-01~10-01 —— 同一个数与它自己的
+            # 区间标签不一致。转抄中间层回执就会这样: 取数用的是一份, 展示写的是另一份。
+            # 现在只从定稿 DSL 推, 两者不可能再分叉。
+            "range": _display_range(state.get("dsl") or {},
+                                    (state.get("validate_result") or {}).get("resolved_range") or {}),
             "columns": list(result.get("columns") or []),
             "column_labels": result.get("column_labels") or {},
             "rows": (result.get("rows") or [])[:50],
@@ -1192,6 +1383,24 @@ def _candidates_are_snapshots(metrics: list[dict[str, Any]]) -> bool:
     if not metrics:
         return False
     return all(m.get("time_aware") is False for m in metrics)
+
+
+def _time_required(metrics: list[dict[str, Any]]) -> bool:
+    """本轮是否真的还欠一个统计区间 —— 按**会被选中的那个口径**判, 不按全部候选判。
+
+    为什么不是"全部候选都是快照才免": 本轮实测 6 条错在这上面 ——
+    问"年假余额合计是多少"时 top1 是年度快照指标(库里没有时间列), 但候选里还混着
+    "年假天数"(按审批时间统计)。拿全体取"与"得出的结论是"缺统计区间", 而对用户来说
+    这个追问根本无法回答(他选的口径就没有区间可言)。
+    真选错了怎么办: 模型若最后挑了一个需要时间的口径, 校验器的 E_TIME_INVALID 会确定性
+    拦下并回炉 —— 那条路比"对快照指标喷一句没意义的追问"便宜。
+    """
+    if not metrics:
+        return True
+    top = metrics[0]
+    if top.get("time_aware") is False:
+        return False
+    return not _candidates_are_snapshots(metrics)
 
 
 def _prune_invented_terms(slots: dict[str, Any], question: str) -> dict[str, Any]:
@@ -1520,6 +1729,27 @@ def _chart_shape(
         return {"kind": "line", "cats": cats, "series": None,
                 "values": [r.get(primary) for r in head]}
     return {"kind": kind, "cats": cats, "series": series, "values": None}
+
+
+def _display_range(dsl: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    """给人看的统计区间: 只由定稿 DSL 的时间块现算。
+
+    为什么不只信上游回执: 回执可能是另一份 DSL(回炉前的、或槽位里的模型自算日期)算出来的,
+    那会让"表里的数"与"开头那句统计区间"讲的是两件不同的事 —— 用户看不出来, 只会拿着
+    错区间的结论去汇报。拿不到合法 DSL 时间时退回原回执(不阻断本轮)。
+    """
+    time_block = dsl.get("time")
+    if not isinstance(time_block, dict) or not (time_block.get("range") or time_block.get("start")):
+        return fallback
+    compare = dsl.get("compare")
+    compare_type = str(compare.get("type") or "none") if isinstance(compare, dict) else str(compare or "none")
+    try:
+        resolved = timesem.resolve(time_block, compare=compare_type)
+    except Exception as exc:  # noqa: BLE001 - 展示层不该把已算好的数抖掉
+        logger.debug("[askdata] 展示区间现算失败, 退回回执: %s", str(exc)[:120])
+        return fallback
+    payload = resolved.to_payload()
+    return payload
 
 
 def _route_failed_text(attempts: list[dict[str, Any]], state: AskDataState) -> str:

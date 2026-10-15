@@ -422,11 +422,15 @@ def _query_enum_values(dim: Dimension, scope: Any) -> list[str]:
     if scope is None:
         return []
     table, column, select_col, join = _enum_shape(dim)
+    # 空串判断必须**先转 text**: `year <> ''` 对 integer 列是非法表达式
+    # (psycopg: invalid input syntax for type integer: ""), 而预算年度/采购预算年度
+    # 这类整型维一度因此永远进不了"动态取值"这一路 —— 只留一条 WARNING, 表现为
+    # "换了个年份说法就不认识", 不报错也不好用。::text 对文本列无副作用。
     sql = (
         f"SELECT DISTINCT {select_col} AS v FROM {table} dx "
         + (f"{join} " if join else "")
         + f"WHERE {scope.scope_clause('dx')} AND {select_col} IS NOT NULL "
-        f"AND {select_col} <> '' LIMIT {MAX_ENUM_VALUES}"
+        f"AND COALESCE({select_col}::text, '') <> '' LIMIT {MAX_ENUM_VALUES}"
     )
     checked = validate_sql(sql, allowed_tables=_allowed(), mode=READ_MODE, normalize=False)
     payload, _scan = dbsync.execute_scoped_select(

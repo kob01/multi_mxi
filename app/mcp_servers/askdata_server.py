@@ -33,6 +33,7 @@ from app.analytics import charts, store
 from app.config import get_settings
 from app.db import dataops
 from app.db import sync as dbsync
+from app.db.analytics_views import SANDBOX_VIEW_SPECS, sandbox_view_names
 from app.db.ast_guard import ASTGuardError, READ_MODE, validate_sql
 from app.db.rls import read_role
 from app.db.scope import DataScope, ScopeError, resolve_scope_sync
@@ -64,6 +65,39 @@ def _allowed_tables() -> set[str]:
 
         _ALLOWED_TABLES = set(ALLOWED_TABLES)
     return _ALLOWED_TABLES
+
+
+def _sandbox_allowed_tables() -> set[str]:
+    """沙箱可查面: 默认只给治理视图, 配置退回时才给基表白名单。
+
+    与编译器用不同两个面是刻意的: 编译器产物引用基表(口径由服务端模板与列策略管),
+    而模型自由 SQL 只能碰"已经把机密列拿掉"的那一份投影。用 ``use_views=false`` 退回
+    基表面时, 调用方会连带打开星号投影拒(因为那时列黑名单靠点名才生效)。
+    """
+    if not get_settings().askdata_sandbox_use_views:
+        return _allowed_tables()
+    return sandbox_view_names()
+
+
+def _sandbox_denied_columns(role: str) -> set[str]:
+    """把语义层 col_policies 汇成沙箱 AST 列黑名单(取不到就空集, 不拿它拦人)。
+
+    为什么按基表并集而不逐视图对账: 宁可多拒一个同名列, 也不能漏放一个机密列。
+    列策略取不到(语义层降级)时选"不施加列黑名单"而不是"拒所有": 视图已经把列拿掉了,
+    这一层只是可移植的兜底, 它挂了不该把能答的问题卡在门外。
+    """
+    settings = get_settings()
+    if not settings.askdata_sandbox_enforce_col_policies:
+        return set()
+    try:
+        catalog = registry.get_catalog()
+    except Exception as exc:  # noqa: BLE001 - 兜底层不可用不能反过来误杀
+        logger.warning("[askdata] 列策略读不到(本轮沙箱不施加列黑名单): %s", exc)
+        return set()
+    denied: set[str] = set()
+    for spec in SANDBOX_VIEW_SPECS:
+        denied |= set(catalog.denied_columns_for(role, spec.source_table))
+    return {str(col or "").strip().lower() for col in denied if str(col or "").strip()}
 
 
 def _scope_of_caller(caller_user_id: str, caller_role: str) -> tuple[DataScope | None, dict | None]:
@@ -627,9 +661,10 @@ def exec_sql_sandbox(
     """降级链第 3 级(最后一级): 在只读沙箱里执行一条你自写的 SELECT。
 
     只有指标 API 与编译器都覆盖不了时才用(例如语义层还没登记这个口径)。
-    沙箱不是许可: 单条 SELECT、只碰白名单表、行数与扫描量有上限、能读到哪些行由
-    行级安全决定; 校验被拒时**不要改写成语义层外的表或去掉 WHERE 再试**, 如实说明
-    这个口径还没被治理过。
+    沙箱不是许可: 单条 SELECT、**只能碰 v_analytics_* 治理视图**(基表不在可查面内,
+    机密列已从视图里拿掉)、行数与扫描量有上限、不允许无关联条件的多表连接、
+    能读到哪些行由行级安全决定; 校验被拒时**不要改写成语义层外的表或去掉 WHERE 再试**,
+    如实说明这个口径还没被治理过。
 
     Args:
         sql: 一条只读 PostgreSQL SELECT(或 WITH ... SELECT)。
@@ -655,8 +690,15 @@ def exec_sql_sandbox(
                 "error_codes": ["E_ENGINE_BREAKER"], "table": table, "semver": semver}
     try:
         safe_sql = validate_sql(
-            sql, allowed_tables=_allowed_tables(), mode=READ_MODE,
+            sql, allowed_tables=_sandbox_allowed_tables(), mode=READ_MODE,
             max_rows=settings.askdata_max_rows,
+            # 沙箱专项护栏: 列策略黑名单 + JOIN 数上限 + 笛卡尔拒。
+            # 星号投影只在"退回基表可查面"时才拒: 视图本身已不含机密列,
+            # 那时拒 * 只会把合法问法拦在门外。
+            denied_columns=_sandbox_denied_columns(caller_role),
+            deny_star_projection=not settings.askdata_sandbox_use_views,
+            max_joins=settings.askdata_sandbox_max_joins,
+            reject_cartesian=settings.askdata_sandbox_reject_cartesian,
         )
     except ASTGuardError as exc:
         _audit(trace_id=trace_id, scope=scope, user_id=caller_user_id, role=caller_role,

@@ -381,7 +381,7 @@ WHERE event_type = 'clarify_pick' AND created_at >= :since
             mis = conn.execute(text(mis_sql), {"since": since}).first()
             latest = conn.execute(
                 text("SELECT run_id, exec_accuracy, dsl_exact_match, slot_f1, mode, case_count, "
-                     "gate_status, started_at "
+                     "gate_status, semver, started_at "
                      "FROM askdata_eval_run ORDER BY started_at DESC LIMIT 1")
             ).first()
             # 评测集规模也算进来: 告警线要判"样本够不够", 让调用方再发一次查询就会
@@ -437,6 +437,9 @@ WHERE event_type = 'clarify_pick' AND created_at >= :since
             "mode": item.get("mode"),
             "case_count": int(item.get("case_count") or 0),
             "gate_status": item.get("gate_status") or "",
+            # 评测跑的是哪一版口径: 分数必须与口径版本一起看, 否则"EX 掉了"分不清
+            # 是能力回退还是有人改了定义。
+            "semver": item.get("semver") or "",
             "started_at": str(item.get("started_at") or ""),
         }
     # 样本队列现状也带上: 治理面要一眼看到"攒了多少可训材料, 多少被门禁拦住了"。

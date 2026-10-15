@@ -21,10 +21,14 @@ from app.semantic.dsl import SpecTime
 _CST = timezone(timedelta(hours=8))
 
 # 区间词表: DSL 里只允许出现这些值(或显式 start/end)。
+# 前向窗口(next_*)不是装饰: 合同续签/到期提醒、预算还能花多久这类问题问的就是**以后**,
+# 词表里没有它时模型只能拿 last_30d 顶替 —— 那不是"表达不精确", 而是把过去 30 天
+# 的数当成未来 30 天给出(方案 §10 里列为最禁的"方向性错误": 数字看似对, 意思完全相反)。
 RANGE_TOKENS: frozenset[str] = frozenset({
     "this_week", "last_week", "this_month", "last_month",
     "this_quarter", "last_quarter", "this_year", "last_year",
     "last_7d", "last_30d", "last_90d", "last_365d", "all_time",
+    "next_7d", "next_30d", "next_90d", "next_365d",
 })
 
 # 中文/口语说法 -> 区间词。刻意只做"确定性可判"的同义替换, 判不出的一律走澄清门。
@@ -42,6 +46,16 @@ _SYNONYMS: dict[str, str] = {
     "近一月": "last_30d", "最近30天": "last_30d", "近30天": "last_30d",
     "近三月": "last_90d", "最近90天": "last_90d", "近90天": "last_90d",
     "近一年": "last_365d", "最近365天": "last_365d",
+    # 前向窗口说法: 中文习惯里写汉字数量("未来三十天"), 所以同义表必须**汉字与数字两种都认**
+    # (detect_phrase 靠子串命中, 只写"未来30天"的话一句"未来三十天"就归一不出来)。
+    "未来7天": "next_7d", "未来一周": "next_7d", "未来七天": "next_7d",
+    "接下来7天": "next_7d", "今后7天": "next_7d", "未来一周内": "next_7d",
+    "未来30天": "next_30d", "未来三十天": "next_30d", "未来一个月": "next_30d",
+    "接下来30天": "next_30d", "今后30天": "next_30d", "未来30天内": "next_30d",
+    "未来三十天内": "next_30d", "未来一个月内": "next_30d",
+    "未来90天": "next_90d", "未来三个月": "next_90d", "未来九十天内": "next_90d",
+    "接下来三个月": "next_90d", "今后三个月": "next_90d",
+    "未来一年": "next_365d", "未来365天": "next_365d", "未来十二个月": "next_365d",
     "全部": "all_time", "所有": "all_time", "历史": "all_time", "总计": "all_time",
 }
 
@@ -62,6 +76,7 @@ TIME_CHOICES: tuple[tuple[str, str], ...] = (
     ("this_quarter", "本季度"),
     ("this_year", "今年至今"),
     ("last_30d", "近 30 天"),
+    ("next_30d", "未来 30 天"),
 )
 
 
@@ -272,6 +287,13 @@ def _bounds(token: str, day: date) -> tuple[date, date, str]:
         if token == suffix:
             start = day - timedelta(days=days)
             return start, day + timedelta(days=1), f"{start.isoformat()} ~ {(day + timedelta(days=1)).isoformat()}(近 {days} 天)"
+    # 前向窗口: 从**今天**起算的 N 天, 右开所以 [today, today+N) 正好 N 天。
+    # 与 last_* 刻意不对称是有意为之: "近 30 天"含今天(N+1 天跨度)是报表沿用口径,
+    # 而"未来 30 天内要续签"多数业务语义就是"往后的 30 天", 多塞一天会把 31 天后的合同拉进来。
+    for suffix, days in (("next_7d", 7), ("next_30d", 30), ("next_90d", 90), ("next_365d", 365)):
+        if token == suffix:
+            end = day + timedelta(days=days)
+            return day, end, f"{day.isoformat()} ~ {end.isoformat()}(未来 {days} 天)"
     if token == "all_time":
         return day, day, "全部历史(不限时间)"
     raise TimeError(f"内部错误: 未实现的区间词 {token!r}")

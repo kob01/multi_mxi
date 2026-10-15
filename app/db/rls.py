@@ -252,6 +252,57 @@ async def ensure_audit_immutability() -> None:
                 )
 
 
+async def ensure_analytics_views() -> None:
+    """建(或重建)沙箱专用的只读治理视图: 剔除机密列 + 过滤软删 + 行级安全穿透。
+
+    三个不能省的细节:
+    1. **必须 DROP 后再 CREATE**: PG 的 ``CREATE OR REPLACE VIEW`` 不允许改变列名/列序,
+       一旦某天调整投影就会在这一步报 "cannot change name of view column" 并拖垮整条
+       init_schema。先删后建把"改视图列"变成一次普通的幂等操作。
+    2. **必须 security_invoker=true**: 普通视图以视图属主(登录账号)权限执行, 而属主默认
+       绕过 RLS —— 那种视图会把"按列隔离"做成"跨部门行泄漏"。带此选项后 PG 按调用角色
+       检查基表权限并施加策略, 视图才只是列的白名单(依赖 PG15+, 本仓部署为 pg16)。
+    3. **只授只读角色**: 写角色不需要自由 SQL 问数面, 少一个授权就少一个将来被误用的面。
+
+    security_invoker 不被支持(PG<15)时抛 :class:`RlsError` 而不是静默跳过: 隔离层建不起来
+    必须响, 否则"列白名单生效了但行隔离被视图绕过"这种更糟的形状会伪装成正常运行。
+    """
+    from app.db.analytics_views import source_tables, view_selects
+    from app.db.session import get_engine
+
+    if not get_settings().askdata_sandbox_use_views:
+        # 退回基表白名单时连视图都不建: 否则"已经决定不用这个载体"的部署(典型如 PG<15
+        # 的托管库)会被启动期 DDL 硬失败卡住, 那个开关就不是真正的回滚杆。
+        logger.info("[rls] ASKDATA_SANDBOX_USE_VIEWS=false, 跳过沙箱治理视图创建")
+        return
+
+    ro = read_role()
+    stray = sorted(table for table in source_tables() if table not in SCOPED_TABLES)
+    if stray:
+        # 基表不在作用域名单 = 这张表根本没有 RLS 策略, 投成视图就等于开了个无隔离的后门。
+        raise RlsError(f"沙箱视图引用了未受行级安全管辖的表 {stray}, 已拒建")
+
+    selects = view_selects()
+    try:
+        async with get_engine().begin() as conn:
+            for name, select_sql in sorted(selects.items()):
+                await conn.execute(text(f"DROP VIEW IF EXISTS {name}"))
+                await conn.execute(
+                    text(f"CREATE VIEW {name} WITH (security_invoker = true) AS {select_sql}")
+                )
+                if ro:
+                    await conn.execute(text(f"GRANT SELECT ON {name} TO {ro}"))
+    except RlsError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 包装成可定位的口径(与建角色失败一致)
+        raise RlsError(
+            f"创建沙箱治理视图失败: {exc}; 若数据库版本低于 PostgreSQL 15 则不支持 "
+            "security_invoker 视图, 请升级或将 ASKDATA_SANDBOX_USE_VIEWS=false 退回基表白名单"
+        ) from exc
+    logger.info("[rls] 已重建 %d 张沙箱治理视图(security_invoker, 只授只读角色)",
+                len(selects))
+
+
 async def rls_status() -> dict[str, object]:
     """自查看一眼当前隔离状态(给 dev_services check 与排障用, 不改变任何东西)。"""
     from app.db.session import get_engine
@@ -277,11 +328,24 @@ async def rls_status() -> dict[str, object]:
                 {"ro": read_role() or "-", "rw": write_role() or "-"},
             )
         ).all()
+        # 沙箱视图必须带着 security_invoker 才算没把行隔离旁路掉: 这是排障时最易看漏的一项。
+        views = (
+            await conn.execute(
+                text("SELECT c.relname, coalesce(array_to_string(c.reloptions, ','), '') "
+                     "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                     "WHERE c.relkind = 'v' AND n.nspname = 'public' "
+                     "AND c.relname LIKE 'v_analytics_%' ORDER BY c.relname")
+            )
+        ).all()
     return {
         "policies": [{"table": p[0], "name": p[1], "cmd": p[2]} for p in policies],
         "forced_tables": [f[0] for f in forced],
         "roles": [
             {"name": r[0], "can_login": r[1], "super": r[2], "bypass_rls": r[3]}
             for r in roles
+        ],
+        "sandbox_views": [
+            {"name": v[0], "security_invoker": "security_invoker=true" in (v[1] or "")}
+            for v in views
         ],
     }

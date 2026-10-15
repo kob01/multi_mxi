@@ -407,6 +407,10 @@ TERM_ALIASES: list[tuple[str, str, str, float]] = [
     ("采购单数", "metric", "m_purchase_count", 1.0),
     ("采购待审", "metric", "m_purchase_pending_count", 1.0),
     ("比价不够", "metric", "m_purchase_quotes_short", 1.0),
+    # 用户实际会说"比价不足三单"(而不是"比价不够"): 这条是评测里一条误澄清的真因
+    # —— 不是模型错, 是词典里没这个词(语义层覆盖不足归②词典类)。
+    ("比价不足三单", "metric", "m_purchase_quotes_short", 1.0),
+    ("比价不足", "metric", "m_purchase_quotes_short", 0.95),
     ("三家比价", "metric", "m_purchase_quotes_short", 0.9),
     ("合同份数", "metric", "m_contract_count", 1.0),
     ("签了多少合同", "metric", "m_contract_count", 0.95),

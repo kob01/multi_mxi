@@ -37,6 +37,10 @@ dependencies = [
     "motor>=3.6",
     "neo4j>=5.0",
     "openpyxl>=3.1.5",
+    # 审计留痕的 OTel 主写通道(app/security/audit.py): Logs API 可选依赖, import 期惰性,
+    # 缺失即降级回纯标准库落盘。此前经 langfuse/observability 间接带入, 现提升为直接依赖。
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
     "pgvector>=0.2.9",
     "pillow>=10.0.0",
     "psycopg[binary]>=3.1.21",
