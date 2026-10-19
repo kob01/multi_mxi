@@ -14,9 +14,11 @@ langchain-ollama>=0.2.1
 # DeepSeek 官方集成: 透出 reasoning_content(深度思考), langchain-openai v1 不提取该字段
 langchain-deepseek>=1.0.0
 # 自托管 LLM 可观测(app/tracing.py, 与 LangSmith 并存的独立开关):
-# 以 langfuse.langchain.CallbackHandler 挂在图顶层调用上; 服务侧见
-# docker-compose.yml 的 profile=langfuse 栈(同大版本)。
-langfuse>=3.4,<5
+# 以 langfuse.langchain.CallbackHandler 挂在图顶层调用上, 环节级 score 用
+# start_as_current_observation(trace_context=...) + span.score(); 服务侧见
+# docker-compose.yml 的 profile=langfuse 栈(同为 v4)。与 pyproject 同口径:
+# trace_context 只在 SDK v4 完整支持, 放宽到 v3 会静默丢环节 span。
+langfuse>=4,<5
 
 # 审计留痕 OTel 主写(app/security/audit.py, 与 LangSmith/Langfuse 并存的可选观测面):
 # OTel Logs API + BatchLogRecordProcessor 落 JSONL 文件 Exporter; SDK 缺失时降级为

@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from contextlib import contextmanager
+from typing import Any
 
 from app.config import get_settings
 
@@ -180,3 +183,148 @@ def shutdown_langfuse() -> None:
         get_client().shutdown()
     except Exception as exc:  # noqa: BLE001 - 关停路径上的失败只记日志
         logger.warning("langfuse shutdown failed: %s", exc)
+
+
+# --------------------------------------------------------------- 环节级评测
+# 一轮对话只有一条 trace, 但「哪一个环节掉了链子」要看环节自己的分数。这条通道
+# 把前三层漏斗里**可确定性判定**的信号按 EVAL_METRICS.md 的指标编号上报成 score,
+# 于是 Langfuse UI 里能按 score name 筛「本轮哪些请求降级了 / 阈值裁空了 / 越权
+# 命中被剔除了」, 不必去翻 audit.jsonl 再自己聚合。
+#
+# 为什么不用 score_current_span: 实测在 LangGraph 的节点函数体内 OTel current
+# span 是无效的 —— CallbackHandler 在 on_chain_start 里 attach 的 context 不跨
+# Pregel 的执行边界传进节点函数, score_current_span 于是静默 no-op (只在日志里
+# 留一条 warning), 调用方看不出失败。所以这里显式建 span: 用 trace_context 把
+# 环节 span 绑回同一条 trace (seed 与 langfuse_callback 一致), 再用 span.score()
+# 把分数挂到该 span 上 —— 真正的 observation 级, 不是 trace 级。
+#
+# 口径边界: 意图准确率(RT-01)/忠实度(GEN-FAITH-01)这类需要标注集或 judge 的指标
+# **不在这条通道**, 仍走离线评测; 这里只报规则能判定的量, 以及需要重标定时
+# 赖以判断分布的观测值(如 top_score 的漂移)。
+
+_DERIVED_IDS: dict[str, str] = {}
+_DERIVED_IDS_MAX = 1024
+
+
+class StageEval:
+    """一个环节的评测句柄: 只暴露 :meth:`score`, 未启用时是空实现。
+
+    刻意不抛任何异常 —— 可观测通道的失败不能反过来影响对话链路, 与
+    :func:`langfuse_callback` 的降级口径一致。
+    """
+
+    __slots__ = ("_span",)
+
+    def __init__(self, span: Any = None) -> None:
+        self._span = span
+
+    def score(
+        self,
+        name: str,
+        value: float | str,
+        *,
+        data_type: str = "NUMERIC",
+        comment: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """挂一条分数。``data_type`` 取 NUMERIC/BOOLEAN/CATEGORICAL。
+
+        BOOLEAN 用 1.0/0.0 表达(与 Langfuse 的取值约定一致); CATEGORICAL 直接
+        传字符串, 同一个 name 下的取值分布就是 EVAL_METRICS 里那句「占比」。
+        """
+        if self._span is None:
+            return
+        try:
+            self._span.score(
+                name=name,
+                value=value,
+                data_type=data_type,
+                comment=comment or None,
+                metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 - 打分失败只留 debug 痕迹
+            logger.debug("stage score failed (%s): %s", name, exc)
+
+
+_NULL_EVAL = StageEval()
+
+
+def derive_trace_id(audit_trace_id: str) -> str | None:
+    """审计号 -> Langfuse trace id, 与 :func:`langfuse_callback` 同一 seed。
+
+    进程内缓存: 一轮对话的多个环节共用一个 seed, 不缓存等于每个环节重复算一次
+    sha256。派生失败返回 None (调用侧放弃打分, 不抛)。
+    """
+    if not audit_trace_id:
+        return None
+    cached = _DERIVED_IDS.get(audit_trace_id)
+    if cached:
+        return cached
+    try:
+        from langfuse import Langfuse
+
+        derived = Langfuse.create_trace_id(seed=audit_trace_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("derived trace id unavailable: %s", exc)
+        return None
+    if len(_DERIVED_IDS) >= _DERIVED_IDS_MAX:
+        # 简单容量控制: 清空而非 LRU —— 缓存只省一次哈希, 重建代价极低。
+        _DERIVED_IDS.clear()
+    _DERIVED_IDS[audit_trace_id] = derived
+    return derived
+
+
+@contextmanager
+def stage_eval(stage: str, audit_trace_id: str):
+    """环节评测上下文: 进入时建 ``eval.<stage>`` span, 退出时关闭。
+
+    用法::
+
+        with stage_eval("kb_retrieve", state.get("trace_id") or "") as ev:
+            ...
+            ev.score("RET-DEG-01.rerank_degraded", 1.0, data_type="BOOLEAN")
+
+    未启用 Langfuse / 拿不到派生 trace id / 建 span 失败时产出空句柄,
+    ``score()`` 是 no-op, 调用侧不需要写分支。
+
+    前置条件: 本函数用 ``_langfuse_initialized`` 走热路径短路, 因此依赖图顶层
+    调用点已经执行过 :func:`langfuse_callback` (它内部会 init)。图之外的调用
+    (如评测脚本) 需自己先 ``init_langfuse()``。
+    """
+    if not _langfuse_initialized:
+        # 没启用就别再碰 SDK: 这个判断取代 init_langfuse(), 避免热路径上每个
+        # 环节都重跑一遍「配置 -> 环境变量」的搬运。
+        yield _NULL_EVAL
+        return
+    trace_id = derive_trace_id(audit_trace_id)
+    if not trace_id:
+        yield _NULL_EVAL
+        return
+    cm = None
+    try:
+        from langfuse import get_client
+
+        cm = get_client().start_as_current_observation(
+            trace_context={"trace_id": trace_id},
+            name=f"eval.{stage}",
+            as_type="span",
+        )
+        span = cm.__enter__()
+    except Exception as exc:  # noqa: BLE001 - 建 span 失败不影响业务
+        logger.debug("stage eval span unavailable (%s): %s", stage, exc)
+        yield _NULL_EVAL
+        return
+    try:
+        yield StageEval(span)
+    except BaseException:
+        # 环节自己抛了: 把异常信息带进 span 的 level/status_message。否则 trace
+        # 里会显示成一个「正常但很短」的 span, 排查时把人往错方向带。
+        try:
+            cm.__exit__(*sys.exc_info())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("stage eval span close failed (%s): %s", stage, exc)
+        raise
+    try:
+        cm.__exit__(None, None, None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("stage eval span close failed (%s): %s", stage, exc)

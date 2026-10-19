@@ -336,6 +336,7 @@
 | `seed_business_data.py` | 灌 `hr_employees/hr_tickets/hr_leave_records/fin_reimbursements/fin_department_budgets` 五表，FIN5000+ 11 条示例 | 作为评测数据底座，需扩边界样本（金额=5000/5000.01、同名多人、非 OPEN 工单、空余额） |
 | `data/knowledge/` | `finance_policy.md`、`hr_faq.md` 等 4 件 | RAG 领域评测集起点，需补人工 qrels |
 | `audit.jsonl` + Langfuse | audit 全链留痕；Langfuse 默认关，trace_id 与 audit 号确定性对齐 | 离线统计主数据源；性能/降级率/verdict 分布可直接从 action 聚合，无需新埋点 |
+| Langfuse 环节 score | `app/tracing.py::stage_eval()` 对 `classify_intent`/`kb_retrieve`/`kb_generate`/`agent_delegate` 四个环节建 `eval.<环节>` span，按本表编号上报 13 个规则型指标（RT-02/03/04、RET-DEG-01/CACHE-01/ACL-01/RERANK-04/RERANK-07、GEN-REFUSE-01/TOK-01/CITE-01、RT-14、PERF-02） | **只报规则能确定性判定的量**。需要标注集或 judge 的指标（意图准确率 RT-01、忠实度 GEN-FAITH-01 等）不在线，仍走离线评测；分数落 `default.scores` 表（按 `observation_id` 归属到环节），读回 REST 在 v4 `events_only` 下 404 |
 | `chat_sessions/chat_messages` | 含 thinking/route/target/intent/docs_meta | 可回放历史轮次构造评测集 |
 
 **约束**（影响评测怎么跑，来自 `.qoder/rules/`）：容器是唯一验证环境，宿主可跑评测脚本但结论须容器复核；宿主连 PG 靠 `config.py` 的 `_SECRET_HOST_FALLBACK` 回退读 `docker/secrets/pg_password.txt`；网关宿主端口 18000（winnat 排除段会随机吞端口，起不来先 `netsh int ipv4 show excludedportrange protocol=tcp`）；改切块/归一化行为必须递增 `PARSER_VERSION`/`NORMALIZER_VERSION` 并重入库，否则评测跑在旧产物上。

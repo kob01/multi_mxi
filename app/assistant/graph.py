@@ -131,6 +131,7 @@ from app.security.caller import Caller, reset_caller, set_caller
 from app.security.masking import mask_text
 from app.security.quota import check_capability_quota, remaining, resolve_daily_limit
 from app.tools import CAPABILITY_TOOLS
+from app.tracing import StageEval, stage_eval
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,11 @@ def _memory_command_pattern(settings) -> re.Pattern:
 _CONTEXT_DEPENDENT = re.compile(
     r"(它|他|她|这个|那个|这些|那些|上面说的|刚才说的|前面说|刚才说|呢$|呢[?？])"
 )
+
+# 知识库答案里的引用标注: ``format_context`` 产出 ``[资料i]《标题》...``。
+# 统计它的出现次数只能作为 GEN-CITE-01(引用覆盖率) 的分子 —— 分母是
+# 「需要依据的事实句数」, 那一步要 judge, 不在在线通道里算。
+_CITATION = re.compile(r"\[资料\d+\]")
 
 # 能力域(tool_execute 的进程内工具分支, 计划 D2)的域内提示: 追加进 system_context,
 # 把"怎么交付"钉死 —— web 要带来源 URL; docgen 要先检索后成文(禁编造)并把 download_url 输出为 Markdown 链接。
@@ -428,7 +434,17 @@ class AssistantOrchestrator:
         # 用改写后的独立问题分类: "那帮我查一下它的余额" 消解为
         # "查一下 XX 的余额" 后才能正确判出 tool_call 而非 knowledge_qa。
         query = state.get("rewritten_query") or state["message"]
-        intent = await self._intent.classify(query, state.get("history", ""))
+        with stage_eval("classify_intent", state.get("trace_id") or "") as ev:
+            intent = await self._intent.classify(query, state.get("history", ""))
+            # 在线只报「分类结果」的可观测量; 准确率要标注集, 走离线评测。
+            # RT-03: 四层漏斗(规则/语义/LLM/兜底)里哪一层接走的 —— 越靠后越贵
+            # 越不稳, 这个 CATEGORICAL 的取值分布就是文档里的「各层命中占比」。
+            ev.score("RT-03.intent_layer", intent.layer or "unknown", data_type="CATEGORICAL")
+            # RT-04: 语义层阈值(intent_accept_threshold/margin)的输入信号,
+            # 分数分布漂移时据此重标定。
+            ev.score("RT-04.intent_confidence", float(intent.confidence))
+            # RT-02: 域判定结果。与 RT-01 分开看: 「该不该委派」对了, 「委派给谁」仍可能错。
+            ev.score("RT-02.intent_target", intent.target or "none", data_type="CATEGORICAL")
         await self._emit_status(state, "routed", f"意图识别: {intent.intent.value}")
         self._audit.log(
             state.get("trace_id") or new_trace_id(), "assistant", "intent_classified",
@@ -522,10 +538,15 @@ class AssistantOrchestrator:
     # ---------------- knowledge_qa: retrieve-judge loop ----------------
 
     async def kb_retrieve(self, state: AssistantState) -> dict[str, Any]:
-        """单意图路径的一次检索(薄壳: 取 query/attempt -> ``_kb_retrieve_once`` -> 回写 state)。"""
+        """单意图路径的一次检索(薄壳: 取 query/attempt -> ``_kb_retrieve_once`` -> 回写 state)。
+
+        评测 span 建在这里而不是 helper 内部: helper 只负责在拿到 ``score_mode`` /
+        ``cache_hit`` / 越权剔除结果之后把分数挂上去, 不改它原有的控制流。
+        """
         query = state.get("kb_query") or state.get("rewritten_query") or state["message"]
         attempt = int(state.get("kb_attempt") or 0) + 1
-        kb = await self._kb_retrieve_once(state, query, attempt)
+        with stage_eval("kb_retrieve", state.get("trace_id") or "") as ev:
+            kb = await self._kb_retrieve_once(state, query, attempt, ev=ev)
         return {
             "kb_query": query,
             "kb_chunks": kb["chunks"],
@@ -535,13 +556,18 @@ class AssistantOrchestrator:
         }
 
     async def _kb_retrieve_once(
-        self, state: AssistantState, query: str, attempt: int
+        self, state: AssistantState, query: str, attempt: int,
+        *, ev: StageEval | None = None,
     ) -> dict[str, Any]:
         """One retrieval pass with rerank thresholding + ACL trim.
 
         图节点只薄壳地组装与回写 ``kb_*`` state, 真正的检索一次走这一份实现。
         query 与 attempt 都由参数传入, 因此本 helper 不读 ``kb_*`` state。返回
         ``{chunks, meta_map, acl_blocked, attempt}``。
+
+        ``ev`` 是环节评测句柄(由 :meth:`kb_retrieve` 传入): 默认 None 时零开销,
+        不影响其他调用点。分数只在拿齐 ``score_mode`` / ``cache_hit`` /
+        ``dropped_docs`` 之后才打, 否则报出去的降级率与越权数不可信。
 
         The query comes from ``kb_query`` (set by ``rewrite_query`` on the
         first pass, or by ``kb_requery`` on a retry). Retrieval channels and
@@ -628,6 +654,33 @@ class AssistantOrchestrator:
              )},
             state.get("session_id"),
         )
+        if ev is not None:
+            # RET-DEG-01: score_mode=rrf 即精排降级。此时阈值不生效, 质量口径
+            # 与主路径不同 —— 不单独计数就会把两种口径的分数搅在一起算。
+            ev.score(
+                "RET-DEG-01.rerank_degraded",
+                0.0 if score_mode == "rerank" else 1.0,
+                data_type="BOOLEAN",
+                comment=f"score_mode={score_mode}",
+            )
+            # RET-CACHE-01: 缓存命中即跳过了整段混合检索(含 embed/ES/rerank)。
+            ev.score("RET-CACHE-01.cache_hit", 1.0 if cache_hit else 0.0, data_type="BOOLEAN")
+            # RET-ACL-01: 检索出口(父块组装后)仍被剔除的越权/未就绪文档数。
+            # 这是纵深防御的最后一道, 除 ACL 前置裁剪未盖上之外的冗余拦截——
+            # "出口后必须为 0" 指的是最终返回里不能含越权块, 不是这里为 0。
+            ev.score("RET-ACL-01.acl_dropped_docs", float(len(dropped_docs)))
+            # RET-RERANK-07: 保留块的最高分, 阈值 0.4 重标定靠它的分布漂移。
+            if top_score is not None:
+                ev.score("RET-RERANK-07.top_score", float(top_score),
+                         comment=f"threshold={self._settings.retrieval_score_threshold}")
+            # RET-RERANK-04: 没被 ACL 拦住却裁到空集 —— 阈值偏高的直接证据
+            # (下游就是拒答, 用户看到的是"知识库没有")。
+            ev.score(
+                "RET-RERANK-04.empty_after_threshold",
+                1.0 if (not authorized and not dropped_docs) else 0.0,
+                data_type="BOOLEAN",
+                comment=f"children={len(children)} authorized={len(authorized)}",
+            )
         return {
             "chunks": authorized,
             "meta_map": meta_map,
@@ -720,9 +773,11 @@ class AssistantOrchestrator:
             "acl_blocked": bool(state.get("kb_acl_blocked")),
             "attempt": int(state.get("kb_attempt") or 0),
         }
-        return await self._kb_generate_answer(
-            state, query, kb, stream=self._stream_enabled(state), original=state["message"]
-        )
+        with stage_eval("kb_generate", state.get("trace_id") or "") as ev:
+            return await self._kb_generate_answer(
+                state, query, kb, stream=self._stream_enabled(state),
+                original=state["message"], ev=ev,
+            )
 
     async def _kb_generate_answer(
         self,
@@ -732,11 +787,16 @@ class AssistantOrchestrator:
         *,
         stream: bool,
         original: str,
+        ev: StageEval | None = None,
     ) -> dict[str, Any]:
         """Answer from confident chunks; refuse explicitly when there are none.
 
         ``original`` 是写进 prompt 的"用户原话": 单意图路径传原始消息(资料是按改写后
         的问题检的, 附上原话避免偏离用户真实问法); 非流式内部调用可传同一个问题。
+
+        ``ev`` 是环节评测句柄(由 :meth:`kb_generate` 传入, 默认 None 零开销)。
+        拒答与正常生成两个出口都打分: 只看正常生成会让拒答率的分母凭空少一块,
+        而误拒答(GEN-REFUSE-02)恰好是本项目最需要盯的质量项。
         """
         chunks = kb["chunks"]
         meta_map = kb["meta_map"]
@@ -753,6 +813,14 @@ class AssistantOrchestrator:
                  "reason": "acl_blocked" if kb["acl_blocked"] else "below_threshold"},
                 state.get("session_id"),
             )
+            if ev is not None:
+                # 拒答也是「生成环节」的一种产出: 不打这个分, 拒答率的分母就只剩
+                # 真正调过 LLM 的轮次, 阈值误空/越权拦截会被系统性低报。
+                ev.score(
+                    "GEN-REFUSE-01.refused", 1.0, data_type="BOOLEAN",
+                    comment="acl_blocked" if kb["acl_blocked"] else "below_threshold",
+                )
+                ev.score("GEN-TOK-01.context_chars", 0.0)
             return {"answer": answer, "route": "assistant_kb", "docs_meta": [], "thinking_text": ""}
         retriever = await self._get_retriever()
         context = retriever.format_context(chunks, meta_map)
@@ -788,6 +856,14 @@ class AssistantOrchestrator:
             }
             for c in chunks
         ]
+        if ev is not None:
+            ev.score("GEN-REFUSE-01.refused", 0.0, data_type="BOOLEAN")
+            # GEN-TOK-01: 送进 prompt 的上下文规模。这里没有 tokenizer, 用字符数
+            # 作代理口径(注释固定住, 免得拿它当 token 直接比模型窗口)。
+            ev.score("GEN-TOK-01.context_chars", float(len(context)),
+                     comment=f"chunks={len(chunks)}")
+            ev.score("GEN-CITE-01.citations_in_answer",
+                     float(len(_CITATION.findall(answer))))
         return {
             "answer": answer, "route": "assistant_kb", "docs_meta": docs_meta,
             "thinking_text": think_text,
@@ -1040,11 +1116,29 @@ class AssistantOrchestrator:
             cache.pop(next(iter(cache)), None)
 
     async def agent_delegate(self, state: AssistantState) -> dict[str, Any]:
-        """单意图路径的 A2A 委派(薄壳)。"""
+        """单意图路径的 A2A 委派(薄壳 + 环节评测)。
+
+        评测只包单意图这一条: ``_delegate_task`` 同时被并发分支调用, 埋在那里会把
+        「显式点选多智能体」也计入 RT-14, 两套口径混在一起后成功率就不再可比。
+        """
         intent = state["intent"]
         target = intent.target if intent and intent.target else "hr"
         query = state.get("rewritten_query") or state["message"]
-        return await self._delegate_task(state, query, target)
+        started = time.perf_counter()
+        with stage_eval("agent_delegate", state.get("trace_id") or "") as ev:
+            update = await self._delegate_task(state, query, target)
+            # RT-14: 逐项委派结果。注意 status=denied 时 answer 也非空(是一段拒答
+            # 文本), 所以不能靠 answer 判成败 —— 这正是该指标要分开计的原因。
+            ev.score(
+                "RT-14.delegate_status", str(update.get("status") or "unknown"),
+                data_type="CATEGORICAL", comment=f"target={target}",
+            )
+            # PERF-02: 分段时延里的「委派」一段(A2A 往返, 含远端 ReAct 循环)。
+            ev.score(
+                "PERF-02.a2a_latency_ms",
+                round((time.perf_counter() - started) * 1000, 1),
+            )
+        return update
 
     async def _delegate_task(
         self, state: AssistantState, query: str, target: str, *, timeout: float | None = None

@@ -841,6 +841,46 @@ secret 文件是在容器创建时才解析挂载点, 如果文件是后来才�
 - Langfuse 栈的存储(PG/ClickHouse/redis/MinIO)与业务的 postgres/redis 完全隔离,
   删栈不伤业务数据; 详见 `docker/docker-compose.yml` 内注释。
 
+### 环节级评测(一条 trace 里定位「哪个环节掉链子」)
+
+只有一条 trace 时, 质量问题混在一起看不清: 是意图路由错了, 还是压根没检索到,
+还是检索到了没引用上。`app/tracing.py::stage_eval()` 因此给四个核心环节各建一个
+`eval.<环节>` span, 把**规则能确定性判定**的信号按 [EVAL_METRICS.md](EVAL_METRICS.md)
+的指标编号上报成 score:
+
+| 环节 | score name | 类型 | 读法 |
+| --- | --- | --- | --- |
+| `classify_intent` | `RT-03.intent_layer` | CATEGORICAL | 取值分布 = 四层漏斗各层命中占比 |
+| | `RT-04.intent_confidence` | NUMERIC | 分布漂移 -> 重标定 0.62/0.05 阈值 |
+| | `RT-02.intent_target` | CATEGORICAL | 域判定结果 |
+| `kb_retrieve` | `RET-DEG-01.rerank_degraded` | BOOLEAN | 均值 = 精排降级率(降级时阈值不生效) |
+| | `RET-CACHE-01.cache_hit` | BOOLEAN | 均值 = 检索缓存命中率 |
+| | `RET-ACL-01.acl_dropped_docs` | NUMERIC | 检索出口仍剔除的越权/未就绪文档数 |
+| | `RET-RERANK-07.top_score` | NUMERIC | 保留块最高分, 阈值 0.4 重标定的依据 |
+| | `RET-RERANK-04.empty_after_threshold` | BOOLEAN | 均值 = 被阈值裁空的轮次占比(直接导向拒答) |
+| `kb_generate` | `GEN-REFUSE-01.refused` | BOOLEAN | 拒答/正常生成两个出口都打, 分母才完整 |
+| | `GEN-TOK-01.context_chars` | NUMERIC | 上下文规模(无 tokenizer, 字符作代理口径) |
+| | `GEN-CITE-01.citations_in_answer` | NUMERIC | 答案里 `[资料N]` 标注条数(覆盖率分子) |
+| `agent_delegate` | `RT-14.delegate_status` | CATEGORICAL | ok/denied —— denied 时 answer 也非空, 不能靠它判成败 |
+| | `PERF-02.a2a_latency_ms` | NUMERIC | A2A 往返耗时(含远端 ReAct) |
+
+- **为什么不直接用 `score_current_span()`**: 实测在 LangGraph 节点函数体内 OTel
+  current span 无效(`CallbackHandler` 在 `on_chain_start` 里 attach 的 context 不跨
+  Pregel 的执行边界进节点), 该方法会**静默 no-op** 而调用方看不出失败。所以环节
+  span 用 `trace_context` 显式绑回同一条 trace(seed 与 `langfuse_callback` 一致)。
+- **口径边界**: 意图准确率(RT-01)、忠实度(GEN-FAITH-01)这类需要标注集或 judge
+  的指标**不在这条通道**, 仍走离线评测; 在线只报规则能判定的量, 以及重标定时赖以
+  判断分布的观测值。不要拿 `GEN-CITE-01.citations_in_answer` 当引用正确率用。
+- **验证落点**: 实跑一轮后 `default.scores` 表可直接查(每个环节一个独立
+  `observation_id`):
+
+  ```powershell
+  docker exec docker-langfuse-clickhouse-1 clickhouse-client --query `
+    "SELECT name, value, observation_id FROM default.scores ORDER BY timestamp DESC LIMIT 15"
+  ```
+
+  `scores` 的读回 REST 接口在 v4 `events_only` 模式下同样 404, 只能走 ClickHouse 或 UI。
+
 ## 端到端链路("我要报销")
 
 1. `POST /api/chat` → Assistant 载入会话记忆(短期窗口 + 长期摘要)与个人级记忆各桶
