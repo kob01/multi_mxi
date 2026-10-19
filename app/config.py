@@ -157,6 +157,16 @@ class Settings(BaseSettings):
     # 超上限部分截掉并给出提示(需要全文时改为只点选一个智能体)。
     multi_agent_answer_chars: int = 4000
 
+    # ---------- 单域 MCP ReAct 的有界跨域委派 ----------
+    # 用户没点选智能体时, 意图漏斗只产出**一个** target; 若原句里还有别域子问题
+    # (如"年假剩多少。部门预算呢"), 单域 ReAct 只能回"我查不到"。开启后为单域
+    # ReAct 注入 delegate_to_agent: 本域部分自己答, 明确属于他域的子问题最多委派
+    # N 次; 调用前过 check_agent_permission, 转发原始调用者身份。
+    # 这不是入口层自动拆句(那条链已下线): 不改变单意图路由, 不并发分发整句,
+    # 也不在网关层合并多份回答 —— 委派与否由接手那一域的 ReAct 按需决定。
+    mcp_peer_delegate_enabled: bool = True
+    mcp_peer_delegate_max_calls: int = 2
+
     # ---------- Finance_Agent 第三代 Agentic AI(自主决策 + 协同执行) ----------
     # 把 finance_agent 从单循环 ReAct 升级为显式 planner -> executor(逐步) -> reflector
     # (复核/重规划)闭环, 并允许其作为对等智能体横向委派 hr/analytics/procurement 域。
@@ -740,8 +750,8 @@ class Settings(BaseSettings):
     # / public key(第二行), 加载完成后在 model_post_init 拆分;
     # dotenv 里 LANGFUSE_API_KEY / LANGFUSE_PUBLIC_KEY 留空(红线: 密钥不进 dotenv)。
     langfuse_enabled: bool = False
-    langfuse_api_key: str = Field(default="", repr=False)
-    langfuse_public_key: str = Field(default="", repr=False)
+    langfuse_api_key: str = ""
+    langfuse_public_key: str = "pk-lf-608ecb1e-70b3-4266-8e41-ed6c9f64858d"
     # 容器内用服务名 langfuse-web:3000; 宿主轨默认指向已发布端口 18100。
     langfuse_base_url: str = "http://localhost:18100"
     # Langfuse 侧靠 pk/sk 区分项目, 项目名不参与路由; 本字段只用作 trace 名

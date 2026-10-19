@@ -46,8 +46,11 @@ AGENT_URLS = {
 # 并发分节标题里的可读名(不拉 agent-card 是为了不给每次渲染依赖下游可用性)。
 # 新增智能体时三处同步: AGENT_URLS + AGENT_PROFILES + security/auth.AGENT_WHITELIST。
 AGENT_PROFILES: dict[str, tuple[str, str]] = {
-    "hr": ("HR_Agent", "入离职/证明/考勤/请假/工单等人事办理与查询"),
-    "finance": ("Finance_Agent", "费用报销全流程: 政策咨询/报销单创建/进度查询"),
+    "hr": ("HR_Agent", "入离职/证明/考勤/请假/年假余额/工单等人事办理与查询"),
+    "finance": (
+        "Finance_Agent",
+        "费用报销全流程与部门预算: 政策咨询/报销单创建/进度查询/部门预算余额",
+    ),
     "analytics": ("Analyst_Agent", "跨域数据统计(Text2SQL)/图表/周期经营报告"),
     "procurement": ("Contract_Agent", "采购申请发起与合规初审/合同条款风险初审"),
     "askdata": ("AskData_Agent", "自然语言问数(NL2DSL+语义层)/多维下钻/同环比/图表"),

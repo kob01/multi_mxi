@@ -85,6 +85,13 @@ from app.assistant.askdata_bridge import (
 from app.assistant.intent import IntentRecognizer, needs_current_time
 from app.assistant.mcp_client import get_mcp_pool
 from app.assistant.memory import get_memory_store
+from app.assistant.peer_delegate import (
+    DelegationContext,
+    build_peer_delegate_tool,
+    peer_prompt_block,
+    reset_delegation_context,
+    set_delegation_context,
+)
 from app.assistant.prompts import (
     DIRECT_PROMPT,
     KB_ANSWER_PROMPT,
@@ -880,6 +887,17 @@ class AssistantOrchestrator:
         # 权限Mask: 按角色×工具白名单矩阵过滤, 隐藏工具对 LLM 不可见、不可调。
         # 能力域未建矩阵 -> 透传全部(app/security/auth.py 的既定语义)。
         tools = self._tools_for(target, role, all_tools, stamp, await self._lookup_tool())
+        # 有界跨域委派: 只在 MCP 业务域路径注入(能力域工具在进程内, 没有对等智能体
+        # 语义)。工具本身无状态, 身份/链路号在同一轮的 ContextVar 里读。
+        peer_enabled = capability_tools is None and bool(
+            self._settings.mcp_peer_delegate_enabled
+        )
+        if peer_enabled:
+            peer_tool = build_peer_delegate_tool(target, role)
+            if peer_tool is not None:
+                tools = [*tools, peer_tool]
+            else:
+                peer_enabled = False
         visible_names = [t.name for t in tools]
         self._audit.log(
             state.get("trace_id") or "", "assistant", "tools_filtered",
@@ -892,7 +910,7 @@ class AssistantOrchestrator:
                 "status": "denied", "route": "mcp_tool", "target": target,
             }
 
-        agent = self._react_agent(target, role, tools, stamp)
+        agent = self._react_agent(target, role, tools, stamp, peer=peer_enabled)
         # 身份/时间走 System 消息, 与用户请求文本分离; 并显式区分"当前操作者"
         # (登录态)与"任务目标用户"(消息中指定的他人), 否则 LLM 会把操作者
         # 工号误用作目标员工的查询参数(如"查张三的余额"却传了自己的工号)。
@@ -907,6 +925,12 @@ class AssistantOrchestrator:
         )
         if domain_hint:
             system_context += f"\n{domain_hint}"
+        if peer_enabled:
+            peer_block = peer_prompt_block(
+                role, target, self._settings.mcp_peer_delegate_max_calls
+            )
+            if peer_block:
+                system_context += f"\n{peer_block}"
         dispatch_kind = "capability" if capability_tools is not None else "mcp"
         self._audit.log(
             trace_id, "assistant", "mcp_dispatch",
@@ -916,9 +940,24 @@ class AssistantOrchestrator:
         await self._emit_status(state, "tool", f"正在调用 {target} 域业务工具…")
         # 用消解后的独立问题驱动 ReAct: "审批到哪一步了" 已改写为
         # "FIN5000 审批到哪一步了", 工具才能拿到正确的查询对象。
-        result = await agent.ainvoke(
-            {"messages": [("system", system_context), ("user", query)]}
+        # 委派上下文按本轮设置(并发轮次各自一份), 离开必须复位。
+        ctx_token = (
+            set_delegation_context(DelegationContext(
+                source_domain=target,
+                trace_id=trace_id,
+                session_id=session_id,
+                max_calls=max(1, int(self._settings.mcp_peer_delegate_max_calls)),
+            ))
+            if peer_enabled
+            else None
         )
+        try:
+            result = await agent.ainvoke(
+                {"messages": [("system", system_context), ("user", query)]}
+            )
+        finally:
+            if ctx_token is not None:
+                reset_delegation_context(ctx_token)
         answer = "工具调用未产生回复。"
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
@@ -976,9 +1015,15 @@ class AssistantOrchestrator:
         self._evict_stale(self._toolset_cache, stamp)
         return wrapped
 
-    def _react_agent(self, target: str, role: Role, tools: list[Any], stamp: float) -> Any:
-        """取/建一个编译好的 ReAct 图(同一批工具只编译一次)。"""
-        key = (target, role.value, stamp)
+    def _react_agent(
+        self, target: str, role: Role, tools: list[Any], stamp: float, *, peer: bool = False
+    ) -> Any:
+        """取/建一个编译好的 ReAct 图(同一批工具只编译一次)。
+
+        key 里带 ``peer``: 同一域/角色下, 是否挂委派工具会改变图的工具清单,
+        不能复用旧图(否则开关切换后仍会在旧图里调用/看不到 delegate_to_agent)。
+        """
+        key = (target, role.value, stamp, peer)
         agent = self._agent_cache.get(key)
         if agent is not None:
             return agent

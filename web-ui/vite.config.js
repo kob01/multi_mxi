@@ -15,7 +15,9 @@ function resolveApiTarget() {
   let port = "18000";
   try {
     const envFile = fileURLToPath(new URL("../.env", import.meta.url));
-    const hit = readFileSync(envFile, "utf8").match(/^ASSISTANT_PORT=\s*(\d+)\s*$/m);
+    const hit = readFileSync(envFile, "utf8").match(
+      /^ASSISTANT_PORT=\s*(\d+)\s*$/m,
+    );
     if (hit) port = hit[1];
   } catch {
     /* .env 缺失(如容器内构建)则用默认端口, 不阻断前端启动 */
@@ -40,7 +42,7 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    port: 5173,
+    port: 20206,
     strictPort: true,
     proxy: {
       "/api": proxyEntry,

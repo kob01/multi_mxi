@@ -800,9 +800,12 @@ tracing 默认关闭(`LANGSMITH_TRACING=false`, 代码默认值与容器侧配�
 容器侧恒锁 `false`。两者互不影响, 可只开一个、都开、或都关(默认全关)。
 
 ```powershell
-# 1) 起 Langfuse 栈(默认不随 dev.ps1 起, 需显式带 profile)
-docker compose -f docker/docker-compose.yml --profile langfuse up -d
-# 2) 浏览器开 http://localhost:18100 -> 注册 -> 建 org/project -> 取 pk-lf-/sk-lf-
+# 1) 单独起 Langfuse 栈(默认不随 dev.ps1 起, 需显式带 profile)。
+#    只点名 web+worker: 依赖的 4 个存储由 depends_on 自动带起。
+#    切勿省略服务名跑裸 --profile langfuse up -d —— 那会把没挂 profiles: 的业务栈
+#    (assistant/postgres/各 agent...) 一起拉起, 不是"单独启动 Langfuse"。
+docker compose -f docker/docker-compose.yml --profile langfuse up -d langfuse-web langfuse-worker
+# 2) 浏览器开 Web UI http://localhost:18100 -> 注册 -> 建 org/project -> 取 pk-lf-/sk-lf-
 #    写入 docker/secrets/langfuse_api_key.txt(第一行 sk, 第二行 pk)
 # 3) docker/.env 置 LANGFUSE_ENABLED=true 并重建 assistant 镜像
 ./scripts/dev.ps1 -Build
