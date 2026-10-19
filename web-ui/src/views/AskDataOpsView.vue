@@ -25,6 +25,14 @@ const badcases = ref([])
 const golden = ref([])
 const goldenFilter = ref('all')
 
+// 问数记录: SQL 不随对话载荷/SSE 下发, 而是在这里按需回查一轮的 final_sql 与 DSL。
+const queries = ref([])
+const queryVerdict = ref('')
+const queryUser = ref('')
+const queryOpen = ref(false)
+const queryLoading = ref(false)
+const queryDetail = ref({})
+
 // 指标卡: key 必须与 app/askdata/store.py::stats 返回的字段名一致。
 // 刻意把"分母是什么"写进 tip: 这些比率的分母互不相同(全员轮次 / 澄清轮次 / 有反馈轮次),
 // 不看说明就会把"误澄清率 100%"读成"一半的问数都错了" —— 那是两个不同的病。
@@ -91,6 +99,20 @@ const draftSamples = computed(() => Number(sampleStats.value.draft || 0))
 
 const evalRun = computed(() => stats.value.latest_eval || {})
 const sampleQueue = computed(() => stats.value.samples || {})
+const sqlText = computed(() => queryDetail.value.final_sql || '')
+// 没有 SQL 时把“为什么没有”说清楚: 缓存命中/被澄清拦下/被拒/执行失败都是不同的事。
+const sqlEmptyReason = computed(() => {
+  const row = queryDetail.value
+  if (row.cache_hit) return '本轮命中了结果缓存, 没有重新编译 SQL(结果行直接复用)。'
+  if (row.verdict === 'clarify') return '本轮被澄清门拦下, 还没进入编译, 因此没有 SQL。'
+  if (row.verdict === 'denied') return '本轮被权限或校验拒绝, 没有可执行的 SQL。'
+  if (row.verdict === 'fail') return '本轮没有执行成功(见错误码与备注), 可能编译失败或引擎报错。'
+  return '这一轮没有记录到 SQL。'
+})
+const dslText = computed(() => {
+  const dsl = queryDetail.value.dsl_json
+  return dsl && Object.keys(dsl).length ? JSON.stringify(dsl, null, 2) : ''
+})
 
 function pct(value) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return '—'
@@ -128,7 +150,7 @@ async function loadAll() {
     if (s.ok) stats.value = await s.json()
     if (a.ok) alerts.value = (await a.json()).alerts || []
     if (sem.ok) semantic.value = await sem.json()
-    await Promise.all([loadTickets(), loadSamples(), loadBadcases(), loadGolden()])
+    await Promise.all([loadTickets(), loadSamples(), loadBadcases(), loadGolden(), loadQueries()])
   } catch {
     ElMessage.error('治理数据加载失败: 网关不可用')
   } finally {
@@ -166,6 +188,45 @@ async function loadBadcases() {
     badcases.value = resp.ok ? (await resp.json()).badcases || [] : []
   } catch {
     badcases.value = []
+  }
+}
+
+async function loadQueries() {
+  try {
+    const params = new URLSearchParams({ days: days.value, limit: '100' })
+    if (queryVerdict.value) params.set('verdict', queryVerdict.value)
+    if (queryUser.value.trim()) params.set('user_id', queryUser.value.trim())
+    const resp = await fetch(query(`/api/askdata/queries?${params.toString()}`))
+    queries.value = resp.ok ? (await resp.json()).queries || [] : []
+  } catch {
+    queries.value = []
+  }
+}
+
+async function openQueryDetail(row) {
+  queryOpen.value = true
+  queryLoading.value = true
+  queryDetail.value = { ...row }
+  try {
+    const resp = await fetch(query(`/api/askdata/queries/${encodeURIComponent(row.query_id)}`))
+    const body = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(body.detail || `读取失败(${resp.status})`)
+    queryDetail.value = body
+  } catch (e) {
+    ElMessage.error('读取 SQL 失败: ' + e.message)
+    queryOpen.value = false
+  } finally {
+    queryLoading.value = false
+  }
+}
+
+async function copySql() {
+  if (!sqlText.value) return
+  try {
+    await navigator.clipboard.writeText(sqlText.value)
+    ElMessage.success('已复制 SQL')
+  } catch {
+    ElMessage.warning('浏览器不允许直接写剪贴板, 请手动选择复制')
   }
 }
 
@@ -361,6 +422,59 @@ onMounted(loadAll)
         </el-descriptions>
       </el-tab-pane>
 
+      <el-tab-pane label="问数记录" name="queries">
+        <el-alert type="info" :closable="false" show-icon class="note"
+          title="SQL 是排障视图：对话与 SSE 只带 query_id, 点「查看 SQL」才按需回查这一轮真正执行的 final_sql 与 DSL。库里只保留前 4000 字符。" />
+        <div class="row-tools">
+          <el-radio-group v-model="queryVerdict" size="small" @change="loadQueries">
+            <el-radio-button value="">全部</el-radio-button>
+            <el-radio-button value="ok">出数</el-radio-button>
+            <el-radio-button value="clarify">澄清</el-radio-button>
+            <el-radio-button value="fail">失败</el-radio-button>
+            <el-radio-button value="denied">被拒</el-radio-button>
+            <el-radio-button value="degraded">降级</el-radio-button>
+          </el-radio-group>
+          <el-input v-model="queryUser" size="small" style="width: 150px" placeholder="按工号过滤" clearable
+            @change="loadQueries" />
+          <span class="hint">近 {{ days }} 天 · 最多 100 条</span>
+        </div>
+        <el-table :data="queries" size="small" empty-text="窗口内没有问数记录">
+          <el-table-column label="时间" width="160">
+            <template #default="{ row }">{{ (row.created_at || '').toString().slice(0, 19).replace('T', ' ') }}</template>
+          </el-table-column>
+          <el-table-column label="提问者" width="150">
+            <template #default="{ row }">
+              {{ row.user_id || '—' }}<span class="hint"> / {{ row.role || '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="问题" prop="question" min-width="240" show-overflow-tooltip />
+          <el-table-column label="路由" width="100">
+            <template #default="{ row }">{{ row.route || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="结论" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.verdict === 'ok' ? 'success' : row.verdict === 'clarify' ? 'warning' : 'danger'">
+                {{ row.verdict || '—' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="行数" width="80">
+            <template #default="{ row }">{{ row.rowcount ?? 0 }}</template>
+          </el-table-column>
+          <el-table-column label="时延" width="90">
+            <template #default="{ row }">{{ row.latency_ms ? `${row.latency_ms} ms` : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="缓存" width="70">
+            <template #default="{ row }">{{ row.cache_hit ? '命中' : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="110" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="openQueryDetail(row)">查看 SQL</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
       <el-tab-pane name="tickets">
         <template #label>
           人工工单
@@ -548,6 +662,45 @@ onMounted(loadAll)
         </el-table>
       </el-tab-pane>
     </el-tabs>
+
+    <el-drawer v-model="queryOpen" size="640px" title="问数记录详情">
+      <div v-loading="queryLoading">
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="问题" :span="2">{{ queryDetail.question || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="提问者">
+            {{ queryDetail.user_id || '—' }} / {{ queryDetail.role || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="时间">
+            {{ (queryDetail.created_at || '—').toString().slice(0, 19).replace('T', ' ') }}
+          </el-descriptions-item>
+          <el-descriptions-item label="路由">{{ queryDetail.route || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="结论">
+            {{ queryDetail.verdict || '—' }}{{ queryDetail.cache_hit ? '（缓存命中）' : '' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="行数 / 时延">
+            {{ queryDetail.rowcount ?? 0 }} 行 / {{ queryDetail.latency_ms ? `${queryDetail.latency_ms} ms` : '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="口径版本">{{ queryDetail.semver || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="留痕号" :span="2">{{ queryDetail.query_id || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="错误码" :span="2">
+            {{ (queryDetail.error_codes || []).join(', ') || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item v-if="queryDetail.notes" label="备注" :span="2">{{ queryDetail.notes }}</el-descriptions-item>
+        </el-descriptions>
+
+        <div class="sub-title">
+          最终执行 SQL
+          <el-button v-if="sqlText" link type="primary" size="small" @click="copySql">复制</el-button>
+        </div>
+        <pre v-if="sqlText" class="sql-block">{{ sqlText }}</pre>
+        <el-alert v-else type="info" :closable="false" :title="sqlEmptyReason" />
+
+        <template v-if="dslText">
+          <div class="sub-title">本轮 DSL（模型产物，SQL 由编译器按语义层生成）</div>
+          <pre class="sql-block">{{ dslText }}</pre>
+        </template>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -643,6 +796,21 @@ onMounted(loadAll)
 .danger {
   color: #f56c6c;
   font-weight: 600;
+}
+
+.sql-block {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: #f6f8fa;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 420px;
+  overflow: auto;
 }
 
 .tabs :deep(.el-tabs__content) {

@@ -487,7 +487,7 @@ function askdataNone(item) {
             <ClarifyPanel v-if="item.askdata && item.askdata.kind === 'clarify'" :payload="item.askdata"
               :disabled="sending" @choose="(c) => askdataChoose(item, c)" @none="() => askdataNone(item)" />
             <AskDataFeedback v-else-if="item.askdata && item.askdata.query_id" :query-id="item.askdata.query_id"
-              :payload="item.askdata" :user-id="current.empId" :trace-id="item.askdata.trace_id"
+              :payload="item.askdata" :user-id="current.empId" :role="current.role" :trace-id="item.askdata.trace_id"
               :session-id="sessionId" :disabled="sending" />
             <!-- 本轮用的语义层版本与工单号: 口径能不能回查、球有没有接住, 在对话里就能看到 -->
             <div v-if="item.askdata && (item.askdata.semver || item.askdata.ticket)" class="askdata-meta">

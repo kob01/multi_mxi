@@ -377,8 +377,7 @@ python -m scripts.export_askdata_samples --dry-run              # 只导 approve
   报告进 `reports/askdata_eval_*`, 结论(EX/DSL-EM/slot-F1/误澄清率/门禁)进 `askdata_eval_run`。
 
 治理面入口(前端页): `web-ui/src/views/AskDataOpsView.vue`(导航"问数治理", `/askdata`)。五个页签分别接
-`/api/askdata/{stats,alerts,tickets,samples,badcases,golden,semantic}`: 运行指标与分母说明、四条告警线
-+评测 CI 门禁、人工工单(领取/结办/驳回)、SFT/DPO 样本队列(批准/驳回, 两道门禁列直接可见)、
+`/api/askdata/{stats,alerts,tickets,samples,badcases,golden,semantic}`: 运行指标与分母说明、四条告警线 +评测 CI 门禁、人工工单(领取/结办/驳回)、SFT/DPO 样本队列(批准/驳回, 两道门禁列直接可见)、
 评测集的**语义缓存复用批准**(默认全不可复用, 逐条人批)与口径版本/变更记录。入口只对
 `ANALYTICS_ALL_DEPT_ROLES` 里的角色可见 —— 这只是体验, 每个接口都服务端重查角色。
 

@@ -32,7 +32,8 @@ _FENCE_RE = re.compile(
 )
 # 载荷里进 metadata 的字段: 刻意**不含 rows 与 sql**。
 # 表格正文已经在 answer 里(前端 Markdown 渲染), 再把 50 行数据塞进每个 SSE 事件与
-# 会话历史等于把同一份数据传两遍; SQL 是排障用的, 已经在 askdata_query_log 里留痕。
+# 会话历史等于把同一份数据传两遍; SQL 是排障用的, 已经在 askdata_query_log 里留痕,
+# 页面与对话按需回查 ``GET /api/askdata/queries/{query_id}``(不把每轮 SQL 推给所有人)。
 # 但 **dsl / slots 要带**: 它们是"查询意图"不是业务数据, 而 edit_dsl 反馈与多轮指代
 # 继承都要拿得到本轮到底编成了什么(不带就得让用户重述一遍)。
 _VIEW_KEYS = (

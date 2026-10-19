@@ -12,6 +12,7 @@ const props = defineProps({
     queryId: { type: String, default: '' },
     payload: { type: Object, default: () => ({}) },
     userId: { type: String, default: '' },
+    role: { type: String, default: 'employee' },
     traceId: { type: String, default: '' },
     sessionId: { type: String, default: '' },
     disabled: { type: Boolean, default: false },
@@ -39,6 +40,54 @@ const chosenTime = ref('')
 const noDrill = ref(false)
 
 const currentDsl = computed(() => props.payload.dsl || {})
+
+// SQL 排障视图: 对话载荷里只有 query_id(不把每轮 SQL 塞进 SSE/历史), 点开时才按需回查。
+const sqlOpen = ref(false)
+const sqlLoading = ref(false)
+const sqlDetail = ref({})
+const sqlText = computed(() => sqlDetail.value.final_sql || '')
+const dslText = computed(() => {
+    const dsl = sqlDetail.value.dsl_json || props.payload.dsl
+    return dsl && Object.keys(dsl).length ? JSON.stringify(dsl, null, 2) : ''
+})
+const sqlEmptyReason = computed(() => {
+    const row = sqlDetail.value
+    if (row.cache_hit) return '本轮命中了结果缓存, 没有重新编译 SQL(结果行直接复用)。'
+    if (row.verdict === 'clarify') return '本轮被澄清门拦下, 还没进入编译, 因此没有 SQL。'
+    if (row.verdict === 'denied') return '本轮被权限或校验拒绝, 没有可执行的 SQL。'
+    if (row.verdict === 'fail') return '本轮没有执行成功(见错误码), 可能编译失败或引擎报错。'
+    return '这一轮没有记录到 SQL。'
+})
+
+async function openSql() {
+    if (!props.queryId) return
+    sqlOpen.value = true
+    sqlLoading.value = true
+    // 先用载荷里已有的 route/verdict/cache_hit 顶上, 等详情回来再替换。
+    sqlDetail.value = { ...props.payload, query_id: props.queryId }
+    try {
+        const params = new URLSearchParams({ role: props.role || 'employee', operator: props.userId || '' })
+        const resp = await fetch(`/api/askdata/queries/${encodeURIComponent(props.queryId)}?${params.toString()}`)
+        const data = await resp.json().catch(() => ({}))
+        if (!resp.ok) throw new Error(data.detail || `读取失败(${resp.status})`)
+        sqlDetail.value = data
+    } catch (e) {
+        ElMessage.error('读取 SQL 失败: ' + e.message)
+        sqlOpen.value = false
+    } finally {
+        sqlLoading.value = false
+    }
+}
+
+async function copySql() {
+    if (!sqlText.value) return
+    try {
+        await navigator.clipboard.writeText(sqlText.value)
+        ElMessage.success('已复制 SQL')
+    } catch {
+        ElMessage.warning('浏览器不允许直接写剪贴板, 请手动选择复制')
+    }
+}
 
 // 把"用户的三处改动"合成本轮 DSL 的修正版: 没动的字段一律沿用原值, 这样后端
 // dsl_diff 只会看到真正被改的那一项, 不会把我们的默认值当成"用户改了它"。
@@ -174,6 +223,9 @@ function openRewrite() {
             <el-button size="small" text :disabled="disabled" @click="copyNumbers">
                 📋 复制数字
             </el-button>
+            <el-button size="small" text :disabled="disabled" @click="openSql">
+                🧾 查看 SQL
+            </el-button>
         </template>
         <span v-else class="done">已收到反馈，会进入 badcase 归因(生成的口径草案需人工核对后生效)</span>
 
@@ -210,6 +262,27 @@ function openRewrite() {
                 </el-button>
             </template>
         </el-dialog>
+
+        <el-dialog v-model="sqlOpen" title="这一轮实际执行的 SQL" width="720px">
+            <div v-loading="sqlLoading">
+                <div class="sql-meta">
+                    <span>路由 {{ sqlDetail.route || '—' }}</span>
+                    <span>结论 {{ sqlDetail.verdict || '—' }}{{ sqlDetail.cache_hit ? '（缓存命中）' : '' }}</span>
+                    <span>行数 {{ sqlDetail.rowcount ?? 0 }}</span>
+                    <span>口径版本 {{ sqlDetail.semver || '—' }}</span>
+                </div>
+                <pre v-if="sqlText" class="sql-block">{{ sqlText }}</pre>
+                <el-alert v-else type="info" :closable="false" :title="sqlEmptyReason" />
+                <template v-if="dslText">
+                    <div class="label sql-title">本轮 DSL（模型产物，SQL 由编译器按语义层生成）</div>
+                    <pre class="sql-block">{{ dslText }}</pre>
+                </template>
+            </div>
+            <template #footer>
+                <el-button size="small" @click="sqlOpen = false">关闭</el-button>
+                <el-button size="small" type="primary" :disabled="!sqlText" @click="copySql">复制 SQL</el-button>
+            </template>
+        </el-dialog>
     </div>
 </template>
 
@@ -242,5 +315,34 @@ function openRewrite() {
 .diff {
     font-size: 12px;
     color: #909399;
+}
+
+.sql-meta {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: #6b7280;
+}
+
+.sql-title {
+    display: block;
+    margin-top: 10px;
+}
+
+.sql-block {
+    margin: 0;
+    padding: 10px 12px;
+    background: #f6f8fa;
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 320px;
+    overflow: auto;
 }
 </style>

@@ -124,6 +124,27 @@ async def list_queries(
     }
 
 
+@router.get("/queries/{query_id}")
+async def query_detail(
+    query_id: str,
+    role: str = Query(default="employee", description="调用者角色"),
+    operator: str = Query(default="", description="调用者工号"),
+) -> dict[str, Any]:
+    """回查一轮问数: 实际执行的 SQL、本轮 DSL 与槽位(按需拉取)。
+
+    为什么 SQL 走单独接口而不是塞进对话载荷: 它是排障视图, 只在有人点开时取一次;
+    SSE 与会话历史里每轮都带一段 SQL 既费流量又和“答案正文”无关。普通角色只能看
+    自己问过的那一轮, 能跨全员看数的角色不受限(与 ``/queries`` 同一口径)。
+    """
+    row = await run_in_threadpool(store.get_query, query_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="没找到这条问数记录")
+    caller = (operator or "").strip()
+    if not _privileged(role) and str(row.get("user_id") or "") != caller:
+        raise HTTPException(status_code=403, detail="只能查看自己问过的 SQL")
+    return _query_detail(row)
+
+
 @router.post("/feedback")
 async def submit_feedback(req: FeedbackIn) -> dict[str, Any]:
     """收下一条反馈并触发五类归因(处置只产出**草案**, 生效要过人)。"""
@@ -507,6 +528,23 @@ def _recent_changes(limit: int = 20) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 - 版本记录读不出不影响快照本身(存量库可能还没这张表)
         return []
     return [dict(r._mapping) for r in rows]
+
+
+# 详情返回的列: 刻意不含 candidates_json / metric_summary。前者是召回候选的长文本,
+# 后者是结果量级摘要, 都不回答“这句话最后编成了什么 SQL”。
+_QUERY_DETAIL_KEYS = (
+    "query_id", "trace_id", "session_id", "user_id", "role", "question",
+    "route", "verdict", "error_codes", "rowcount", "latency_ms", "token_cost",
+    "semver", "catalog_origin", "cache_hit", "feedback", "attribution", "notes",
+    "final_sql", "dsl_json", "slots_json", "created_at",
+)
+
+
+def _query_detail(row: dict[str, Any]) -> dict[str, Any]:
+    """裁出排障需要的列并统一空值形状(错误码永远是数组, 前端不用判 null)。"""
+    out = {key: row.get(key) for key in _QUERY_DETAIL_KEYS if key in row}
+    out["error_codes"] = list(out.get("error_codes") or [])
+    return out
 
 
 def _require_privileged(role: str, operator: str, what: str) -> None:
